@@ -330,3 +330,123 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
         #expect(view.gridSize.rows < size.rows)
     }
 }
+
+// MARK: - Cursor rendering (block cursor must show the cell under it)
+
+@MainActor
+@Suite struct CursorRenderTests {
+    private func makeView(cursorCol: Int) -> (GridSurfaceView, FlushResult) {
+        let view = GridSurfaceView(
+            frame: NSRect(x: 0, y: 0, width: 600, height: 400), font: menlo)
+        let store = GridStore()
+        var mode = ModeInfo()
+        mode.cursorShape = .block
+        let result = flush(store, [
+            .gridResize(grid: 1, width: 10, height: 4),
+            .defaultColorsSet(fg: rgb(0xFFFFFF), bg: rgb(0x000000), special: rgb(0xFF0000)),
+            .modeInfoSet(cursorStyleEnabled: true, modes: [mode]),
+            .modeChange(mode: "normal", modeIndex: 0),
+            line(0, "abc", hl: 0),
+            .gridCursorGoto(grid: 1, row: 0, col: cursorCol),
+        ])
+        view.present(result)
+        return (view, result)
+    }
+
+    private func cursorLayer(of view: GridSurfaceView) -> CALayer? {
+        view.layer?.sublayers?.first { $0.zPosition == 10_000 }
+    }
+
+    /// Reference: what a block cursor over `letter` SHOULD contain —
+    /// default-fg fill, default-bg glyph, same pipeline as the grid.
+    private func reference(_ letter: String, fonts: FontSet) -> CGImage {
+        let cw = fonts.cellSize.width
+        let ch = fonts.cellSize.height
+        let ctx = GridRenderer.makeContext(width: Int(cw * 2), height: Int(ch * 2), scale: 2)!
+        ctx.setFillColor(NvimKit.RGBColor(rgb: 0xFFFFFF).cgColor)
+        ctx.fill(CGRect(x: 0, y: 0, width: cw, height: ch))
+        let cache = GlyphCache(capacity: 8)
+        let shaped = cache.shapedRun(text: letter, variant: .regular, font: fonts.regular)
+        ctx.translateBy(x: 0, y: ch - fonts.baselineOffset)
+        ctx.setFillColor(NvimKit.RGBColor(rgb: 0x000000).cgColor)
+        for segment in shaped.segments {
+            CTFontDrawGlyphs(segment.font, segment.glyphs, segment.positions, segment.glyphs.count, ctx)
+        }
+        return ctx.makeImage()!
+    }
+
+    @Test func blockCursorFrameAndGlyphMatchTheCellUnderIt() {
+        let (view, _) = makeView(cursorCol: 1)  // over "b"
+        let fonts = FontSet(spec: menlo)
+        let layer = cursorLayer(of: view)
+        #expect(layer != nil, "cursor layer present")
+        guard let layer else { return }
+
+        #expect(layer.frame.origin.x == fonts.cellSize.width, "block sits over column 1")
+        #expect(layer.frame.origin.y == 0, "block sits on row 0")
+
+        guard let contents = layer.contents else {
+            Issue.record("block cursor has no glyph contents")
+            return
+        }
+        let image = contents as! CGImage
+        let matchesB = identical(image, reference("b", fonts: fonts))
+        let matchesA = identical(image, reference("a", fonts: fonts))
+        let matchesC = identical(image, reference("c", fonts: fonts))
+        #expect(matchesB, "cursor must render the letter under it ('b')")
+        #expect(!matchesA && !matchesC, "cursor must not render a neighbor's letter")
+    }
+}
+
+extension CursorRenderTests {
+    /// The regression from the field: cursor over ITALIC text (comments)
+    /// must render the italic glyph, not the upright variant.
+    @MainActor
+    @Test func blockCursorHonorsTheCellsFontVariant() {
+        let view = GridSurfaceView(
+            frame: NSRect(x: 0, y: 0, width: 600, height: 400), font: menlo)
+        let store = GridStore()
+        var mode = ModeInfo()
+        mode.cursorShape = .block
+        var italic = HlAttrs()
+        italic.italic = true
+        let result = flush(store, [
+            .gridResize(grid: 1, width: 10, height: 4),
+            .defaultColorsSet(fg: rgb(0xFFFFFF), bg: rgb(0x000000), special: rgb(0xFF0000)),
+            .modeInfoSet(cursorStyleEnabled: true, modes: [mode]),
+            .modeChange(mode: "normal", modeIndex: 0),
+            .hlAttrDefine(id: 5, attrs: italic),
+            line(0, "bbb", hl: 5),
+            .gridCursorGoto(grid: 1, row: 0, col: 1),
+        ])
+        view.present(result)
+        guard let layer = view.layer?.sublayers?.first(where: { $0.zPosition == 10_000 }),
+            let contents = layer.contents
+        else {
+            Issue.record("cursor layer/contents missing")
+            return
+        }
+        let image = contents as! CGImage
+
+        let fonts = FontSet(spec: menlo)
+        func variantReference(_ variant: FontSet.Variant) -> CGImage {
+            let cw = fonts.cellSize.width
+            let ch = fonts.cellSize.height
+            let ctx = GridRenderer.makeContext(width: Int(cw * 2), height: Int(ch * 2), scale: 2)!
+            ctx.setFillColor(NvimKit.RGBColor(rgb: 0xFFFFFF).cgColor)
+            ctx.fill(CGRect(x: 0, y: 0, width: cw, height: ch))
+            let cache = GlyphCache(capacity: 8)
+            let shaped = cache.shapedRun(text: "b", variant: variant, font: fonts.font(for: variant))
+            ctx.translateBy(x: 0, y: ch - fonts.baselineOffset)
+            ctx.setFillColor(NvimKit.RGBColor(rgb: 0x000000).cgColor)
+            for s in shaped.segments {
+                CTFontDrawGlyphs(s.font, s.glyphs, s.positions, s.glyphs.count, ctx)
+            }
+            return ctx.makeImage()!
+        }
+        #expect(identical(image, variantReference(.italic)),
+                "cursor over italic text must draw the italic glyph")
+        #expect(!identical(image, variantReference(.regular)),
+                "upright glyph over italic text is the reported bug")
+    }
+}

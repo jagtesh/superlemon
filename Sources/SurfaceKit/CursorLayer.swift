@@ -96,8 +96,12 @@ final class CursorLayer: CALayer {
         else { return }
         ctx.setFillColor(fill.cgColor)
         ctx.fill(CGRect(x: 0, y: 0, width: cw, height: ch))
+        // Match the grid's font variant for this cell — an upright glyph
+        // drawn over italic/bold text reads as the wrong letter entirely.
+        let attrs = flush.highlights.resolved(id: cell.hlID)
+        let variant = FontSet.Variant(bold: attrs.bold, italic: attrs.italic)
         let shaped = cache.shapedRun(
-            text: cell.text, variant: .regular, font: fonts.regular)
+            text: cell.text, variant: variant, font: fonts.font(for: variant))
         ctx.translateBy(x: 0, y: ch - fonts.baselineOffset)
         ctx.setFillColor(glyphColor.cgColor)
         for segment in shaped.segments {
