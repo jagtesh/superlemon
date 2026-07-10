@@ -105,6 +105,17 @@ public final class PopupMenuPanelController: NSObject {
     /// Presents the popup with its top-left at `point`, given in the window's
     /// contentView coordinate space (the app converts grid cell -> point).
     /// Safe headless: skips window-server work when `window` is not visible.
+    /// Drop-down origin (screen coords, y-up): below the anchor when it
+    /// fits above the window's bottom edge, otherwise FLIPPED to open
+    /// upward from the anchor — a wildmenu anchored at the bottom status
+    /// bar must never descend under the window/dock.
+    static func panelOriginY(
+        anchorScreenY: CGFloat, panelHeight: CGFloat, windowMinY: CGFloat
+    ) -> CGFloat {
+        let below = anchorScreenY - panelHeight
+        return below >= windowMinY ? below : anchorScreenY
+    }
+
     public func present(anchoredAt point: NSPoint, in window: NSWindow, model: PopupMenuModel) {
         render(model)
         guard let contentView = window.contentView else { return }
@@ -112,8 +123,11 @@ public final class PopupMenuPanelController: NSObject {
         let size = preferredSize(for: model)
         let windowPoint = contentView.convert(point, to: nil)
         let screenPoint = window.convertPoint(toScreen: windowPoint)
+        let originY = Self.panelOriginY(
+            anchorScreenY: screenPoint.y, panelHeight: size.height,
+            windowMinY: window.frame.minY)
         panel.setFrame(
-            NSRect(x: screenPoint.x, y: screenPoint.y - size.height, width: size.width, height: size.height),
+            NSRect(x: screenPoint.x, y: originY, width: size.width, height: size.height),
             display: false
         )
         effectView.frame = NSRect(origin: .zero, size: size)

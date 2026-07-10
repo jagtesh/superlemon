@@ -220,7 +220,13 @@ final class WorkspaceChrome {
     private func anchorPoint(grid: Int, row: Int, col: Int) -> NSPoint {
         guard let window, let contentView = window.contentView else { return .zero }
         if grid == -1 {
-            // Wildmenu: anchor under the cmdline panel.
+            if nativeStatusbar {
+                // Cmdline lives IN the bottom bar: anchor at the bar's top
+                // edge so the popup's flip logic opens it UPWARD (downward
+                // would descend below the window, under the dock).
+                return NSPoint(x: statusBar.frame.minX + 8, y: statusBar.frame.maxY)
+            }
+            // Wildmenu: anchor under the floating cmdline panel.
             let panelFrame = contentView.convert(cmdlinePanel.panel.frame, from: nil)
             return NSPoint(x: panelFrame.minX + 16, y: panelFrame.minY)
         }

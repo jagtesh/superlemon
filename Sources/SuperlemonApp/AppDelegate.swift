@@ -196,6 +196,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
     /// View ▸ Native Tabs / Native Status Bar — affordances only; the runtime
     /// plugin owns the state and answers with a superlemon.chrome push.
+    @objc private func showMessageHistory(_ sender: Any?) {
+        chrome?.toasts.showHistory()
+    }
+
     @objc private func toggleNativeTabs(_ sender: Any?) {
         controller?.toggleNativeChrome("tabs")
     }
@@ -361,6 +365,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             keyEquivalent: "")
         nativeBarItem.target = self
         viewMenu.addItem(nativeBarItem)
+        viewMenu.addItem(.separator())
+        let historyItem = NSMenuItem(
+            title: "Message History…",
+            action: #selector(showMessageHistory(_:)),
+            keyEquivalent: "")
+        historyItem.target = self
+        viewMenu.addItem(historyItem)
 
         // Go menu: quick-open (⌘P intercepts before key translation — menu
         // key equivalents fire ahead of keyDown, so nvim never sees <D-p>).

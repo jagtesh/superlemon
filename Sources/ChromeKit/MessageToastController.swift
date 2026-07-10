@@ -1,6 +1,9 @@
-// ext_messages as stacking transient toasts, top-right of the parent
-// window's content view. Plain layer-backed NSViews, not panels (NORTHSTAR:
-// flat opaque surfaces + hairlines; vibrancy only on palette-class panels).
+// ext_messages as a SINGLE replacing toast, top-right of the parent
+// window's content view — new messages replace the current toast instead of
+// stacking (stacks of stale toasts were noise). Everything shown is also
+// appended to a timestamped history log; clicking the toast (or View ▸
+// Message History) opens a scrollable, timestamped viewer so missed
+// messages are never lost.
 //
 // Confirm-kind messages are never toasted — the app reads
 // `ChromeState.pendingConfirm` and routes those to NSAlert.
@@ -15,36 +18,46 @@ public enum ToastKind: String, Sendable {
     case error
 }
 
+/// One remembered message (the history log).
+public struct ToastLogEntry: Sendable {
+    public let date: Date
+    public let kind: String  // nvim message kind ("emsg", "echo", …)
+    public let isError: Bool
+    public let text: String
+}
+
 @MainActor
 public final class MessageToastController {
     public static let toastWidth: CGFloat = 320
     static let margin: CGFloat = 12
-    static let spacing: CGFloat = 8
+    static let historyCap = 200
 
     /// Non-error toasts dismiss after this many seconds. Overridable so tests
     /// don't wait 4 real seconds. Error toasts persist until clicked or
     /// cleared by `msg_clear`.
     public var autoDismissInterval: TimeInterval = 4.0
 
-    /// Number of toast views currently shown (or tracked headlessly).
-    public var activeToastCount: Int { toastViews.count }
+    /// 0 or 1 — a single replacing toast (or tracked headlessly).
+    public var activeToastCount: Int { currentToast == nil ? 0 : 1 }
 
-    private(set) var toastViews: [UUID: ToastView] = [:]
-    private var dismissTasks: [UUID: Task<Void, Never>] = [:]
-    /// User-dismissed messages: never resurrected by a later render of the
-    /// same model list. Pruned to the live message set on each render.
-    private var dismissedIDs: Set<UUID> = []
-    /// Ad-hoc toasts (superlemon.ui `toast show`): owned by this controller
-    /// rather than ChromeState, so `render(_:)`'s model sync must never
-    /// remove them.
-    private var adHocIDs: Set<UUID> = []
-    private var order: [UUID] = []
+    /// Timestamped log of everything shown, newest last, capped.
+    public private(set) var history: [ToastLogEntry] = []
+
+    private var currentToast: ToastView?
+    private var currentID: UUID?
+    private var currentIsAdHoc = false
+    private var dismissTask: Task<Void, Never>?
+    /// Message ids already logged/shown once — a later render of the same
+    /// model list must not resurrect or re-log them.
+    private var seenIDs: Set<UUID> = []
     private weak var container: NSView?
+    private var historyPanel: NSPanel?
+    private var historyTextView: NSTextView?
 
     public init() {}
 
     deinit {
-        for task in dismissTasks.values { task.cancel() }
+        dismissTask?.cancel()
     }
 
     // MARK: Attachment
@@ -54,48 +67,39 @@ public final class MessageToastController {
         if let contentView = window.contentView { attach(to: contentView) }
     }
 
-    /// Toasts become subviews of `view`, stacked from its top-right corner.
+    /// The toast becomes a subview of `view`, pinned to its top-right corner.
     public func attach(to view: NSView) {
         guard container !== view else { return }
-        // Move any live toasts to the new container.
-        for id in order {
-            toastViews[id]?.removeFromSuperview()
-            if let toast = toastViews[id] { view.addSubview(toast) }
+        if let toast = currentToast {
+            toast.removeFromSuperview()
+            view.addSubview(toast)
         }
         container = view
-        layoutToasts()
+        layoutToast()
     }
 
     // MARK: Rendering (model -> view, one-way)
 
-    /// Syncs toast views with the message list from ChromeState. Confirm-kind
-    /// (`needsPrompt`) messages are skipped. Safe headless: without an
-    /// attached container this only does bookkeeping.
+    /// Syncs with the message list from ChromeState: logs anything new and
+    /// shows the NEWEST non-confirm message as the single toast. Safe
+    /// headless (bookkeeping only without a container).
     public func render(_ messages: [MessageModel]) {
-        dismissedIDs.formIntersection(Set(messages.map(\.id)))
-
-        let visible = messages.filter { !$0.needsPrompt && !dismissedIDs.contains($0.id) }
-        let visibleIDs = Set(visible.map(\.id))
-
-        // Remove toasts whose message is gone (msg_clear, replace_last).
-        // Ad-hoc toasts live outside the model list and are kept.
-        for id in order where !visibleIDs.contains(id) && !adHocIDs.contains(id) {
-            removeToast(id)
+        let fresh = messages.filter { !$0.needsPrompt && !seenIDs.contains($0.id) }
+        for message in fresh {
+            log(kind: message.kind, isError: message.isError, text: message.text)
+            seenIDs.insert(message.id)
         }
-
-        // Add toasts for new messages.
-        for message in visible where toastViews[message.id] == nil {
-            addToast(for: message)
+        if let newest = fresh.last {
+            show(message: newest, adHoc: false)
+        } else if currentID != nil, !currentIsAdHoc,
+            !messages.contains(where: { $0.id == currentID })
+        {
+            removeCurrentToast()  // msg_clear / replace_last removed it
         }
-
-        order = visible.map(\.id) + order.filter { adHocIDs.contains($0) }
-        layoutToasts()
     }
 
-    /// superlemon.ui `toast show` (runtime/CONTRACT.md): an ad-hoc toast
-    /// through the same view pipeline as ext_messages, but owned by this
-    /// controller — model re-renders never clear it. `error` persists until
-    /// clicked; `info`/`warn` auto-dismiss.
+    /// superlemon.ui `toast show` (runtime/CONTRACT.md): same single-toast
+    /// pipeline; replaces whatever is showing.
     public func showAdHoc(text: String, kind: ToastKind) {
         let nvimKind: String
         switch kind {
@@ -104,62 +108,135 @@ public final class MessageToastController {
         case .error: nvimKind = "emsg"
         }
         let message = MessageModel(kind: nvimKind, content: [Chunk(hlID: 0, text: text)])
-        adHocIDs.insert(message.id)
-        addToast(for: message)
-        order.append(message.id)
-        layoutToasts()
+        log(kind: nvimKind, isError: kind == .error, text: text)
+        seenIDs.insert(message.id)
+        show(message: message, adHoc: true)
     }
 
-    private func addToast(for message: MessageModel) {
-        let toast = ToastView(message: message, width: Self.toastWidth)
-        toast.onClick = { [weak self] in self?.dismissToast(message.id) }
-        toastViews[message.id] = toast
-        container?.addSubview(toast)
-        if !message.isError {
-            scheduleAutoDismiss(of: message.id)
-        }
-    }
-
-    /// Click-to-dismiss (also used by the auto-dismiss task). The message
-    /// stays in ChromeState; it just won't be toasted again.
+    /// Dismiss the current toast if it matches (kept for API compatibility;
+    /// auto-dismiss and clicks route here).
     public func dismissToast(_ id: UUID) {
-        guard toastViews[id] != nil else { return }
-        dismissedIDs.insert(id)
-        removeToast(id)
-        layoutToasts()
+        guard currentID == id else { return }
+        removeCurrentToast()
+    }
+
+    // MARK: History
+
+    /// Opens (or refreshes) the timestamped message-history panel.
+    public func showHistory() {
+        let panel = historyPanel ?? makeHistoryPanel()
+        refreshHistoryText()
+        panel.center()
+        panel.makeKeyAndOrderFront(nil)
     }
 
     // MARK: Internals
 
-    private func scheduleAutoDismiss(of id: UUID) {
-        dismissTasks[id] = Task { [weak self] in
-            let interval = self?.autoDismissInterval ?? 4.0
-            try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
-            guard !Task.isCancelled else { return }
-            self?.dismissToast(id)
+    private func show(message: MessageModel, adHoc: Bool) {
+        removeCurrentToast()
+        let toast = ToastView(message: message, width: Self.toastWidth)
+        toast.onClick = { [weak self] in
+            // The toast doubles as the entry point to the log: click opens
+            // history (and clears the toast).
+            self?.dismissToast(message.id)
+            self?.showHistory()
+        }
+        currentToast = toast
+        currentID = message.id
+        currentIsAdHoc = adHoc
+        container?.addSubview(toast)
+        layoutToast()
+        if !message.isError {
+            let id = message.id
+            dismissTask = Task { [weak self] in
+                let interval = self?.autoDismissInterval ?? 4.0
+                try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+                guard !Task.isCancelled else { return }
+                self?.dismissToast(id)
+            }
         }
     }
 
-    private func removeToast(_ id: UUID) {
-        dismissTasks[id]?.cancel()
-        dismissTasks[id] = nil
-        toastViews[id]?.removeFromSuperview()
-        toastViews[id] = nil
-        adHocIDs.remove(id)
-        order.removeAll { $0 == id }
+    private func removeCurrentToast() {
+        dismissTask?.cancel()
+        dismissTask = nil
+        currentToast?.removeFromSuperview()
+        currentToast = nil
+        currentID = nil
+        currentIsAdHoc = false
     }
 
-    private func layoutToasts() {
-        guard let container else { return }
-        var top = container.bounds.maxY - Self.margin
-        let x = container.bounds.maxX - Self.toastWidth - Self.margin
-        for id in order {
-            guard let toast = toastViews[id] else { continue }
-            let height = toast.frame.height
-            toast.frame.origin = NSPoint(x: x, y: top - height)
-            toast.autoresizingMask = [.minXMargin, .minYMargin]
-            top -= height + Self.spacing
+    private func layoutToast() {
+        guard let container, let toast = currentToast else { return }
+        toast.frame.origin = NSPoint(
+            x: container.bounds.maxX - Self.toastWidth - Self.margin,
+            y: container.bounds.maxY - Self.margin - toast.frame.height)
+        toast.autoresizingMask = [.minXMargin, .minYMargin]
+    }
+
+    private func log(kind: String, isError: Bool, text: String) {
+        history.append(ToastLogEntry(date: Date(), kind: kind, isError: isError, text: text))
+        if history.count > Self.historyCap {
+            history.removeFirst(history.count - Self.historyCap)
         }
+        if historyPanel?.isVisible == true {
+            refreshHistoryText()
+        }
+    }
+
+    private func makeHistoryPanel() -> NSPanel {
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 460, height: 380),
+            styleMask: [.titled, .closable, .resizable, .utilityWindow],
+            backing: .buffered, defer: false)
+        panel.title = "Message History"
+        panel.isReleasedWhenClosed = false
+
+        let scroll = NSScrollView(frame: panel.contentView?.bounds ?? .zero)
+        scroll.hasVerticalScroller = true
+        scroll.autoresizingMask = [.width, .height]
+        let text = NSTextView(frame: scroll.bounds)
+        text.isEditable = false
+        text.isRichText = true
+        text.autoresizingMask = [.width]
+        text.textContainerInset = NSSize(width: 10, height: 10)
+        scroll.documentView = text
+        panel.contentView?.addSubview(scroll)
+
+        historyPanel = panel
+        historyTextView = text
+        return panel
+    }
+
+    private func refreshHistoryText() {
+        guard let text = historyTextView else { return }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss"
+        let mono = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        let result = NSMutableAttributedString()
+        for entry in history.reversed() {  // newest first
+            let stamp = NSAttributedString(
+                string: "[\(formatter.string(from: entry.date))] ",
+                attributes: [.font: mono, .foregroundColor: NSColor.secondaryLabelColor])
+            let kind = NSAttributedString(
+                string: entry.kind.padding(toLength: 10, withPad: " ", startingAt: 0),
+                attributes: [
+                    .font: mono,
+                    .foregroundColor: entry.isError
+                        ? NSColor.systemRed : NSColor.tertiaryLabelColor,
+                ])
+            let body = NSAttributedString(
+                string: entry.text + "\n",
+                attributes: [
+                    .font: mono,
+                    .foregroundColor: entry.isError ? NSColor.systemRed : NSColor.labelColor,
+                ])
+            result.append(stamp)
+            result.append(kind)
+            result.append(body)
+        }
+        text.textStorage?.setAttributedString(result)
+        text.scrollToBeginningOfDocument(nil)
     }
 }
 

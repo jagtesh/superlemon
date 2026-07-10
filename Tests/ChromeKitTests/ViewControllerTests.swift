@@ -188,7 +188,7 @@ private func allText(in view: NSView) -> [String] {
                      needsPrompt: kind == "confirm")
     }
 
-    @Test func rendersToastsSkippingConfirm() {
+    @Test func singleToastShowsNewestSkippingConfirm() {
         _ = NSApplication.shared
         let container = NSView(frame: NSRect(x: 0, y: 0, width: 600, height: 400))
         let controller = MessageToastController()
@@ -200,24 +200,31 @@ private func allText(in view: NSView) -> [String] {
             message("Save changes?", kind: "confirm"),
         ])
 
-        #expect(controller.activeToastCount == 2)
-        #expect(container.subviews.count == 2)
+        // Single replacing toast: the NEWEST non-confirm message shows;
+        // everything (except confirms? no — all non-prompt) lands in history.
+        #expect(controller.activeToastCount == 1)
+        #expect(container.subviews.count == 1)
+        let shown = container.subviews.compactMap { $0 as? ToastView }.first
+        #expect(shown?.message.isError == true)
+        #expect(controller.history.count == 2)
+        #expect(controller.history.last?.isError == true)
     }
 
-    @Test func toastsStackFromTopRight() {
+    @Test func newestReplacesAndSitsTopRight() {
         _ = NSApplication.shared
         let container = NSView(frame: NSRect(x: 0, y: 0, width: 600, height: 400))
         let controller = MessageToastController()
         controller.attach(to: container)
-        controller.render([message("one"), message("two")])
+        let one = message("one")
+        controller.render([one])
+        controller.render([one, message("two")])
 
         let frames = container.subviews.map(\.frame)
-        #expect(frames.count == 2)
-        // Right-aligned with the standard margin, first toast above the second.
-        for frame in frames {
-            #expect(abs(frame.maxX - (600 - 12)) < 0.5)
-        }
-        #expect(frames[0].minY > frames[1].maxY)
+        #expect(frames.count == 1, "new message replaces, never stacks")
+        #expect(abs(frames[0].maxX - (600 - 12)) < 0.5)
+        #expect(abs(frames[0].maxY - (400 - 12)) < 0.5)
+        // Both messages are remembered with timestamps.
+        #expect(controller.history.map(\.text) == ["one", "two"])
     }
 
     @Test func clickToDismissIsNotResurrected() {
@@ -245,6 +252,7 @@ private func allText(in view: NSView) -> [String] {
         controller.attach(to: container)
         controller.render([message("a"), message("b")])
         controller.render([])  // msg_clear
+        _ = controller.history  // history survives clearing (by design)
 
         #expect(controller.activeToastCount == 0)
         #expect(container.subviews.isEmpty)
@@ -263,15 +271,17 @@ private func allText(in view: NSView) -> [String] {
         controller.autoDismissInterval = 0.05
         controller.attach(to: container)
 
+        controller.render([message("transient info")])
+        #expect(controller.activeToastCount == 1)
+        try await Task.sleep(nanoseconds: 300_000_000)
+        #expect(controller.activeToastCount == 0, "info auto-dismisses")
+
         controller.render([
             message("transient info"),
             message("E123: persistent error", kind: "emsg"),
         ])
-        #expect(controller.activeToastCount == 2)
-
         try await Task.sleep(nanoseconds: 300_000_000)
-
-        #expect(controller.activeToastCount == 1)
+        #expect(controller.activeToastCount == 1, "error persists")
         let remaining = container.subviews.compactMap { $0 as? ToastView }
         #expect(remaining.count == 1)
         #expect(remaining[0].message.isError)
