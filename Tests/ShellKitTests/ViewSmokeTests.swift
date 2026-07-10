@@ -358,3 +358,30 @@ struct FileTreeSidebarTests {
         #expect(sidebar.outlineView.numberOfRows == 4)
     }
 }
+
+// MARK: - ⌘P stacking regression
+
+@MainActor
+@Suite struct QuickOpenScrimRegressionTests {
+    private func scrimCount(in window: NSWindow) -> Int {
+        window.contentView?.subviews.filter {
+            $0.accessibilityIdentifier() == "quickopen.scrim"
+        }.count ?? 0
+    }
+
+    @Test func representingNeverStacksScrims() {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+            styleMask: [.titled], backing: .buffered, defer: false)
+        let controller = QuickOpenPanelController()
+        controller.present(over: window)
+        controller.present(over: window)
+        controller.present(over: window)
+        #expect(scrimCount(in: window) == 1, "repeated ⌘P must not pile scrims")
+        controller.close()
+        #expect(scrimCount(in: window) == 0, "close removes the scrim")
+        controller.present(over: window)
+        #expect(scrimCount(in: window) == 1, "fresh session installs exactly one")
+        controller.close()
+    }
+}

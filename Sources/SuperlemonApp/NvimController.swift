@@ -67,9 +67,15 @@ final class NvimController {
             {
                 arguments += ["--listen", listen]
             }
-            // "Use Superlemon Config": skip the user's init in favor of the
-            // managed, native-first config (App menu; takes effect at launch).
-            if UserDefaults.standard.bool(forKey: Self.managedConfigDefaultsKey),
+            // Config source (Settings window / app menu), in priority order:
+            // 1. an explicit custom init path, 2. the managed native-first
+            // config (the default), 3. the user's own init (no -u at all).
+            let defaults = UserDefaults.standard
+            if let custom = defaults.string(forKey: "CustomInitPath"),
+                !custom.isEmpty, FileManager.default.fileExists(atPath: custom)
+            {
+                arguments += ["-u", custom]
+            } else if defaults.bool(forKey: Self.managedConfigDefaultsKey),
                 let managed = Self.runtimeDirectory()?
                     .appendingPathComponent("config/init.lua"),
                 FileManager.default.fileExists(atPath: managed.path)
@@ -139,7 +145,7 @@ final class NvimController {
 
     /// The runtime/ directory: env override → repo-relative to the executable
     /// (dev builds run from .build/<config>/) → cwd.
-    private nonisolated static func runtimeDirectory() -> URL? {
+    nonisolated static func runtimeDirectory() -> URL? {
         var candidates: [URL] = []
         if let env = ProcessInfo.processInfo.environment["SUPERLEMON_RUNTIME"], !env.isEmpty {
             candidates.append(URL(fileURLWithPath: env, isDirectory: true))

@@ -18,6 +18,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private var window: NSWindow?
     private var sidebarPane: NSView?
     private var appearanceObservation: NSKeyValueObservation?
+    private var settings: SettingsWindowController?
+
+    @objc private func showSettings(_ sender: Any?) {
+        guard let controller else { return }
+        if settings == nil {
+            let settings = SettingsWindowController(controller: controller)
+            settings.onEditManagedConfig = { [weak controller] in
+                if let managed = NvimController.runtimeDirectory()?
+                    .appendingPathComponent("config/init.lua")
+                {
+                    controller?.openFile(managed.path)
+                }
+            }
+            settings.onRelaunch = { [weak self] in self?.relaunch() }
+            self.settings = settings
+        }
+        settings?.show()
+    }
 
     init(smokeMode: Bool) {
         self.smokeMode = smokeMode
@@ -278,6 +296,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                 action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
                 keyEquivalent: ""))
         appMenu.addItem(.separator())
+        let settingsItem = NSMenuItem(
+            title: "Settings…",
+            action: #selector(showSettings(_:)),
+            keyEquivalent: ",")
+        settingsItem.target = self
+        appMenu.addItem(settingsItem)
         let managedConfigItem = NSMenuItem(
             title: "Use My Neovim Config",
             action: #selector(toggleManagedConfig(_:)),

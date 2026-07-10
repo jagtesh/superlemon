@@ -34,6 +34,21 @@ vim.opt.showmode = false
 vim.cmd.colorscheme("habamax")
 
 ---------------------------------------------------------------------------
+-- Plugins ─────────────────────────────────────────────────────────────────
+--
+-- Managed with nvim's BUILT-IN package manager (:h vim.pack, nvim 0.12+):
+-- add/remove entries here like any vimrc — plugins are fetched on first
+-- launch and loaded on every launch after. `:checkhealth vim.pack` to
+-- inspect. nvim-surround gives Sublime-style ys/cs/ds surround editing.
+---------------------------------------------------------------------------
+pcall(function()
+  vim.pack.add({
+    { src = "https://github.com/kylechui/nvim-surround" },
+  })
+  require("nvim-surround").setup()
+end)
+
+---------------------------------------------------------------------------
 -- Statusline (powerline-style) ────────────────────────────────────────────
 --
 -- This is a PLAIN vim 'statusline' (:h 'statusline') — even though

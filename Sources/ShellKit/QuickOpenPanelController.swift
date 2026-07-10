@@ -205,17 +205,28 @@ public final class QuickOpenPanelController: NSObject {
     /// over the parent's content view. Passing nil shows the panel
     /// standalone (headless/tests).
     public func present(over parent: NSWindow?) {
+        // Re-presenting while open must never stack a second scrim/child
+        // window (the ⌘P-piles-up bug): just refocus the existing session.
+        if sessionActive {
+            panel.makeKeyAndOrderFront(nil)
+            panel.makeFirstResponder(searchField)
+            return
+        }
+        scrimView?.removeFromSuperview()  // belt & braces against stale scrims
+        scrimView = nil
+
         parentWindow = parent
         sessionActive = true
         searchField.stringValue = ""
         onQueryChange?("")
 
         if let parent, let parentContent = parent.contentView {
-            let scrim = NSView(frame: parentContent.bounds)
+            let scrim = ScrimView(frame: parentContent.bounds)
             scrim.wantsLayer = true
             scrim.layer?.backgroundColor = NSColor.black.withAlphaComponent(Self.scrimAlpha).cgColor
             scrim.autoresizingMask = [.width, .height]
             scrim.setAccessibilityIdentifier("quickopen.scrim")
+            scrim.onClick = { [weak self] in self?.close() }
             parentContent.addSubview(scrim, positioned: .above, relativeTo: nil)
             scrimView = scrim
 
@@ -434,4 +445,12 @@ final class QuickOpenCellView: NSView {
         }
         return result
     }
+}
+
+/// The dimming layer behind the palette: clicking it dismisses (standard
+/// macOS modal-scrim behavior).
+@MainActor
+final class ScrimView: NSView {
+    var onClick: (() -> Void)?
+    override func mouseDown(with event: NSEvent) { onClick?() }
 }
