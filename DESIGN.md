@@ -657,6 +657,7 @@ ui.statusbar.segment("my-plugin", { text = "⚡ 3", color = "#E0B268" })
 | Text prompts (LSP rename, plugin inputs) | `vim.ui.input` override → native field | superlemon.ui wave A |
 | Notifications | `vim.notify` override → toasts | trivial follow-on |
 | Picker plugins (telescope et al.) | adapter tier (model-layer glue) | wave B |
+| nvim-cmp completions (insert + cmdline) | zero glue: `view = { entries = "native" }` routes through the already-externalized pum | user config one-liner |
 | Quickfix / location list | adapter tier → native list panel | backlog |
 | LSP progress ($/progress) | handler → statusbar segment | backlog |
 | Float dressing (hover/signature) | detect + material/shadow per kind | cosmetic backlog |
