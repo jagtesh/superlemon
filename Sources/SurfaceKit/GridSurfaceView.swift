@@ -99,6 +99,20 @@ public final class GridSurfaceView: NSView {
             height: CGFloat(frame.rect.height) * cellSize.height)
     }
 
+    /// Convert a view point to a SPECIFIC grid's local cell, clamped to its
+    /// bounds — mouse drags must stay on the press grid (`:h ui-multigrid`),
+    /// even when the pointer wanders past its edges.
+    public func cell(at point: NSPoint, inGrid id: Int) -> (row: Int, col: Int)? {
+        guard cellSize.width > 0, cellSize.height > 0 else { return nil }
+        guard let frame = lastFrames.first(where: { $0.gridID == id }) else { return nil }
+        let localRow = Int(floor(point.y / cellSize.height)) - frame.rect.row
+        let localCol = Int(floor(point.x / cellSize.width)) - frame.rect.col
+        return (
+            row: max(0, min(frame.rect.height - 1, localRow)),
+            col: max(0, min(frame.rect.width - 1, localCol))
+        )
+    }
+
     /// Cursor cell rect in view coordinates — the IME candidate-window anchor
     /// (NSTextInputClient firstRect). Nil while no flush has been presented.
     public var cursorRect: NSRect? {

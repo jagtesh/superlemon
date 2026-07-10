@@ -659,7 +659,41 @@ ui.statusbar.segment("my-plugin", { text = "⚡ 3", color = "#E0B268" })
 
 ---
 
-## 16. What makes it feel right (checklist to protect)
+## 16. Splits: nvim as layout engine, macOS as hands and paint
+
+Nvim's window layout is an explicit tree (`winlayout()`: row/col/leaf) that
+is structurally isomorphic to nested NSSplitViews — but four mismatches rule
+out adopting NSSplitView's ENGINE, and each is load-bearing:
+
+1. **Cell quantization vs pixel continuity** — nvim geometry is integer
+   cells; pixel-continuous dividers either snap (jitter) or float at
+   positions nvim cannot represent.
+2. **Separators are content, not chrome** — nvim draws them as themed cells
+   (`fillchars`/`WinSeparator`); native dividers would double them.
+3. **The oscillation trap** — two authoritative layout engines resolving the
+   same resize (holding priorities vs `equalalways`/`winfix*`) feed back;
+   every shipping nvim GUI keeps layout authority singular for this reason.
+4. **Atomicity** — win_pos batches arrive per flush (tear-free); NSSplitView
+   resizes panes across frames, letterboxing grids mid-transition.
+
+**The hybrid that survives all four**: grid layers positioned verbatim from
+win_pos (atomic, one engine); native SEPARATOR AFFORDANCES overlaid on the
+separator columns — resize cursors, generous hit targets, continuous drag
+translated to `nvim_win_set_width/height` at cell crossings; and native
+PAINT: the managed config blanks `fillchars` separators while the GUI draws
+a 1px hairline in the reserved column — native look without layout
+inversion.
+
+**Mouse-drag latching (implemented)**: per the UI contract, drag/release
+events stay on the PRESS grid. Re-hit-testing per event caused directional
+jitter: dragging toward the window whose origin moves with the separator
+(right/down) reported positions relative to an edge that had just moved —
+a feedback loop. InputHostView latches the grid at mouse-down and converts
+via `GridSurfaceView.cell(at:inGrid:)` (clamped) for the drag's duration.
+
+---
+
+## 17. What makes it feel right (checklist to protect)
 
 - Your `init.lua` loads unmodified; every plugin works
 - Keystroke latency indistinguishable from Terminal.app, UI polish

@@ -220,10 +220,30 @@ final class InputHostView: NSView, @preconcurrency NSTextInputClient {
     override func otherMouseDragged(with event: NSEvent) { sendMouse(event, button: .middle, action: .drag) }
     override func otherMouseUp(with event: NSEvent) { sendMouse(event, button: .middle, action: .release) }
 
+    /// The grid latched at mouse-press: per the nvim UI contract, DRAG and
+    /// RELEASE events must stay on the press grid. Re-hit-testing per event
+    /// made separator drags toward the moving window (right/down) feed back
+    /// through that window's shifting origin — the jitter asymmetry.
+    private var dragGrid: Int?
+
     private func sendMouse(_ event: NSEvent, button: MouseButton, action: MouseAction) {
-        guard let controller, controller.isMouseEnabled,
-            let cell = cellUnderPointer(event)
-        else { return }
+        guard let controller, controller.isMouseEnabled else { return }
+        var cell: (grid: Int, row: Int, col: Int)?
+        switch action {
+        case .press:
+            cell = cellUnderPointer(event)
+            dragGrid = cell?.grid
+        case .drag, .release:
+            if let grid = dragGrid {
+                let point = surface.convert(event.locationInWindow, from: nil)
+                if let local = surface.cell(at: point, inGrid: grid) {
+                    cell = (grid: grid, row: local.row, col: local.col)
+                }
+            }
+            if cell == nil { cell = cellUnderPointer(event) }
+            if action == .release { dragGrid = nil }
+        }
+        guard let cell else { return }
         let arguments = mouseTranslator.translate(
             button: button,
             action: action,
