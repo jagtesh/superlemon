@@ -34,6 +34,15 @@ final class WorkspaceChrome {
     private weak var surface: GridSurfaceView?
     private let projectRoot: URL
     private var confirmAlertShowing = false
+    /// Identity of the last-presented popup menu: selection changes preserve
+    /// it; anything else forces a re-anchor (see syncChrome).
+    private struct PumIdentity: Equatable {
+        let items: [PopupMenuItem]
+        let grid: Int
+        let row: Int
+        let col: Int
+    }
+    private var lastPumIdentity: PumIdentity?
     /// Returns key focus to the editor (set by AppDelegate).
     var restoreFocus: (() -> Void)?
 
@@ -168,15 +177,26 @@ final class WorkspaceChrome {
         }
 
         if let menu = chromeState.popupmenu {
-            if popupMenu.isPresented {
+            // Selection-only updates (popupmenu_select) keep the panel where
+            // it is; a NEW menu (fresh popupmenu_show: different items or
+            // anchor) must RE-ANCHOR — reusing the old frame froze the popup
+            // at stale positions across mode toggles and wildmenu reopens.
+            let anchorChanged =
+                lastPumIdentity == nil
+                || lastPumIdentity! != PumIdentity(
+                    items: menu.items, grid: menu.grid, row: menu.row, col: menu.col)
+            if popupMenu.isPresented && !anchorChanged {
                 popupMenu.render(menu)
             } else {
                 popupMenu.present(
                     anchoredAt: anchorPoint(grid: menu.grid, row: menu.row, col: menu.col),
                     in: window, model: menu)
             }
+            lastPumIdentity = PumIdentity(
+                items: menu.items, grid: menu.grid, row: menu.row, col: menu.col)
         } else {
             popupMenu.render(nil)
+            lastPumIdentity = nil
         }
 
         toasts.render(chromeState.messages)
