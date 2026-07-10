@@ -32,10 +32,12 @@ public final class MessageToastController {
     static let margin: CGFloat = 12
     static let historyCap = 200
 
-    /// Non-error toasts dismiss after this many seconds. Overridable so tests
-    /// don't wait 4 real seconds. Error toasts persist until clicked or
-    /// cleared by `msg_clear`.
-    public var autoDismissInterval: TimeInterval = 4.0
+    /// Every toast fades away after this many seconds — nothing nags; the
+    /// history log (click a toast / View ▸ Message History) is the durable
+    /// record. Overridable so tests don't wait real seconds.
+    public var autoDismissInterval: TimeInterval = 3.0
+    /// Fade-out duration; 0 removes immediately (tests, reduced motion).
+    public var fadeDuration: TimeInterval = 0.25
 
     /// 0 or 1 — a single replacing toast (or tracked headlessly).
     public var activeToastCount: Int { currentToast == nil ? 0 : 1 }
@@ -146,24 +148,33 @@ public final class MessageToastController {
         currentIsAdHoc = adHoc
         container?.addSubview(toast)
         layoutToast()
-        if !message.isError {
-            let id = message.id
-            dismissTask = Task { [weak self] in
-                let interval = self?.autoDismissInterval ?? 4.0
-                try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
-                guard !Task.isCancelled else { return }
-                self?.dismissToast(id)
-            }
+        let id = message.id
+        dismissTask = Task { [weak self] in
+            let interval = self?.autoDismissInterval ?? 3.0
+            try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            self?.dismissToast(id)
         }
     }
 
     private func removeCurrentToast() {
         dismissTask?.cancel()
         dismissTask = nil
-        currentToast?.removeFromSuperview()
+        let toast = currentToast
         currentToast = nil
         currentID = nil
         currentIsAdHoc = false
+        guard let toast else { return }
+        if fadeDuration <= 0 {
+            toast.removeFromSuperview()
+            return
+        }
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = fadeDuration
+            toast.animator().alphaValue = 0
+        }) {
+            toast.removeFromSuperview()
+        }
     }
 
     private func layoutToast() {

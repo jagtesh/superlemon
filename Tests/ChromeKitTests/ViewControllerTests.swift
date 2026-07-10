@@ -192,6 +192,7 @@ private func allText(in view: NSView) -> [String] {
         _ = NSApplication.shared
         let container = NSView(frame: NSRect(x: 0, y: 0, width: 600, height: 400))
         let controller = MessageToastController()
+        controller.fadeDuration = 0  // deterministic removal in tests
         controller.attach(to: container)
 
         controller.render([
@@ -214,6 +215,7 @@ private func allText(in view: NSView) -> [String] {
         _ = NSApplication.shared
         let container = NSView(frame: NSRect(x: 0, y: 0, width: 600, height: 400))
         let controller = MessageToastController()
+        controller.fadeDuration = 0  // deterministic removal in tests
         controller.attach(to: container)
         let one = message("one")
         controller.render([one])
@@ -231,6 +233,7 @@ private func allText(in view: NSView) -> [String] {
         _ = NSApplication.shared
         let container = NSView(frame: NSRect(x: 0, y: 0, width: 600, height: 400))
         let controller = MessageToastController()
+        controller.fadeDuration = 0  // deterministic removal in tests
         controller.attach(to: container)
 
         let msg = message("dismiss me")
@@ -249,6 +252,7 @@ private func allText(in view: NSView) -> [String] {
         _ = NSApplication.shared
         let container = NSView(frame: NSRect(x: 0, y: 0, width: 600, height: 400))
         let controller = MessageToastController()
+        controller.fadeDuration = 0  // deterministic removal in tests
         controller.attach(to: container)
         controller.render([message("a"), message("b")])
         controller.render([])  // msg_clear
@@ -264,27 +268,26 @@ private func allText(in view: NSView) -> [String] {
         #expect(controller.activeToastCount == 1)
     }
 
-    @Test func nonErrorAutoDismissesErrorPersists() async throws {
+    @Test func everyToastFadesAfterTheInterval() async throws {
         _ = NSApplication.shared
         let container = NSView(frame: NSRect(x: 0, y: 0, width: 600, height: 400))
         let controller = MessageToastController()
         controller.autoDismissInterval = 0.05
         controller.attach(to: container)
 
+        controller.fadeDuration = 0  // immediate removal for deterministic timing
         controller.render([message("transient info")])
         #expect(controller.activeToastCount == 1)
         try await Task.sleep(nanoseconds: 300_000_000)
-        #expect(controller.activeToastCount == 0, "info auto-dismisses")
+        #expect(controller.activeToastCount == 0, "info fades away")
 
         controller.render([
             message("transient info"),
-            message("E123: persistent error", kind: "emsg"),
+            message("E123: errors fade too — history is the record", kind: "emsg"),
         ])
         try await Task.sleep(nanoseconds: 300_000_000)
-        #expect(controller.activeToastCount == 1, "error persists")
-        let remaining = container.subviews.compactMap { $0 as? ToastView }
-        #expect(remaining.count == 1)
-        #expect(remaining[0].message.isError)
+        #expect(controller.activeToastCount == 0, "errors fade after the interval too")
+        #expect(controller.history.contains { $0.isError }, "…but stay in history")
     }
 
     @Test func errorToastUsesRedTint() {
