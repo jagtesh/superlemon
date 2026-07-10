@@ -70,10 +70,10 @@ final class TextRasterizer {
         "!==", "===", "<=", ">=", "!=", "==", "->", "=>", "<-",
     ]
 
-    /// Sequences with well-supported Unicode equivalents render THROUGH THE
-    /// FONT (professionally drawn, perfectly aligned), centered across the
-    /// original cells. Only the multi-bar equals family stays hand-drawn —
-    /// its codepoints (⩵ ⩶ ≢) have spotty font coverage.
+    /// Every ligature sequence renders THROUGH THE FONT as its Unicode
+    /// equivalent (professionally drawn, perfectly aligned), centered across
+    /// the original cells; Core Text's cascade supplies any glyph the
+    /// primary font lacks.
     static let ligatureSubstitutions: [String: String] = [
         "<=": "\u{2264}",  // ≤
         ">=": "\u{2265}",  // ≥
@@ -81,6 +81,9 @@ final class TextRasterizer {
         "->": "\u{2192}",  // →
         "<-": "\u{2190}",  // ←
         "=>": "\u{21D2}",  // ⇒
+        "==": "\u{2A75}",  // ⩵ two consecutive equals
+        "===": "\u{2261}",  // ≡ identical to
+        "!==": "\u{2262}",  // ≢ not identical to
     ]
 
     /// Split runs so ligature sequences become synthetic runs (cell-accurate,
@@ -239,8 +242,6 @@ final class TextRasterizer {
                     segment.glyphs.count, ctx)
             }
             ctx.restoreGState()
-        } else if run.synthetic, Self.ligatureSequences.contains(run.text) {
-            drawLigatureShape(run.text, in: rect, color: attrs.foreground, into: ctx)
         } else if fonts.powerlineGlyphs,
             run.text.unicodeScalars.count == 1,
             let scalar = run.text.unicodeScalars.first,
@@ -267,84 +268,6 @@ final class TextRasterizer {
         }
 
         drawDecorations(attrs, runRect: rect, baselineY: baselineY, into: ctx)
-    }
-
-    /// Fira-style synthesized ligatures as geometry (unflipped ctx, y-up).
-    private func drawLigatureShape(
-        _ seq: String, in rect: CGRect, color: NvimKit.RGBColor, into ctx: CGContext
-    ) {
-        ctx.saveGState()
-        defer { ctx.restoreGState() }
-        ctx.setStrokeColor(color.cgColor)
-        let thickness = max(1.2, fonts.underlineThickness * 1.2)
-        ctx.setLineWidth(thickness)
-        ctx.setLineCap(.round)
-
-        let inset = rect.width * 0.14
-        let left = rect.minX + inset
-        let right = rect.maxX - inset
-        let midY = rect.midY
-        let gap = rect.height * 0.13
-
-        func bar(_ y: CGFloat, from x0: CGFloat? = nil, to x1: CGFloat? = nil) {
-            ctx.move(to: CGPoint(x: x0 ?? left, y: y))
-            ctx.addLine(to: CGPoint(x: x1 ?? right, y: y))
-        }
-        func slash() {
-            ctx.move(to: CGPoint(x: rect.midX - rect.width * 0.11, y: midY - gap * 2.1))
-            ctx.addLine(to: CGPoint(x: rect.midX + rect.width * 0.11, y: midY + gap * 2.1))
-        }
-        func arrowHead(at x: CGFloat, y: CGFloat, back: CGFloat) {
-            ctx.move(to: CGPoint(x: back, y: y + rect.height * 0.24))
-            ctx.addLine(to: CGPoint(x: x, y: y))
-            ctx.addLine(to: CGPoint(x: back, y: y - rect.height * 0.24))
-        }
-
-        switch seq {
-        case "==":
-            bar(midY - gap)
-            bar(midY + gap)
-        case "===":
-            bar(midY - gap * 1.6)
-            bar(midY)
-            bar(midY + gap * 1.6)
-        case "!=":
-            bar(midY - gap)
-            bar(midY + gap)
-            slash()
-        case "!==":
-            bar(midY - gap * 1.6)
-            bar(midY)
-            bar(midY + gap * 1.6)
-            slash()
-        case "<=", ">=":
-            // ≤/≥: the chevron spans the SAME width as the bar beneath it —
-            // tip at one edge, open end at the other, bar directly below.
-            let pointLeft = seq == "<="
-            let tipX = pointLeft ? left : right
-            let backX = pointLeft ? right : left
-            let chevMid = midY + gap * 1.1
-            ctx.move(to: CGPoint(x: backX, y: chevMid + gap * 2.0))
-            ctx.addLine(to: CGPoint(x: tipX, y: chevMid))
-            ctx.addLine(to: CGPoint(x: backX, y: chevMid - gap * 2.0))
-            bar(midY - gap * 2.6)
-        case "->", "<-":
-            let pointLeft = seq == "<-"
-            bar(midY)
-            if pointLeft {
-                arrowHead(at: left, y: midY, back: left + rect.width * 0.3)
-            } else {
-                arrowHead(at: right, y: midY, back: right - rect.width * 0.3)
-            }
-        case "=>":
-            // Double shaft stops well short of the tip; a FULL-SIZE head.
-            bar(midY - gap, to: right - rect.width * 0.3)
-            bar(midY + gap, to: right - rect.width * 0.3)
-            arrowHead(at: right, y: midY, back: right - rect.width * 0.38)
-        default:
-            break
-        }
-        ctx.strokePath()
     }
 
     /// The five classic powerline glyphs as geometry (unflipped ctx, y-up).
