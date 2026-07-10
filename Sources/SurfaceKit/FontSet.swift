@@ -48,9 +48,12 @@ struct FontSet {
     /// runtime/fonts/ directory is registered at app launch, so FiraCode
     /// resolves even when not user-installed.
     static let symbolFontCandidates = [
+        "FiraCodeNFM-Reg",  // bundled FiraCode Nerd Font Mono (runtime/fonts/)
         "FiraCode-Regular", "JetBrainsMono-Regular", "CascadiaCode-Regular",
         "MonaspaceNeon-Regular", "Hasklig-Regular",
     ]
+    /// Carried from the spec: force built-in fallback rendering.
+    let forceSynthesis: Bool
 
     init(spec: FontSpec) {
         let base = spec.name.flatMap { NSFont(name: $0, size: spec.size) }
@@ -72,8 +75,9 @@ struct FontSet {
         let leading = CTFontGetLeading(ct)
         powerlineGlyphs = spec.powerlineGlyphs
         ligatures = spec.ligatures
+        forceSynthesis = spec.forceSynthesis
         var symbol: CTFont? = nil
-        if spec.ligatures {
+        if spec.useSymbolFont {
             for name in Self.symbolFontCandidates {
                 if let font = NSFont(name: name, size: spec.size) {
                     symbol = font as CTFont

@@ -181,14 +181,31 @@ final class NvimController {
     func applyRenderingOptions() {
         guard let surface else { return }
         var spec = surface.fontSpec
-        let defaults = UserDefaults.standard
-        spec.powerlineGlyphs = defaults.bool(forKey: "PowerlineGlyphs")
+        Self.applyDefaults(to: &spec)
         // The native bar synthesizes the same glyphs in harvested segments.
-        chrome?.statusBar.synthesizePowerline = spec.powerlineGlyphs
+        chrome?.statusBar.synthesizePowerline =
+            spec.powerlineGlyphs && (spec.useSymbolFont || spec.forceSynthesis)
+        guard spec != surface.fontSpec else { return }
+        let metricsChanged =
+            spec.size != surface.fontSpec.size || spec.name != surface.fontSpec.name
+        surface.setFont(spec)
+        if metricsChanged { sendResizeIfNeeded(force: true) }
+    }
+
+    /// Settings -> FontSpec. The editor font/size override (when set) beats
+    /// guifont; empty follows the config.
+    static func applyDefaults(to spec: inout FontSpec) {
+        let defaults = UserDefaults.standard
+        if let name = defaults.string(forKey: "EditorFontName"), !name.isEmpty {
+            spec.name = name
+        }
+        let size = defaults.double(forKey: "EditorFontSize")
+        if size >= 6, size <= 72 { spec.size = size }
+        spec.powerlineGlyphs = defaults.bool(forKey: "PowerlineGlyphs")
         spec.ligatures = defaults.object(forKey: "Ligatures") == nil
             ? true : defaults.bool(forKey: "Ligatures")
-        guard spec != surface.fontSpec else { return }
-        surface.setFont(spec)  // metrics unchanged; full re-render only
+        spec.useSymbolFont = defaults.bool(forKey: "UseSymbolFont")
+        spec.forceSynthesis = defaults.bool(forKey: "ForceGlyphFallback")
     }
 
     /// The runtime/ directory: env override → repo-relative to the executable
@@ -390,12 +407,7 @@ final class NvimController {
         lastGuifont = guifont
         lastLinespace = linespace
 
-        let defaults = UserDefaults.standard
-        var spec = FontSpec(
-            name: nil, size: 13, linespace: linespace,
-            powerlineGlyphs: defaults.bool(forKey: "PowerlineGlyphs"),
-            ligatures: defaults.object(forKey: "Ligatures") == nil
-                ? true : defaults.bool(forKey: "Ligatures"))
+        var spec = FontSpec(name: nil, size: 13, linespace: linespace)
         if let guifont, !guifont.isEmpty {
             for candidate in GuifontParser.candidates(from: guifont) {
                 let size = CGFloat(candidate.size ?? Double(surface.fontSpec.size))
@@ -406,6 +418,7 @@ final class NvimController {
                 }
             }
         }
+        Self.applyDefaults(to: &spec)  // Settings overrides beat guifont
         guard spec != surface.fontSpec else { return }
         surface.setFont(spec)
         sendResizeIfNeeded(force: true)
@@ -663,6 +676,7 @@ final class NvimController {
         guard let surface else { return }
         var spec = surface.fontSpec
         spec.size = delta == 0 ? 13 : max(6, min(72, spec.size + CGFloat(delta)))
+        Self.applyDefaults(to: &spec)  // Settings overrides beat guifont
         guard spec != surface.fontSpec else { return }
         surface.setFont(spec)
         sendResizeIfNeeded(force: true)

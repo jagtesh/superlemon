@@ -36,11 +36,18 @@ final class SettingsWindowController: NSObject {
     private var fineStack: NSStackView!
 
     // Appearance
-    private let powerlineCheckbox = NSButton(
-        checkboxWithTitle: "Draw Powerline symbols with any font",
+    private let fontNameField = NSTextField(string: "")
+    private let fontSizeField = NSTextField(string: "")
+    private let symbolFontCheckbox = NSButton(
+        checkboxWithTitle: "Use a different font for symbols (bundled FiraCode Nerd Font)",
         target: nil, action: nil)
+    private let powerlineCheckbox = NSButton(
+        checkboxWithTitle: "Powerline symbols", target: nil, action: nil)
     private let ligaturesCheckbox = NSButton(
-        checkboxWithTitle: "Enable font ligatures", target: nil, action: nil)
+        checkboxWithTitle: "Font ligatures", target: nil, action: nil)
+    private let forceFallbackCheckbox = NSButton(
+        checkboxWithTitle: "Force built-in fallback rendering (no font required)",
+        target: nil, action: nil)
 
     private let relaunchNote = NSTextField(
         wrappingLabelWithString:
@@ -63,6 +70,14 @@ final class SettingsWindowController: NSObject {
     }
 
     // MARK: - UI
+
+    private func fontRow() -> NSStackView {
+        let row = NSStackView(views: [fontNameField, fontSizeField])
+        row.orientation = .horizontal
+        fontNameField.widthAnchor.constraint(greaterThanOrEqualToConstant: 260).isActive = true
+        fontSizeField.widthAnchor.constraint(equalToConstant: 60).isActive = true
+        return row
+    }
 
     private func sectionLabel(_ text: String) -> NSTextField {
         let label = NSTextField(labelWithString: text)
@@ -109,12 +124,21 @@ final class SettingsWindowController: NSObject {
         fineStack.edgeInsets = NSEdgeInsets(top: 0, left: 20, bottom: 0, right: 0)
         fineStack.isHidden = true
 
-        powerlineCheckbox.target = self
-        powerlineCheckbox.action = #selector(appearanceToggled)
-        powerlineCheckbox.toolTip =
-            "Synthesizes the Powerline separators and branch symbol (U+E0A0, U+E0B0–B3) as vector shapes — no patched font needed."
-        ligaturesCheckbox.target = self
-        ligaturesCheckbox.action = #selector(appearanceToggled)
+        fontNameField.placeholderString = "Editor font (empty = follow guifont)"
+        fontNameField.target = self
+        fontNameField.action = #selector(appearanceToggled)
+        fontSizeField.placeholderString = "Size"
+        fontSizeField.target = self
+        fontSizeField.action = #selector(appearanceToggled)
+        for box in [symbolFontCheckbox, powerlineCheckbox, ligaturesCheckbox, forceFallbackCheckbox] {
+            box.target = self
+            box.action = #selector(appearanceToggled)
+        }
+        symbolFontCheckbox.toolTip =
+            "Ligatures and plugin symbols render through FiraCode Nerd Font Mono while text keeps your font."
+        forceFallbackCheckbox.toolTip =
+            "Superlemon draws Powerline shapes and substitutes Unicode ligature equivalents itself."
+
 
         relaunchNote.textColor = .secondaryLabelColor
         relaunchNote.font = .systemFont(ofSize: 11)
@@ -127,7 +151,8 @@ final class SettingsWindowController: NSObject {
             sectionLabel("APPLY THESE SETTINGS ON STARTUP"),
             combinedRow, fineStack,
             sectionLabel("APPEARANCE"),
-            powerlineCheckbox, ligaturesCheckbox,
+            fontRow(),
+            symbolFontCheckbox, powerlineCheckbox, ligaturesCheckbox, forceFallbackCheckbox,
             relaunchNote, relaunchButton,
         ])
         stack.orientation = .vertical
@@ -171,6 +196,11 @@ final class SettingsWindowController: NSObject {
         let ligatures =
             defaults.object(forKey: "Ligatures") == nil ? true : defaults.bool(forKey: "Ligatures")
         ligaturesCheckbox.state = ligatures ? .on : .off
+        fontNameField.stringValue = defaults.string(forKey: "EditorFontName") ?? ""
+        let size = defaults.double(forKey: "EditorFontSize")
+        fontSizeField.stringValue = size > 0 ? String(Int(size)) : ""
+        symbolFontCheckbox.state = defaults.bool(forKey: "UseSymbolFont") ? .on : .off
+        forceFallbackCheckbox.state = defaults.bool(forKey: "ForceGlyphFallback") ? .on : .off
     }
 
     // MARK: - Actions
@@ -236,6 +266,19 @@ final class SettingsWindowController: NSObject {
         let defaults = UserDefaults.standard
         defaults.set(powerlineCheckbox.state == .on, forKey: "PowerlineGlyphs")
         defaults.set(ligaturesCheckbox.state == .on, forKey: "Ligatures")
+        defaults.set(symbolFontCheckbox.state == .on, forKey: "UseSymbolFont")
+        defaults.set(forceFallbackCheckbox.state == .on, forKey: "ForceGlyphFallback")
+        let name = fontNameField.stringValue.trimmingCharacters(in: .whitespaces)
+        if name.isEmpty {
+            defaults.removeObject(forKey: "EditorFontName")
+        } else {
+            defaults.set(name, forKey: "EditorFontName")
+        }
+        if let size = Double(fontSizeField.stringValue), size >= 6, size <= 72 {
+            defaults.set(size, forKey: "EditorFontSize")
+        } else {
+            defaults.removeObject(forKey: "EditorFontSize")
+        }
         controller.applyRenderingOptions()  // immediate, no relaunch
     }
 

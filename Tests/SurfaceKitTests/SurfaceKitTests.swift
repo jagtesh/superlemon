@@ -468,6 +468,7 @@ extension CursorRenderTests {
         ])
         var spec = menlo
         spec.powerlineGlyphs = true
+        spec.forceSynthesis = true
         let fonts = FontSet(spec: spec)
         let renderer = GridRenderer(rasterizer: TextRasterizer(fonts: fonts), scale: 1)
         let d = result.damagedGrids.first { $0.grid.id == 1 }!
@@ -525,7 +526,9 @@ extension CursorRenderTests {
             .defaultColorsSet(fg: rgb(0xFF0000), bg: rgb(0x000000), special: rgb(0x00FF00)),
             line(0, text, hl: 0),
         ])
-        let fonts = FontSet(spec: menlo)  // ligatures default ON
+        var lspec = menlo
+        lspec.forceSynthesis = true  // substitution path under test
+        let fonts = FontSet(spec: lspec)
         let renderer = GridRenderer(rasterizer: TextRasterizer(fonts: fonts), scale: 1)
         let d = result.damagedGrids.first { $0.grid.id == 1 }!
         renderer.apply(grid: d.grid, damage: d.damage, highlights: result.highlights)

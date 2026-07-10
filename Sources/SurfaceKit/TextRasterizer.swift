@@ -63,6 +63,15 @@ final class TextRasterizer {
         text.unicodeScalars.contains { powerlineScalars.contains($0) }
     }
 
+    /// Private Use Area — every Nerd Font glyph a plugin can emit.
+    static func isPUA(_ scalar: Unicode.Scalar) -> Bool {
+        (0xE000...0xF8FF).contains(scalar.value)
+    }
+
+    static func containsPUA(_ text: String) -> Bool {
+        text.unicodeScalars.contains(where: isPUA)
+    }
+
     /// Programming-ligature sequences synthesized as vector glyphs when the
     /// FontSpec's `ligatures` flag is on — works with fonts that have no
     /// ligature tables (SF Mono, Menlo…). Longest-match order.
@@ -153,12 +162,16 @@ final class TextRasterizer {
     /// run (cell-accurate: columns come from the actual cells, so CJK or
     /// other non-ASCII neighbors never desync the shape's position).
     static func splitPowerlineRuns(
-        _ runs: [StyleRun], cells: ArraySlice<Cell>
+        _ runs: [StyleRun], cells: ArraySlice<Cell>, fullPUA: Bool = false
     ) -> [StyleRun] {
         var result: [StyleRun] = []
         let base = cells.startIndex
+        let matches: (Unicode.Scalar) -> Bool =
+            fullPUA
+            ? { Self.isPUA($0) }
+            : { Self.powerlineScalars.contains($0) }
         for run in runs {
-            guard containsPowerline(run.text) else {
+            guard fullPUA ? containsPUA(run.text) : containsPowerline(run.text) else {
                 result.append(run)
                 continue
             }
@@ -167,12 +180,14 @@ final class TextRasterizer {
                 let cell = cells[base + col]
                 let isPL =
                     cell.text.unicodeScalars.count == 1
-                    && powerlineScalars.contains(cell.text.unicodeScalars.first!)
+                    && matches(cell.text.unicodeScalars.first!)
                 if isPL {
                     if let p = pending { result.append(p) }
                     pending = nil
                     result.append(
-                        StyleRun(startCol: col, cellCount: 1, text: cell.text, hlID: run.hlID))
+                        StyleRun(
+                            startCol: col, cellCount: 1, text: cell.text,
+                            hlID: run.hlID, synthetic: true))
                 } else if var p = pending {
                     p.cellCount += 1
                     p.text += cell.text
@@ -226,7 +241,28 @@ final class TextRasterizer {
 
         // Glyphs.
         let baselineY = gridHeight - cellTop - fonts.baselineOffset
-        if run.synthetic, let symbol = fonts.symbolFont {
+        if run.synthetic, run.text.unicodeScalars.count == 1,
+            let scalar = run.text.unicodeScalars.first, Self.isPUA(scalar)
+        {
+            // A PUA/powerline cell: companion font first (real Nerd glyph),
+            // else the vector shapes for the classic seven (force mode).
+            if let symbol = fonts.symbolFont {
+                let shaped = cache.shapedRun(
+                    text: run.text, variant: .regular, font: symbol,
+                    cellWidth: cw, baseAdvance: fonts.symbolBaseAdvance)
+                ctx.saveGState()
+                ctx.translateBy(x: originX, y: baselineY)
+                ctx.setFillColor(attrs.foreground.cgColor)
+                for segment in shaped.segments {
+                    CTFontDrawGlyphs(
+                        segment.font, segment.glyphs, segment.positions,
+                        segment.glyphs.count, ctx)
+                }
+                ctx.restoreGState()
+            } else if Self.powerlineScalars.contains(scalar) {
+                drawPowerlineShape(scalar, in: rect, color: attrs.foreground, into: ctx)
+            }
+        } else if run.synthetic, let symbol = fonts.symbolFont {
             // The symbol companion font's own calt ligatures do the fusing:
             // shape the RAW sequence through it; per-glyph pieces land on
             // the main font's cell grid via the snapping in GlyphCache.
@@ -258,15 +294,6 @@ final class TextRasterizer {
                     segment.glyphs.count, ctx)
             }
             ctx.restoreGState()
-        } else if fonts.powerlineGlyphs,
-            run.text.unicodeScalars.count == 1,
-            let scalar = run.text.unicodeScalars.first,
-            Self.powerlineScalars.contains(scalar)
-        {
-            // Powerline cells are split into single-cell runs upstream
-            // (splitPowerlineRuns), so any neighbors — ASCII, CJK, airline's
-            // ≡/± — are unaffected. Draw the shape; done.
-            drawPowerlineShape(scalar, in: rect, color: attrs.foreground, into: ctx)
         } else if !run.text.isEmpty, !run.text.allSatisfy({ $0 == " " }) {
             let variant = FontSet.Variant(bold: attrs.bold, italic: attrs.italic)
             let shaped = cache.shapedRun(

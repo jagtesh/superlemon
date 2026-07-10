@@ -13,16 +13,26 @@ public struct FontSpec: Sendable, Equatable {
     /// Shape with the font's standard ligatures (=> ≠ etc. in fonts that
     /// have them); off forces per-character glyphs.
     public var ligatures: Bool
+    /// Route symbols/ligatures through the bundled companion font
+    /// (FiraCode Nerd Font Mono) — real calt ligatures + full Nerd glyph
+    /// coverage with any text font. Off by default.
+    public var useSymbolFont: Bool
+    /// Force Superlemon's built-in fallback rendering (vector powerline
+    /// shapes + Unicode ligature substitution) regardless of font support.
+    public var forceSynthesis: Bool
 
     public init(
         name: String? = nil, size: CGFloat = 13, linespace: CGFloat = 0,
-        powerlineGlyphs: Bool = false, ligatures: Bool = true
+        powerlineGlyphs: Bool = false, ligatures: Bool = true,
+        useSymbolFont: Bool = false, forceSynthesis: Bool = false
     ) {
         self.name = name
         self.size = size
         self.linespace = linespace
         self.powerlineGlyphs = powerlineGlyphs
         self.ligatures = ligatures
+        self.useSymbolFont = useSymbolFont
+        self.forceSynthesis = forceSynthesis
     }
 }
 

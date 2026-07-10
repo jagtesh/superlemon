@@ -85,10 +85,16 @@ final class GridRenderer {
         highlights: HighlightTable, into ctx: CGContext
     ) {
         var runs = TextRasterizer.coalesce(grid.rowCells(row))
-        if rasterizer.fonts.powerlineGlyphs {
-            runs = TextRasterizer.splitPowerlineRuns(runs, cells: grid.rowCells(row))
+        let fonts = rasterizer.fonts
+        let hasCompanion = fonts.symbolFont != nil
+        // Routing modes: companion font (real glyphs, full PUA coverage) or
+        // forced built-in synthesis; otherwise the text font is on its own
+        // (font-native rendering, per Settings).
+        if fonts.powerlineGlyphs, hasCompanion || fonts.forceSynthesis {
+            runs = TextRasterizer.splitPowerlineRuns(
+                runs, cells: grid.rowCells(row), fullPUA: hasCompanion)
         }
-        if rasterizer.fonts.ligatures {
+        if fonts.ligatures, hasCompanion || fonts.forceSynthesis {
             runs = TextRasterizer.splitLigatureRuns(runs, cells: grid.rowCells(row))
         }
         for run in runs {
