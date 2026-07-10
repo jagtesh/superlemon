@@ -44,7 +44,8 @@ final class TextRasterizer {
     /// Powerline separators/branch synthesized as vector shapes when the
     /// FontSpec asks for it — any font, no patching (U+E0A0, U+E0B0–E0B3).
     static let powerlineScalars: Set<Unicode.Scalar> = [
-        "\u{E0A0}", "\u{E0B0}", "\u{E0B1}", "\u{E0B2}", "\u{E0B3}",
+        "\u{E0A0}", "\u{E0A1}", "\u{E0A2}",
+        "\u{E0B0}", "\u{E0B1}", "\u{E0B2}", "\u{E0B3}",
     ]
 
     static func containsPowerline(_ text: String) -> Bool {
@@ -200,6 +201,30 @@ final class TextRasterizer {
             ctx.move(to: CGPoint(x: x2, y: cell.minY + cell.height * 0.12))
             ctx.addLine(to: CGPoint(x: x2, y: cell.midY))
             ctx.addLine(to: CGPoint(x: x1, y: cell.midY + cell.height * 0.18))
+            ctx.strokePath()
+        case "\u{E0A1}":  // line-number symbol: list lines
+            ctx.setStrokeColor(c)
+            ctx.setLineWidth(max(1, fonts.underlineThickness))
+            let inset = cell.width * 0.2
+            for frac in [0.3, 0.5, 0.7] {
+                let y = cell.minY + cell.height * frac
+                let short = frac == 0.5 ? cell.width * 0.18 : 0
+                ctx.move(to: CGPoint(x: cell.minX + inset, y: y))
+                ctx.addLine(to: CGPoint(x: cell.maxX - inset - short, y: y))
+            }
+            ctx.strokePath()
+        case "\u{E0A2}":  // read-only padlock
+            ctx.setStrokeColor(c)
+            ctx.setLineWidth(max(1, fonts.underlineThickness))
+            let bodyW = cell.width * 0.56
+            let bodyH = cell.height * 0.32
+            let bodyX = cell.midX - bodyW / 2
+            let bodyY = cell.minY + cell.height * 0.18
+            ctx.stroke(CGRect(x: bodyX, y: bodyY, width: bodyW, height: bodyH))
+            ctx.addArc(
+                center: CGPoint(x: cell.midX, y: bodyY + bodyH),
+                radius: bodyW * 0.32,
+                startAngle: 0, endAngle: .pi, clockwise: false)
             ctx.strokePath()
         default:
             break
