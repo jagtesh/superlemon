@@ -366,7 +366,9 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
         ctx.setFillColor(NvimKit.RGBColor(rgb: 0xFFFFFF).cgColor)
         ctx.fill(CGRect(x: 0, y: 0, width: cw, height: ch))
         let cache = GlyphCache(capacity: 8)
-        let shaped = cache.shapedRun(text: letter, variant: .regular, font: fonts.regular)
+        let shaped = cache.shapedRun(
+            text: letter, variant: .regular, font: fonts.regular,
+            cellWidth: fonts.cellSize.width, baseAdvance: fonts.baseAdvance)
         ctx.translateBy(x: 0, y: ch - fonts.baselineOffset)
         ctx.setFillColor(NvimKit.RGBColor(rgb: 0x000000).cgColor)
         for segment in shaped.segments {
