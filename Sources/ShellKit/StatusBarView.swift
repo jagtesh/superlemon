@@ -113,6 +113,9 @@ public final class StatusBarView: NSView {
     /// the command overlay.
     private let statuslineLeftStack = NSStackView()
     private let statuslineRightStack = NSStackView()
+    /// The flexible gap between left/right content; painted with the
+    /// statusline's own fill highlight while the harvested powerline shows.
+    private let spacer = NSView()
 
     /// superlemon.ui statusbar segments (runtime/CONTRACT.md): namespace →
     /// (text, color). Rendered as chips AFTER all built-in content, composed
@@ -201,7 +204,7 @@ public final class StatusBarView: NSView {
         statuslineLeftStack.setContentCompressionResistancePriority(.init(249), for: .horizontal)
         statuslineRightStack.setContentCompressionResistancePriority(.init(251), for: .horizontal)
 
-        let spacer = NSView()
+        spacer.wantsLayer = true
         spacer.setContentHuggingPriority(.init(1), for: .horizontal)
 
         stack.addArrangedSubview(modeBadge)
@@ -351,46 +354,61 @@ public final class StatusBarView: NSView {
     /// Split at the `%=` fill (a long run of spaces from nvim_eval_statusline)
     /// so the bar's own flexible spacer provides true right-alignment instead
     /// of hundreds of literal space characters.
+    /// The private-use char the plugin evaluates `%=` fills as
+    /// (runtime/lua/superlemon/statusline.lua) — unambiguous split marker.
+    static let fillMarker: Character = "\u{E000}"
+
+    /// Split at the `%=` fill so the bar's flexible spacer provides true
+    /// right-alignment. Fill runs arrive as U+E000 characters (never real
+    /// content); the fill segment's highlight colors the spacer. Falls back
+    /// to the legacy ≥4-space heuristic when no marker is present (older
+    /// runtime plugin).
     static func splitAtFill(
         _ segments: [StatuslineSegment]
-    ) -> (left: [StatuslineSegment], right: [StatuslineSegment]) {
-        var left: [StatuslineSegment] = []
-        var right: [StatuslineSegment] = []
-        var filled = false
-        for segment in segments {
-            let trimmed = segment.text.trimmingCharacters(in: .whitespaces)
-            if !filled, trimmed.isEmpty, segment.text.count >= 4 {
-                filled = true  // the fill itself is dropped
-                continue
-            }
-            if filled {
-                right.append(segment)
-            } else if !filled, trimmed.isEmpty, segment.text.count >= 4 {
-                continue
-            } else {
-                // Long space runs INSIDE a styled segment (fill inherits the
-                // neighboring highlight) also mark the split.
-                if !filled, let range = segment.text.range(of: "    "),
-                    segment.text.count >= 8
-                {
-                    var head = segment
-                    head.text = String(segment.text[..<range.lowerBound])
-                    var tail = segment
-                    tail.text = segment.text[range.upperBound...]
-                        .trimmingCharacters(in: .whitespaces)
-                    if !head.text.trimmingCharacters(in: .whitespaces).isEmpty {
-                        left.append(head)
-                    }
-                    if !tail.text.isEmpty {
-                        right.append(tail)
-                    }
-                    filled = true
+    ) -> (left: [StatuslineSegment], right: [StatuslineSegment], fill: StatuslineSegment?) {
+        if segments.contains(where: { $0.text.contains(fillMarker) }) {
+            var left: [StatuslineSegment] = []
+            var right: [StatuslineSegment] = []
+            var fill: StatuslineSegment? = nil
+            for segment in segments {
+                if !segment.text.contains(fillMarker) {
+                    if fill == nil { left.append(segment) } else { right.append(segment) }
+                    continue
+                }
+                // First marker segment is THE fill; keep any real text around
+                // the markers on the appropriate side.
+                let parts = segment.text.split(
+                    separator: fillMarker, omittingEmptySubsequences: true)
+                var head = segment
+                head.text = parts.first.map(String.init) ?? ""
+                var tail = segment
+                tail.text = parts.dropFirst().joined()
+                if fill == nil {
+                    if !head.text.isEmpty { left.append(head) }
+                    fill = segment
+                    if !tail.text.isEmpty { right.append(tail) }
                 } else {
-                    left.append(segment)
+                    var cleaned = segment
+                    cleaned.text = segment.text.filter { $0 != Self.fillMarker }
+                    if !cleaned.text.isEmpty { right.append(cleaned) }
                 }
             }
+            return (left, right, fill)
         }
-        return (left, right)
+
+        // Legacy fallback: first ≥4-space run marks the fill.
+        var left: [StatuslineSegment] = []
+        var right: [StatuslineSegment] = []
+        var fill: StatuslineSegment? = nil
+        for segment in segments {
+            let trimmed = segment.text.trimmingCharacters(in: .whitespaces)
+            if fill == nil, trimmed.isEmpty, segment.text.count >= 4 {
+                fill = segment
+                continue
+            }
+            if fill == nil { left.append(segment) } else { right.append(segment) }
+        }
+        return (left, right, fill)
     }
 
     static func attributedStatusline(
@@ -431,8 +449,12 @@ public final class StatusBarView: NSView {
                 $0.removeFromSuperview()
             }
         }
-        guard let segments else { return }
-        let (left, right) = Self.splitAtFill(segments)
+        guard let segments else {
+            spacer.layer?.backgroundColor = nil
+            return
+        }
+        let (left, right, fill) = Self.splitAtFill(segments)
+        spacer.layer?.backgroundColor = fill?.bg.map { Self.colorFromRGB($0).cgColor } ?? nil
         for (side, stackView) in [(left, statuslineLeftStack), (right, statuslineRightStack)] {
             for var segment in side {
                 // Collapse residual fill runs (airline pads sections with

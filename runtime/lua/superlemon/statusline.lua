@@ -34,6 +34,10 @@ function M.eval()
     winid = win,
     highlights = true,
     maxwidth = 500,
+    -- Private-use fill char: %= fills become unambiguously identifiable by
+    -- the GUI (U+E000 cannot occur in real content), so interior spaces in
+    -- e.g. term://…fzf --flags… names are never mistaken for the split.
+    fillchar = vim.fn.nr2char(0xE000),
   })
   if not ok or type(res) ~= "table" or type(res.str) ~= "string" then
     return nil
