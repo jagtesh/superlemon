@@ -101,7 +101,8 @@ final class CursorLayer: CALayer {
         let attrs = flush.highlights.resolved(id: cell.hlID)
         let variant = FontSet.Variant(bold: attrs.bold, italic: attrs.italic)
         let shaped = cache.shapedRun(
-            text: cell.text, variant: variant, font: fonts.font(for: variant))
+            text: cell.text, variant: variant, font: fonts.font(for: variant),
+            cellWidth: cw, baseAdvance: fonts.baseAdvance)
         ctx.translateBy(x: 0, y: ch - fonts.baselineOffset)
         ctx.setFillColor(glyphColor.cgColor)
         for segment in shaped.segments {

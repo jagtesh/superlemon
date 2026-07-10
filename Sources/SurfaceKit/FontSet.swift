@@ -22,6 +22,11 @@ struct FontSet {
     let italic: CTFont
     let boldItalic: CTFont
     let cellSize: CGSize
+    /// The font's true (fractional) monospace advance — cellSize.width is
+    /// this ceiled. Glyph positions snap from one to the other (see
+    /// GlyphCache): without snapping, run-splits (e.g. visual selection)
+    /// re-anchor text and visibly change letter spacing.
+    let baseAdvance: CGFloat
     /// Distance from the top edge of a cell down to the text baseline.
     let baselineOffset: CGFloat
     /// Underline geometry from the base font (position is below baseline).
@@ -46,6 +51,7 @@ struct FontSet {
         let ascent = CTFontGetAscent(ct)
         let descent = CTFontGetDescent(ct)
         let leading = CTFontGetLeading(ct)
+        baseAdvance = max(1, advance.width)
         cellSize = CGSize(
             width: max(1, ceil(advance.width)),
             height: max(1, ceil(ascent + descent + leading) + spec.linespace))

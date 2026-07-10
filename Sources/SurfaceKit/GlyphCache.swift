@@ -34,7 +34,10 @@ final class GlyphCache {
         self.capacity = max(8, capacity)
     }
 
-    func shapedRun(text: String, variant: FontSet.Variant, font: CTFont) -> ShapedRun {
+    func shapedRun(
+        text: String, variant: FontSet.Variant, font: CTFont,
+        cellWidth: CGFloat, baseAdvance: CGFloat
+    ) -> ShapedRun {
         tick += 1
         let key = Key(text: text, variant: variant.rawValue)
         if let entry = store[key] {
@@ -43,7 +46,8 @@ final class GlyphCache {
             return entry.run
         }
         misses += 1
-        let run = Self.shape(text: text, font: font)
+        let run = Self.shape(
+            text: text, font: font, cellWidth: cellWidth, baseAdvance: baseAdvance)
         store[key] = (run, tick)
         evictIfNeeded()
         return run
@@ -51,7 +55,9 @@ final class GlyphCache {
 
     /// Shape one string with Core Text: ligatures form naturally within the
     /// run; font cascade handles fallback for scripts the base font lacks.
-    private static func shape(text: String, font: CTFont) -> ShapedRun {
+    private static func shape(
+        text: String, font: CTFont, cellWidth: CGFloat, baseAdvance: CGFloat
+    ) -> ShapedRun {
         let attributed = NSAttributedString(
             string: text,
             attributes: [NSAttributedString.Key(kCTFontAttributeName as String): font])
@@ -65,6 +71,16 @@ final class GlyphCache {
             var positions = [CGPoint](repeating: .zero, count: count)
             CTRunGetGlyphs(run, CFRange(location: 0, length: 0), &glyphs)
             CTRunGetPositions(run, CFRange(location: 0, length: 0), &positions)
+            // Snap each glyph to its cell column: natural mono advances are
+            // fractional (7.83…) while cells are integral; without this,
+            // splitting a run (visual selection) re-anchors the tail and the
+            // letter spacing visibly shifts.
+            if baseAdvance > 0, cellWidth > 0 {
+                for i in positions.indices {
+                    let column = (positions[i].x / baseAdvance).rounded()
+                    positions[i].x = column * cellWidth
+                }
+            }
             let attrs = CTRunGetAttributes(run) as NSDictionary
             let runFont = attrs[kCTFontAttributeName as String] as! CTFont
             segments.append(.init(font: runFont, glyphs: glyphs, positions: positions))

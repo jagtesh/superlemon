@@ -82,7 +82,8 @@ final class TextRasterizer {
         if !run.text.isEmpty, !run.text.allSatisfy({ $0 == " " }) {
             let variant = FontSet.Variant(bold: attrs.bold, italic: attrs.italic)
             let shaped = cache.shapedRun(
-                text: run.text, variant: variant, font: fonts.font(for: variant))
+                text: run.text, variant: variant, font: fonts.font(for: variant),
+                cellWidth: cw, baseAdvance: fonts.baseAdvance)
             ctx.saveGState()
             ctx.translateBy(x: originX, y: baselineY)
             ctx.setFillColor(attrs.foreground.cgColor)

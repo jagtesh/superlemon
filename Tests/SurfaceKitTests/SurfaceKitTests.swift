@@ -277,9 +277,9 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
     @Test func repeatedShapingHitsCache() {
         let fonts = FontSet(spec: menlo)
         let cache = GlyphCache(capacity: 64)
-        _ = cache.shapedRun(text: "hello", variant: .regular, font: fonts.regular)
-        _ = cache.shapedRun(text: "hello", variant: .regular, font: fonts.regular)
-        _ = cache.shapedRun(text: "hello", variant: .bold, font: fonts.bold)
+        _ = cache.shapedRun(text: "hello", variant: .regular, font: fonts.regular, cellWidth: 8, baseAdvance: 7.8)
+        _ = cache.shapedRun(text: "hello", variant: .regular, font: fonts.regular, cellWidth: 8, baseAdvance: 7.8)
+        _ = cache.shapedRun(text: "hello", variant: .bold, font: fonts.bold, cellWidth: 8, baseAdvance: 7.8)
         #expect(cache.hits == 1)
         #expect(cache.misses == 2)
     }
@@ -288,11 +288,11 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
         let fonts = FontSet(spec: menlo)
         let cache = GlyphCache(capacity: 8)
         for i in 0..<50 {
-            _ = cache.shapedRun(text: "word\(i)", variant: .regular, font: fonts.regular)
+            _ = cache.shapedRun(text: "word\(i)", variant: .regular, font: fonts.regular, cellWidth: 8, baseAdvance: 7.8)
         }
         #expect(cache.misses == 50)
         // Everything distinct: eviction ran; re-shaping an early entry misses.
-        _ = cache.shapedRun(text: "word0", variant: .regular, font: fonts.regular)
+        _ = cache.shapedRun(text: "word0", variant: .regular, font: fonts.regular, cellWidth: 8, baseAdvance: 7.8)
         #expect(cache.misses == 51)
     }
 }
@@ -436,7 +436,9 @@ extension CursorRenderTests {
             ctx.setFillColor(NvimKit.RGBColor(rgb: 0xFFFFFF).cgColor)
             ctx.fill(CGRect(x: 0, y: 0, width: cw, height: ch))
             let cache = GlyphCache(capacity: 8)
-            let shaped = cache.shapedRun(text: "b", variant: variant, font: fonts.font(for: variant))
+            let shaped = cache.shapedRun(
+                text: "b", variant: variant, font: fonts.font(for: variant),
+                cellWidth: fonts.cellSize.width, baseAdvance: fonts.baseAdvance)
             ctx.translateBy(x: 0, y: ch - fonts.baselineOffset)
             ctx.setFillColor(NvimKit.RGBColor(rgb: 0x000000).cgColor)
             for s in shaped.segments {
