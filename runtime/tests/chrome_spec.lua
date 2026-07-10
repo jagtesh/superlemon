@@ -82,4 +82,10 @@ H.eq(last_notify("superlemon.chrome").native_tabs, false, "chrome_toggle flips t
 require("superlemon").setup(1)
 H.ok(true, "re-setup with chrome module does not error")
 
+-- Startup-only tab line hiding (Settings ▸ Customize ▸ hide editor tabs).
+vim.o.showtabline = 2
+vim.g.superlemon_hide_tabline = 1
+require("superlemon").setup(1)
+H.eq(vim.o.showtabline, 0, "hide_tabline releases the editor's tab line")
+
 H.finish()

@@ -29,6 +29,9 @@ final class GlyphCache {
     let capacity: Int
     private(set) var hits = 0
     private(set) var misses = 0
+    /// Standard ligatures on/off; set once by the owning TextRasterizer
+    /// (the cache is rebuilt on font changes, so entries never mix modes).
+    var ligatures = true
 
     init(capacity: Int = 4096) {
         self.capacity = max(8, capacity)
@@ -46,7 +49,7 @@ final class GlyphCache {
             return entry.run
         }
         misses += 1
-        let run = Self.shape(
+        let run = shape(
             text: text, font: font, cellWidth: cellWidth, baseAdvance: baseAdvance)
         store[key] = (run, tick)
         evictIfNeeded()
@@ -55,12 +58,15 @@ final class GlyphCache {
 
     /// Shape one string with Core Text: ligatures form naturally within the
     /// run; font cascade handles fallback for scripts the base font lacks.
-    private static func shape(
+    private func shape(
         text: String, font: CTFont, cellWidth: CGFloat, baseAdvance: CGFloat
     ) -> ShapedRun {
         let attributed = NSAttributedString(
             string: text,
-            attributes: [NSAttributedString.Key(kCTFontAttributeName as String): font])
+            attributes: [
+                NSAttributedString.Key(kCTFontAttributeName as String): font,
+                NSAttributedString.Key(kCTLigatureAttributeName as String): ligatures ? 1 : 0,
+            ])
         let line = CTLineCreateWithAttributedString(attributed)
         var segments: [ShapedRun.Segment] = []
         for run in (CTLineGetGlyphRuns(line) as NSArray) {

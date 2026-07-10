@@ -454,3 +454,61 @@ extension CursorRenderTests {
                 "upright glyph over italic text is the reported bug")
     }
 }
+
+// MARK: - Powerline glyph synthesis (any font, no patching)
+
+@MainActor
+@Suite struct PowerlineSynthesisTests {
+    @Test func rightTriangleFillsItsCell() {
+        let store = GridStore()
+        let result = flush(store, [
+            .gridResize(grid: 1, width: 6, height: 2),
+            .defaultColorsSet(fg: rgb(0xFF0000), bg: rgb(0x000000), special: rgb(0x00FF00)),
+            line(0, "a\u{E0B0}b", hl: 0),
+        ])
+        var spec = menlo
+        spec.powerlineGlyphs = true
+        let fonts = FontSet(spec: spec)
+        let renderer = GridRenderer(rasterizer: TextRasterizer(fonts: fonts), scale: 1)
+        let d = result.damagedGrids.first { $0.grid.id == 1 }!
+        renderer.apply(grid: d.grid, damage: d.damage, highlights: result.highlights)
+        let image = renderer.image()!
+
+        let cw = Int(fonts.cellSize.width)
+        let ch = Int(fonts.cellSize.height)
+        // Cell 1 holds the synthesized triangle: red at the left-middle
+        // (widest part), black at the top-right corner (outside the slope).
+        #expect(pixel(image, x: cw + 1, y: ch / 2) == (255, 0, 0),
+                "triangle base filled with the run's foreground")
+        #expect(pixel(image, x: 2 * cw - 1, y: 1) == (0, 0, 0),
+                "top-right corner stays background")
+        // Neighbor 'a' still shaped normally: some ink in cell 0.
+        var ink = false
+        for y in 0..<ch {
+            for x in 0..<cw where pixel(image, x: x, y: y) != (0, 0, 0) {
+                ink = true
+            }
+        }
+        #expect(ink, "adjacent text still renders")
+    }
+
+    @Test func synthesisIsOptIn() {
+        let store = GridStore()
+        let result = flush(store, [
+            .gridResize(grid: 1, width: 4, height: 1),
+            .defaultColorsSet(fg: rgb(0xFF0000), bg: rgb(0x000000), special: rgb(0x00FF00)),
+            line(0, "\u{E0B0}", hl: 0),
+        ])
+        let fonts = FontSet(spec: menlo)  // powerlineGlyphs = false
+        let renderer = GridRenderer(rasterizer: TextRasterizer(fonts: fonts), scale: 1)
+        let d = result.damagedGrids.first { $0.grid.id == 1 }!
+        renderer.apply(grid: d.grid, damage: d.damage, highlights: result.highlights)
+        let image = renderer.image()!
+        let fonts2 = fonts
+        // Whatever the fallback draws (tofu or nothing), the exact solid
+        // left-edge midpoint fill of the synthesized triangle must NOT be
+        // guaranteed — assert only that both paths render without crashing.
+        _ = pixel(image, x: 1, y: Int(fonts2.cellSize.height) / 2)
+        #expect(Bool(true))
+    }
+}

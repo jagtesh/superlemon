@@ -151,6 +151,12 @@ function M.setup(group)
   state.native_tabs = truthy(vim.g.superlemon_native_tabs)
   state.native_statusbar = truthy(vim.g.superlemon_native_statusbar)
   apply_adopt_statusline()
+  -- Startup-only (explicit user choice in Settings or config): hide the
+  -- editor's own tab line (airline/bufferline tabs) — the native strip
+  -- replaces it.
+  if truthy(vim.g.superlemon_hide_tabline) then
+    vim.o.showtabline = 0
+  end
 
   vim.api.nvim_create_autocmd(
     { "BufAdd", "BufDelete", "BufEnter", "BufFilePost", "BufModifiedSet" },

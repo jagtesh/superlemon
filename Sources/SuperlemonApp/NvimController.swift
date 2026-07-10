@@ -140,12 +140,53 @@ final class NvimController {
                     .string(
                         "local path, chan = ...\n"
                             + "vim.opt.runtimepath:prepend(path)\n"
+                            + Self.startupChromeLua()
                             + "require('superlemon').setup(chan)"),
                     .array([.string(runtime.path), .int(Int64(channelID))]),
                 ])
         } catch {
             NSLog("superlemon: runtime plugin bootstrap failed: \(error)")
         }
+    }
+
+    /// Settings ▸ "On startup": inject the user's explicit chrome choices as
+    /// g: vars AFTER their config loaded, BEFORE plugin setup reads them.
+    /// Injected ONLY when the user has actually chosen (keys present) —
+    /// untouched settings leave the config in charge (faithfulness).
+    static func startupChromeLua() -> String {
+        let defaults = UserDefaults.standard
+        guard let mode = defaults.string(forKey: "StartupChromeMode") else { return "" }
+        let tabs: Bool
+        let bar: Bool
+        let adopt: Bool
+        let hideTabline: Bool
+        if mode == "combined" {
+            let on = defaults.bool(forKey: "StartupChromeCombinedOn")
+            (tabs, bar, adopt, hideTabline) = (on, on, on, on)
+        } else {
+            tabs = defaults.bool(forKey: "StartupNativeTabs")
+            bar = defaults.bool(forKey: "StartupNativeBar")
+            adopt = defaults.bool(forKey: "StartupAdoptStatusline")
+            hideTabline = defaults.bool(forKey: "StartupHideTabline")
+        }
+        func lua(_ name: String, _ on: Bool) -> String {
+            "vim.g.superlemon_\(name) = \(on ? 1 : 0)\n"
+        }
+        return lua("native_tabs", tabs) + lua("native_statusbar", bar)
+            + lua("adopt_statusline", adopt) + lua("hide_tabline", hideTabline)
+    }
+
+    /// Settings ▸ Appearance: applied immediately (and picked up by every
+    /// future FontSpec build).
+    func applyRenderingOptions() {
+        guard let surface else { return }
+        var spec = surface.fontSpec
+        let defaults = UserDefaults.standard
+        spec.powerlineGlyphs = defaults.bool(forKey: "PowerlineGlyphs")
+        spec.ligatures = defaults.object(forKey: "Ligatures") == nil
+            ? true : defaults.bool(forKey: "Ligatures")
+        guard spec != surface.fontSpec else { return }
+        surface.setFont(spec)  // metrics unchanged; full re-render only
     }
 
     /// The runtime/ directory: env override → repo-relative to the executable
@@ -347,12 +388,18 @@ final class NvimController {
         lastGuifont = guifont
         lastLinespace = linespace
 
-        var spec = FontSpec(name: nil, size: 13, linespace: linespace)
+        let defaults = UserDefaults.standard
+        var spec = FontSpec(
+            name: nil, size: 13, linespace: linespace,
+            powerlineGlyphs: defaults.bool(forKey: "PowerlineGlyphs"),
+            ligatures: defaults.object(forKey: "Ligatures") == nil
+                ? true : defaults.bool(forKey: "Ligatures"))
         if let guifont, !guifont.isEmpty {
             for candidate in GuifontParser.candidates(from: guifont) {
                 let size = CGFloat(candidate.size ?? Double(surface.fontSpec.size))
                 if NSFont(name: candidate.name, size: size) != nil {
-                    spec = FontSpec(name: candidate.name, size: size, linespace: linespace)
+                    spec.name = candidate.name
+                    spec.size = size
                     break
                 }
             }

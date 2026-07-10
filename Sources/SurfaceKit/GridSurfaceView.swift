@@ -7,10 +7,22 @@ public struct FontSpec: Sendable, Equatable {
     public var name: String?
     public var size: CGFloat
     public var linespace: CGFloat
-    public init(name: String? = nil, size: CGFloat = 13, linespace: CGFloat = 0) {
+    /// Synthesize Powerline separators/branch (U+E0A0, U+E0B0–B3) as vector
+    /// shapes — works with ANY font, no patched font required.
+    public var powerlineGlyphs: Bool
+    /// Shape with the font's standard ligatures (=> ≠ etc. in fonts that
+    /// have them); off forces per-character glyphs.
+    public var ligatures: Bool
+
+    public init(
+        name: String? = nil, size: CGFloat = 13, linespace: CGFloat = 0,
+        powerlineGlyphs: Bool = false, ligatures: Bool = true
+    ) {
         self.name = name
         self.size = size
         self.linespace = linespace
+        self.powerlineGlyphs = powerlineGlyphs
+        self.ligatures = ligatures
     }
 }
 

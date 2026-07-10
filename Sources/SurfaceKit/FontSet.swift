@@ -32,6 +32,9 @@ struct FontSet {
     /// Underline geometry from the base font (position is below baseline).
     let underlineOffset: CGFloat
     let underlineThickness: CGFloat
+    /// Rendering flags carried from the FontSpec (see FontSpec docs).
+    let powerlineGlyphs: Bool
+    let ligatures: Bool
 
     init(spec: FontSpec) {
         let base = spec.name.flatMap { NSFont(name: $0, size: spec.size) }
@@ -51,6 +54,8 @@ struct FontSet {
         let ascent = CTFontGetAscent(ct)
         let descent = CTFontGetDescent(ct)
         let leading = CTFontGetLeading(ct)
+        powerlineGlyphs = spec.powerlineGlyphs
+        ligatures = spec.ligatures
         baseAdvance = max(1, advance.width)
         cellSize = CGSize(
             width: max(1, ceil(advance.width)),

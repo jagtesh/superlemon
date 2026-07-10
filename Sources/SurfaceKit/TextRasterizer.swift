@@ -38,6 +38,17 @@ final class TextRasterizer {
     init(fonts: FontSet, cacheCapacity: Int = 4096) {
         self.fonts = fonts
         self.cache = GlyphCache(capacity: cacheCapacity)
+        self.cache.ligatures = fonts.ligatures
+    }
+
+    /// Powerline separators/branch synthesized as vector shapes when the
+    /// FontSpec asks for it — any font, no patching (U+E0A0, U+E0B0–E0B3).
+    static let powerlineScalars: Set<Unicode.Scalar> = [
+        "\u{E0A0}", "\u{E0B0}", "\u{E0B1}", "\u{E0B2}", "\u{E0B3}",
+    ]
+
+    static func containsPowerline(_ text: String) -> Bool {
+        text.unicodeScalars.contains { powerlineScalars.contains($0) }
     }
 
     /// Merge a row's cells into style runs. Breaks on hlID change; empty-text
@@ -79,7 +90,14 @@ final class TextRasterizer {
 
         // Glyphs.
         let baselineY = gridHeight - cellTop - fonts.baselineOffset
-        if !run.text.isEmpty, !run.text.allSatisfy({ $0 == " " }) {
+        if fonts.powerlineGlyphs, Self.containsPowerline(run.text),
+            run.text.unicodeScalars.allSatisfy({ $0.isASCII || Self.powerlineScalars.contains($0) })
+        {
+            // Mixed run of ASCII + powerline chars (the only context these
+            // appear in): draw powerline scalars as shapes, shape the rest.
+            drawMixedPowerlineRun(
+                run, rect: rect, baselineY: baselineY, attrs: attrs, into: ctx)
+        } else if !run.text.isEmpty, !run.text.allSatisfy({ $0 == " " }) {
             let variant = FontSet.Variant(bold: attrs.bold, italic: attrs.italic)
             let shaped = cache.shapedRun(
                 text: run.text, variant: variant, font: fonts.font(for: variant),
@@ -96,6 +114,107 @@ final class TextRasterizer {
         }
 
         drawDecorations(attrs, runRect: rect, baselineY: baselineY, into: ctx)
+    }
+
+    /// Draw a run whose scalars are ASCII and/or powerline symbols: text
+    /// spans go through the normal shaping cache at their column offsets;
+    /// powerline scalars become vector shapes filling their cell.
+    private func drawMixedPowerlineRun(
+        _ run: StyleRun, rect: CGRect, baselineY: CGFloat,
+        attrs: ResolvedAttrs, into ctx: CGContext
+    ) {
+        let cw = fonts.cellSize.width
+        let variant = FontSet.Variant(bold: attrs.bold, italic: attrs.italic)
+        var col = run.startCol
+        var pending = ""
+        var pendingStart = col
+
+        func flushPending() {
+            guard !pending.isEmpty, !pending.allSatisfy({ $0 == " " }) else {
+                pending = ""
+                return
+            }
+            let shaped = cache.shapedRun(
+                text: pending, variant: variant, font: fonts.font(for: variant),
+                cellWidth: cw, baseAdvance: fonts.baseAdvance)
+            ctx.saveGState()
+            ctx.translateBy(x: CGFloat(pendingStart) * cw, y: baselineY)
+            ctx.setFillColor(attrs.foreground.cgColor)
+            for segment in shaped.segments {
+                CTFontDrawGlyphs(
+                    segment.font, segment.glyphs, segment.positions,
+                    segment.glyphs.count, ctx)
+            }
+            ctx.restoreGState()
+            pending = ""
+        }
+
+        for scalar in run.text.unicodeScalars {
+            if Self.powerlineScalars.contains(scalar) {
+                flushPending()
+                let cell = CGRect(
+                    x: CGFloat(col) * cw, y: rect.minY,
+                    width: cw, height: rect.height)
+                drawPowerlineShape(scalar, in: cell, color: attrs.foreground, into: ctx)
+                col += 1
+                pendingStart = col
+            } else {
+                if pending.isEmpty { pendingStart = col }
+                pending.unicodeScalars.append(scalar)
+                col += 1
+            }
+        }
+        flushPending()
+    }
+
+    /// The five classic powerline glyphs as geometry (unflipped ctx, y-up).
+    private func drawPowerlineShape(
+        _ scalar: Unicode.Scalar, in cell: CGRect,
+        color: NvimKit.RGBColor, into ctx: CGContext
+    ) {
+        ctx.saveGState()
+        defer { ctx.restoreGState() }
+        let c = color.cgColor
+        switch scalar {
+        case "\u{E0B0}":  // solid right-pointing triangle
+            ctx.setFillColor(c)
+            ctx.move(to: CGPoint(x: cell.minX, y: cell.minY))
+            ctx.addLine(to: CGPoint(x: cell.minX, y: cell.maxY))
+            ctx.addLine(to: CGPoint(x: cell.maxX, y: cell.midY))
+            ctx.closePath()
+            ctx.fillPath()
+        case "\u{E0B2}":  // solid left-pointing triangle
+            ctx.setFillColor(c)
+            ctx.move(to: CGPoint(x: cell.maxX, y: cell.minY))
+            ctx.addLine(to: CGPoint(x: cell.maxX, y: cell.maxY))
+            ctx.addLine(to: CGPoint(x: cell.minX, y: cell.midY))
+            ctx.closePath()
+            ctx.fillPath()
+        case "\u{E0B1}", "\u{E0B3}":  // thin chevrons
+            ctx.setStrokeColor(c)
+            ctx.setLineWidth(max(1, fonts.underlineThickness))
+            ctx.setLineJoin(.miter)
+            let leftPointing = scalar == "\u{E0B3}"
+            let tipX = leftPointing ? cell.minX + 1 : cell.maxX - 1
+            let backX = leftPointing ? cell.maxX - 1 : cell.minX + 1
+            ctx.move(to: CGPoint(x: backX, y: cell.maxY - 1))
+            ctx.addLine(to: CGPoint(x: tipX, y: cell.midY))
+            ctx.addLine(to: CGPoint(x: backX, y: cell.minY + 1))
+            ctx.strokePath()
+        case "\u{E0A0}":  // branch
+            ctx.setStrokeColor(c)
+            ctx.setLineWidth(max(1, fonts.underlineThickness))
+            let x1 = cell.minX + cell.width * 0.32
+            let x2 = cell.minX + cell.width * 0.72
+            ctx.move(to: CGPoint(x: x1, y: cell.minY + cell.height * 0.12))
+            ctx.addLine(to: CGPoint(x: x1, y: cell.maxY - cell.height * 0.12))
+            ctx.move(to: CGPoint(x: x2, y: cell.minY + cell.height * 0.12))
+            ctx.addLine(to: CGPoint(x: x2, y: cell.midY))
+            ctx.addLine(to: CGPoint(x: x1, y: cell.midY + cell.height * 0.18))
+            ctx.strokePath()
+        default:
+            break
+        }
     }
 
     private func drawDecorations(

@@ -248,11 +248,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             menuItem.state = (chrome?.nativeTabs ?? false) ? .on : .off
         case #selector(toggleNativeStatusBar(_:)):
             menuItem.state = (chrome?.nativeStatusbar ?? false) ? .on : .off
-        case #selector(toggleManagedConfig(_:)):
-            // Checked = the USER's init.vim is in charge (managed config off).
-            menuItem.state =
-                UserDefaults.standard.bool(
-                    forKey: NvimController.managedConfigDefaultsKey) ? .off : .on
         default:
             break
         }
@@ -306,13 +301,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             keyEquivalent: ",")
         settingsItem.target = self
         appMenu.addItem(settingsItem)
-        let managedConfigItem = NSMenuItem(
-            title: "Use My Neovim Config",
-            action: #selector(toggleManagedConfig(_:)),
-            keyEquivalent: "")
-        managedConfigItem.target = self
-        appMenu.addItem(managedConfigItem)
-        appMenu.addItem(.separator())
         appMenu.addItem(
             NSMenuItem(
                 title: "Quit Superlemon",
