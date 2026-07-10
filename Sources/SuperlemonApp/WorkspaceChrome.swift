@@ -226,9 +226,15 @@ final class WorkspaceChrome {
                 // would descend below the window, under the dock).
                 return NSPoint(x: statusBar.frame.minX + 8, y: statusBar.frame.maxY)
             }
-            // Wildmenu: anchor under the floating cmdline panel.
-            let panelFrame = contentView.convert(cmdlinePanel.panel.frame, from: nil)
-            return NSPoint(x: panelFrame.minX + 16, y: panelFrame.minY)
+            // Wildmenu: anchor under the floating cmdline panel. The panel
+            // is its OWN window — its frame is in SCREEN coordinates and
+            // must round-trip through the host window (treating it as
+            // window-local put the popup at the bottom of the window,
+            // nowhere near the cmdline).
+            let screenFrame = cmdlinePanel.panel.frame
+            let inWindow = window.convertFromScreen(screenFrame)
+            let panelFrame = contentView.convert(inWindow, from: nil)
+            return NSPoint(x: panelFrame.minX + 16, y: panelFrame.minY - 2)
         }
         guard let surface, let gridRect = surface.rect(ofGrid: grid) else { return .zero }
         // Surface is flipped (top-left origin); convert() handles the flip.
