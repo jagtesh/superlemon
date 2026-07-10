@@ -71,6 +71,7 @@ final class WorkspaceChrome {
         self.window = window
         self.surface = surface
         toasts.attach(to: window)
+        statusBar.synthesizePowerline = UserDefaults.standard.bool(forKey: "PowerlineGlyphs")
         sidebar.setRoot(projectRoot)
         statusBar.render(StatusModel(project: projectRoot.lastPathComponent), dark: isDark)
         Task { await fileIndex.refresh() }

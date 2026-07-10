@@ -100,6 +100,16 @@ public final class StatusBarView: NSView {
     private let commandLabel = NSTextField(labelWithString: "")
 
     private var isDark = false
+    /// Synthesize Powerline glyphs (U+E0A0–A2, E0B0–B3) in harvested
+    /// statusline segments as vector shape views — mirrors the grid
+    /// renderer's setting; set by the app from the same preference.
+    public var synthesizePowerline = false {
+        didSet {
+            if synthesizePowerline != oldValue, activeStatusline != nil {
+                rebuildStatuslineStacks(activeStatusline, dark: isDark)
+            }
+        }
+    }
     public private(set) var model = StatusModel()
     /// Non-nil while the command-line overlay occupies the flexible middle
     /// of the bar (see `renderCommand(_:)`).
@@ -462,17 +472,18 @@ public final class StatusBarView: NSView {
                 // owns alignment; giant space runs must not demand width.
                 segment.text = segment.text.replacingOccurrences(
                     of: "   +", with: "  ", options: .regularExpression)
-                stackView.addArrangedSubview(Self.segmentBlock(segment, dark: dark))
+                stackView.addArrangedSubview(segmentBlock(segment, dark: dark))
             }
         }
     }
 
-    /// One powerline block: opaque full-bar-height fill with a centered label.
-    private static func segmentBlock(_ segment: StatuslineSegment, dark: Bool) -> NSView {
+    /// One powerline block: opaque full-bar-height fill; text runs render as
+    /// labels, powerline scalars as vector shape views (when enabled).
+    private func segmentBlock(_ segment: StatuslineSegment, dark: Bool) -> NSView {
         let container = NSView()
         container.wantsLayer = true
         if let bg = segment.bg {
-            container.layer?.backgroundColor = colorFromRGB(bg).cgColor
+            container.layer?.backgroundColor = Self.colorFromRGB(bg).cgColor
         }
         var font = NSFont.monospacedSystemFont(
             ofSize: 11, weight: segment.bold ? .semibold : .regular)
@@ -482,25 +493,49 @@ public final class StatusBarView: NSView {
         {
             font = italic
         }
-        let label = NSTextField(labelWithString: segment.text)
-        label.font = font
-        label.textColor =
-            segment.fg.map(colorFromRGB) ?? ShellPalette.primaryText(dark: dark)
-        label.lineBreakMode = .byTruncatingMiddle
-        label.usesSingleLineMode = true
-        // Truncate rather than demand width (long paths, term:// names).
-        label.setContentCompressionResistancePriority(.init(240), for: .horizontal)
-        label.translatesAutoresizingMaskIntoConstraints = false
+        let fg = segment.fg.map(Self.colorFromRGB) ?? ShellPalette.primaryText(dark: dark)
+
+        func label(_ text: String) -> NSTextField {
+            let label = NSTextField(labelWithString: text)
+            label.font = font
+            label.textColor = fg
+            label.lineBreakMode = .byTruncatingMiddle
+            label.usesSingleLineMode = true
+            // Truncate rather than demand width (long paths, term:// names).
+            label.setContentCompressionResistancePriority(.init(240), for: .horizontal)
+            return label
+        }
+
+        let tokens =
+            synthesizePowerline
+            ? PowerlineGlyph.tokenize(segment.text)
+            : [(text: segment.text, isGlyph: false)]
+        let content = NSStackView()
+        content.orientation = .horizontal
+        content.spacing = 0
+        content.alignment = .centerY
+        for token in tokens {
+            if token.isGlyph, let scalar = token.text.unicodeScalars.first {
+                content.addArrangedSubview(
+                    PowerlineShapeView(
+                        scalar: scalar, color: fg, height: StatusBarView.barHeight - 1))
+            } else {
+                content.addArrangedSubview(label(token.text))
+            }
+        }
+
+        content.translatesAutoresizingMaskIntoConstraints = false
         container.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(label)
+        container.addSubview(content)
         NSLayoutConstraint.activate([
             // Full bar height minus the 1px top border: blocks reach the
             // bar's edges like the command overlay does.
-            container.heightAnchor.constraint(equalToConstant: barHeight - 1),
+            container.heightAnchor.constraint(equalToConstant: StatusBarView.barHeight - 1),
             container.widthAnchor.constraint(lessThanOrEqualToConstant: 480),
-            label.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 2),
-            label.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -2),
-            label.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+            content.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 2),
+            content.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -2),
+            content.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+            content.heightAnchor.constraint(equalTo: container.heightAnchor),
         ])
         return container
     }

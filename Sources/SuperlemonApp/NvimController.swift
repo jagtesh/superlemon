@@ -183,6 +183,8 @@ final class NvimController {
         var spec = surface.fontSpec
         let defaults = UserDefaults.standard
         spec.powerlineGlyphs = defaults.bool(forKey: "PowerlineGlyphs")
+        // The native bar synthesizes the same glyphs in harvested segments.
+        chrome?.statusBar.synthesizePowerline = spec.powerlineGlyphs
         spec.ligatures = defaults.object(forKey: "Ligatures") == nil
             ? true : defaults.bool(forKey: "Ligatures")
         guard spec != surface.fontSpec else { return }
