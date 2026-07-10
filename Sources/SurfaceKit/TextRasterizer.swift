@@ -70,6 +70,19 @@ final class TextRasterizer {
         "!==", "===", "<=", ">=", "!=", "==", "->", "=>", "<-",
     ]
 
+    /// Sequences with well-supported Unicode equivalents render THROUGH THE
+    /// FONT (professionally drawn, perfectly aligned), centered across the
+    /// original cells. Only the multi-bar equals family stays hand-drawn —
+    /// its codepoints (⩵ ⩶ ≢) have spotty font coverage.
+    static let ligatureSubstitutions: [String: String] = [
+        "<=": "\u{2264}",  // ≤
+        ">=": "\u{2265}",  // ≥
+        "!=": "\u{2260}",  // ≠
+        "->": "\u{2192}",  // →
+        "<-": "\u{2190}",  // ←
+        "=>": "\u{21D2}",  // ⇒
+    ]
+
     /// Split runs so ligature sequences become synthetic runs (cell-accurate,
     /// same-highlight only — coalescing already guarantees that).
     static func splitLigatureRuns(
@@ -210,7 +223,23 @@ final class TextRasterizer {
 
         // Glyphs.
         let baselineY = gridHeight - cellTop - fonts.baselineOffset
-        if run.synthetic, Self.ligatureSequences.contains(run.text) {
+        if run.synthetic, let replacement = Self.ligatureSubstitutions[run.text] {
+            // Font-drawn substitution, centered across the sequence's cells.
+            let variant = FontSet.Variant(bold: attrs.bold, italic: attrs.italic)
+            let shaped = cache.shapedRun(
+                text: replacement, variant: variant, font: fonts.font(for: variant),
+                cellWidth: cw, baseAdvance: fonts.baseAdvance)
+            ctx.saveGState()
+            ctx.translateBy(
+                x: originX + (CGFloat(run.cellCount) - 1) * cw / 2, y: baselineY)
+            ctx.setFillColor(attrs.foreground.cgColor)
+            for segment in shaped.segments {
+                CTFontDrawGlyphs(
+                    segment.font, segment.glyphs, segment.positions,
+                    segment.glyphs.count, ctx)
+            }
+            ctx.restoreGState()
+        } else if run.synthetic, Self.ligatureSequences.contains(run.text) {
             drawLigatureShape(run.text, in: rect, color: attrs.foreground, into: ctx)
         } else if fonts.powerlineGlyphs,
             run.text.unicodeScalars.count == 1,
