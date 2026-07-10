@@ -166,6 +166,7 @@ final class WorkspaceChrome {
 
         // Cmdline routing: with the native status bar on, the command line
         // lives IN the bar (powerline-style); otherwise the floating palette.
+        cmdlinePanel.font = editorFont  // track editor font/size changes
         if nativeStatusbar {
             cmdlinePanel.render(nil, resolver: highlightResolver)  // dismiss if up
             statusBar.renderCommand(commandLineAttributedString())
@@ -210,9 +211,17 @@ final class WorkspaceChrome {
 
     /// The active cmdline as one attributed line for the status bar's
     /// command segment: firstc (":", "/", …) + rendered content chunks.
+    /// The editor's current font (name + size from the surface's FontSpec) —
+    /// the command line matches the editor, not a fixed chrome size.
+    private var editorFont: NSFont {
+        let spec = surface?.fontSpec ?? FontSpec()
+        return spec.name.flatMap { NSFont(name: $0, size: spec.size) }
+            ?? .monospacedSystemFont(ofSize: spec.size, weight: .regular)
+    }
+
     private func commandLineAttributedString() -> NSAttributedString? {
         guard let model = chromeState.cmdline else { return nil }
-        let font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        let font = editorFont
         let line = NSMutableAttributedString()
         let prompt = model.firstc.isEmpty ? model.prompt : model.firstc
         if !prompt.isEmpty {

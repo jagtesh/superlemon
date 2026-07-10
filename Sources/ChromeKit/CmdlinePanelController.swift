@@ -18,7 +18,11 @@ public final class CmdlinePanelController {
     let contentLabel: NSTextField
     let blockLabel: NSTextField
     private let effectView: NSVisualEffectView
-    private let font: NSFont
+    /// The cmdline text font — kept in sync with the editor font by the app;
+    /// applied on the next render.
+    public var font: NSFont {
+        didSet { firstcLabel.font = font }
+    }
     private weak var parentWindow: NSWindow?
 
     public init(font: NSFont = .monospacedSystemFont(ofSize: 13, weight: .regular)) {

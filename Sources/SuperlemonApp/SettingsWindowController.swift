@@ -72,11 +72,37 @@ final class SettingsWindowController: NSObject {
     // MARK: - UI
 
     private func fontRow() -> NSStackView {
-        let row = NSStackView(views: [fontNameField, fontSizeField])
+        let choose = NSButton(title: "Choose…", target: self, action: #selector(showFontPanel))
+        let row = NSStackView(views: [fontNameField, fontSizeField, choose])
         row.orientation = .horizontal
-        fontNameField.widthAnchor.constraint(greaterThanOrEqualToConstant: 260).isActive = true
+        fontNameField.widthAnchor.constraint(greaterThanOrEqualToConstant: 200).isActive = true
         fontSizeField.widthAnchor.constraint(equalToConstant: 60).isActive = true
         return row
+    }
+
+    /// Native NSFontPanel: selections stream through changeFont(_:) for
+    /// LIVE preview in the editor while browsing.
+    @objc private func showFontPanel(_ sender: Any?) {
+        let manager = NSFontManager.shared
+        manager.target = self
+        let size = Double(fontSizeField.stringValue) ?? 13
+        let current =
+            NSFont(name: fontNameField.stringValue, size: size)
+            ?? .monospacedSystemFont(ofSize: size, weight: .regular)
+        manager.setSelectedFont(current, isMultiple: false)
+        manager.orderFrontFontPanel(sender)
+    }
+
+    @objc func changeFont(_ sender: NSFontManager?) {
+        guard let manager = sender else { return }
+        let base = NSFont(
+            name: fontNameField.stringValue,
+            size: Double(fontSizeField.stringValue) ?? 13)
+            ?? .monospacedSystemFont(ofSize: 13, weight: .regular)
+        let chosen = manager.convert(base)
+        fontNameField.stringValue = chosen.fontName
+        fontSizeField.stringValue = String(Int(chosen.pointSize))
+        appearanceToggled()  // persist + apply live
     }
 
     private func sectionLabel(_ text: String) -> NSTextField {
