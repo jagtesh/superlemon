@@ -107,8 +107,12 @@ public final class StatusBarView: NSView {
     /// Non-nil while the bar displays the user's harvested statusline
     /// instead of the built-in chips (see `renderStatusline(_:)`).
     public private(set) var activeStatusline: [StatuslineSegment]?
-    private let statuslineLabel = NSTextField(labelWithString: "")
-    private let statuslineRightLabel = NSTextField(labelWithString: "")
+    /// Harvested-statusline segments render as FULL-HEIGHT powerline blocks
+    /// (two stacks around the flexible spacer) — attributed-label backgrounds
+    /// only painted glyph line-height, leaving the bar visibly thinner than
+    /// the command overlay.
+    private let statuslineLeftStack = NSStackView()
+    private let statuslineRightStack = NSStackView()
 
     /// superlemon.ui statusbar segments (runtime/CONTRACT.md): namespace →
     /// (text, color). Rendered as chips AFTER all built-in content, composed
@@ -176,16 +180,16 @@ public final class StatusBarView: NSView {
 
         // Harvested-statusline segment (superlemon.statusline): a single
         // attributed line carrying the user's own powerline content.
-        statuslineLabel.setAccessibilityIdentifier("status.statusline")
-        statuslineRightLabel.setAccessibilityIdentifier("status.statusline.right")
-        for label in [statuslineLabel, statuslineRightLabel] {
-            label.isHidden = true
-            label.lineBreakMode = .byTruncatingTail
-            label.usesSingleLineMode = true
-            label.maximumNumberOfLines = 1
-            label.setContentCompressionResistancePriority(.init(249), for: .horizontal)
+        statuslineLeftStack.setAccessibilityIdentifier("status.statusline")
+        statuslineRightStack.setAccessibilityIdentifier("status.statusline.right")
+        for segStack in [statuslineLeftStack, statuslineRightStack] {
+            segStack.isHidden = true
+            segStack.orientation = .horizontal
+            segStack.spacing = 0
+            segStack.alignment = .centerY
         }
-        statuslineRightLabel.setContentCompressionResistancePriority(.init(251), for: .horizontal)
+        statuslineLeftStack.setContentCompressionResistancePriority(.init(249), for: .horizontal)
+        statuslineRightStack.setContentCompressionResistancePriority(.init(251), for: .horizontal)
 
         let spacer = NSView()
         spacer.setContentHuggingPriority(.init(1), for: .horizontal)
@@ -194,9 +198,9 @@ public final class StatusBarView: NSView {
         stack.addArrangedSubview(fileChip)
         stack.addArrangedSubview(branchChip)
         stack.addArrangedSubview(commandSegment)
-        stack.addArrangedSubview(statuslineLabel)
+        stack.addArrangedSubview(statuslineLeftStack)
         stack.addArrangedSubview(spacer)
-        stack.addArrangedSubview(statuslineRightLabel)
+        stack.addArrangedSubview(statuslineRightStack)
         stack.addArrangedSubview(projectChip)
         stack.addArrangedSubview(lineColChip)
 
@@ -264,12 +268,8 @@ public final class StatusBarView: NSView {
 
         // Harvested statusline segments carry their own colors; rebuild so an
         // appearance flip re-resolves the default-foreground fallbacks.
-        if let segments = activeStatusline {
-            let (left, right) = Self.splitAtFill(segments)
-            statuslineLabel.attributedStringValue = Self.attributedStatusline(
-                left, dark: dark)
-            statuslineRightLabel.attributedStringValue = Self.attributedStatusline(
-                right, dark: dark)
+        if activeStatusline != nil {
+            rebuildStatuslineStacks(activeStatusline, dark: dark)
         }
         rebuildPluginChips()  // re-resolve default colors on appearance flips
         applyChipVisibility()
@@ -334,16 +334,7 @@ public final class StatusBarView: NSView {
     /// while a cmdline is active.
     public func renderStatusline(_ segments: [StatuslineSegment]?) {
         activeStatusline = (segments?.isEmpty ?? true) ? nil : segments
-        if let segments = activeStatusline {
-            let (left, right) = Self.splitAtFill(segments)
-            statuslineLabel.attributedStringValue = Self.attributedStatusline(
-                left, dark: isDark)
-            statuslineRightLabel.attributedStringValue = Self.attributedStatusline(
-                right, dark: isDark)
-        } else {
-            statuslineLabel.attributedStringValue = NSAttributedString()
-            statuslineRightLabel.attributedStringValue = NSAttributedString()
-        }
+        rebuildStatuslineStacks(activeStatusline, dark: isDark)
         applyChipVisibility()
     }
 
@@ -422,12 +413,72 @@ public final class StatusBarView: NSView {
             alpha: 1)
     }
 
+    /// Rebuild the two segment stacks as full-height colored blocks.
+    private func rebuildStatuslineStacks(_ segments: [StatuslineSegment]?, dark: Bool) {
+        for segStack in [statuslineLeftStack, statuslineRightStack] {
+            segStack.arrangedSubviews.forEach {
+                segStack.removeArrangedSubview($0)
+                $0.removeFromSuperview()
+            }
+        }
+        guard let segments else { return }
+        let (left, right) = Self.splitAtFill(segments)
+        for (side, stackView) in [(left, statuslineLeftStack), (right, statuslineRightStack)] {
+            for segment in side {
+                stackView.addArrangedSubview(Self.segmentBlock(segment, dark: dark))
+            }
+        }
+    }
+
+    /// One powerline block: opaque full-bar-height fill with a centered label.
+    private static func segmentBlock(_ segment: StatuslineSegment, dark: Bool) -> NSView {
+        let container = NSView()
+        container.wantsLayer = true
+        if let bg = segment.bg {
+            container.layer?.backgroundColor = colorFromRGB(bg).cgColor
+        }
+        var font = NSFont.monospacedSystemFont(
+            ofSize: 11, weight: segment.bold ? .semibold : .regular)
+        if segment.italic,
+            let italic = NSFontManager.shared.convert(font, toHaveTrait: .italicFontMask)
+                as NSFont?
+        {
+            font = italic
+        }
+        let label = NSTextField(labelWithString: segment.text)
+        label.font = font
+        label.textColor =
+            segment.fg.map(colorFromRGB) ?? ShellPalette.primaryText(dark: dark)
+        label.lineBreakMode = .byTruncatingTail
+        label.usesSingleLineMode = true
+        label.translatesAutoresizingMaskIntoConstraints = false
+        container.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(label)
+        NSLayoutConstraint.activate([
+            // Full bar height minus the 1px top border: blocks reach the
+            // bar's edges like the command overlay does.
+            container.heightAnchor.constraint(equalToConstant: barHeight - 1),
+            label.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 2),
+            label.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -2),
+            label.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+        ])
+        return container
+    }
+
+    private static func colorFromRGB(_ rgb: UInt32) -> NSColor {
+        NSColor(
+            srgbRed: CGFloat((rgb >> 16) & 0xFF) / 255,
+            green: CGFloat((rgb >> 8) & 0xFF) / 255,
+            blue: CGFloat(rgb & 0xFF) / 255,
+            alpha: 1)
+    }
+
     private func applyChipVisibility() {
         let commandActive = activeCommand != nil
         let statuslineActive = !commandActive && activeStatusline != nil
         commandSegment.isHidden = !commandActive
-        statuslineLabel.isHidden = !statuslineActive
-        statuslineRightLabel.isHidden = !statuslineActive
+        statuslineLeftStack.isHidden = !statuslineActive
+        statuslineRightStack.isHidden = !statuslineActive
         // The harvested statusline carries everything (mode, file, position),
         // so ALL chips yield to it; the command overlay keeps mode + line:col.
         modeBadge.isHidden = statuslineActive

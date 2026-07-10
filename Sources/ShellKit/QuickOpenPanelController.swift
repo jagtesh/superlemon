@@ -62,9 +62,13 @@ public final class QuickOpenPanelController: NSObject {
     public var onOpenIndex: ((Int) -> Void)?
 
     /// Additive (superlemon.ui palette): the search field's placeholder.
+    private var placeholderText = "Search files"
     public var placeholder: String {
-        get { searchField.placeholderString ?? "" }
-        set { searchField.placeholderString = newValue }
+        get { placeholderText }
+        set {
+            placeholderText = newValue
+            applyAppearance(dark: isDark)  // restyle for legibility
+        }
     }
 
     // UI
@@ -94,7 +98,7 @@ public final class QuickOpenPanelController: NSObject {
     }
 
     public override init() {
-        panel = NSPanel(
+        panel = KeyableQuickOpenPanel(
             contentRect: NSRect(origin: .zero, size: Self.panelSize),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
@@ -211,6 +215,12 @@ public final class QuickOpenPanelController: NSObject {
         panel.contentView?.layer?.backgroundColor = ShellPalette.paletteBackground(dark: dark).cgColor
         searchRow.layer?.backgroundColor = ShellPalette.paletteField(dark: dark).cgColor
         searchField.textColor = ShellPalette.primaryText(dark: dark)
+        searchField.placeholderAttributedString = NSAttributedString(
+            string: placeholderText,
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 13),
+                .foregroundColor: ShellPalette.paletteTertiary(dark: dark),
+            ])
         countLabel.textColor = ShellPalette.paletteTertiary(dark: dark)
         magnifierLabel.textColor = ShellPalette.paletteTertiary(dark: dark)
         if let hairline = searchRow.subviews.first(where: {
@@ -240,6 +250,11 @@ public final class QuickOpenPanelController: NSObject {
         parentWindow = parent
         sessionActive = true
         searchField.stringValue = ""
+        if let parent {
+            let dark =
+                parent.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            applyAppearance(dark: dark)
+        }
         onQueryChange?("")
 
         if let parent, let parentContent = parent.contentView {
@@ -491,4 +506,13 @@ final class QuickOpenCellView: NSView {
 final class ScrimView: NSView {
     var onClick: (() -> Void)?
     override func mouseDown(with event: NSEvent) { onClick?() }
+}
+
+
+/// Borderless windows/panels return false from canBecomeKey by default —
+/// which silently sent every palette keystroke to the main window (i.e.
+/// into the nvim buffer). The palette must own the keyboard while open.
+@MainActor
+final class KeyableQuickOpenPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
 }
