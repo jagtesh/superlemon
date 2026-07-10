@@ -20,6 +20,9 @@ final class NvimController {
     /// Wave-3 chrome (ChromeKit + ShellKit); nil in smoke mode.
     var chrome: WorkspaceChrome?
 
+    /// The live editor FontSpec (Settings placeholders/refresh).
+    var currentFontSpec: FontSpec? { surface?.fontSpec }
+
     /// UserDefaults key for the App-menu "Use Superlemon Config" switch.
     static let managedConfigDefaultsKey = "UseSuperlemonManagedConfig"
 
@@ -28,6 +31,9 @@ final class NvimController {
 
     /// Called once, on the first flushed frame (smoke-mode hook).
     var onFirstFlush: ((FlushResult) -> Void)?
+    /// Fired after any editor font change (guifont, Settings, ⌘±) so the
+    /// Settings window can stay in sync while open.
+    var fontDidChange: (() -> Void)?
     /// Overrides default exit handling (close window / alert / terminate).
     var exitHandler: ((Int32, String) -> Void)?
     /// Overrides default startup-failure handling (alert + terminate).
@@ -190,6 +196,7 @@ final class NvimController {
             spec.size != surface.fontSpec.size || spec.name != surface.fontSpec.name
         surface.setFont(spec)
         if metricsChanged { sendResizeIfNeeded(force: true) }
+        fontDidChange?()
     }
 
     /// Settings -> FontSpec. The editor font/size override (when set) beats
@@ -422,6 +429,7 @@ final class NvimController {
         guard spec != surface.fontSpec else { return }
         surface.setFont(spec)
         sendResizeIfNeeded(force: true)
+        fontDidChange?()
     }
 
     // MARK: - Consumption loop: lifecycle
@@ -676,10 +684,13 @@ final class NvimController {
         guard let surface else { return }
         var spec = surface.fontSpec
         spec.size = delta == 0 ? 13 : max(6, min(72, spec.size + CGFloat(delta)))
-        Self.applyDefaults(to: &spec)  // Settings overrides beat guifont
         guard spec != surface.fontSpec else { return }
+        // Persist the zoom FIRST — otherwise the stored size override (or a
+        // later guifont/Settings pass) reverts the bump instantly.
+        UserDefaults.standard.set(Double(spec.size), forKey: "EditorFontSize")
         surface.setFont(spec)
         sendResizeIfNeeded(force: true)
+        fontDidChange?()
     }
 
     /// Native tab strip: switch to a buffer (CONTRACT.md superlemon.buffers).

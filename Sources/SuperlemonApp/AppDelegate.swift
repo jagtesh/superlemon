@@ -155,6 +155,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
         controller.window = window
         controller.surface = surface
+        controller.fontDidChange = { [weak self] in self?.settings?.refresh() }
         chrome.attach(window: window, surface: surface)
         chrome.restoreFocus = { [weak window, weak host] in
             window?.makeFirstResponder(host)

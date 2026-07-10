@@ -61,6 +61,12 @@ final class SettingsWindowController: NSObject {
         super.init()
     }
 
+    /// Live-sync: re-read values while the window is visible (font bumps,
+    /// guifont changes, font-panel picks).
+    func refresh() {
+        if window?.isVisible == true { loadValues() }
+    }
+
     func show() {
         if window == nil { build() }
         loadValues()
@@ -225,6 +231,13 @@ final class SettingsWindowController: NSObject {
         fontNameField.stringValue = defaults.string(forKey: "EditorFontName") ?? ""
         let size = defaults.double(forKey: "EditorFontSize")
         fontSizeField.stringValue = size > 0 ? String(Int(size)) : ""
+        // Placeholders mirror the LIVE editor font, so an empty field always
+        // tells the truth about what is rendering right now.
+        if let spec = controller.currentFontSpec {
+            fontNameField.placeholderString =
+                (spec.name ?? "System Mono") + "  (from config)"
+            fontSizeField.placeholderString = String(Int(spec.size))
+        }
         symbolFontCheckbox.state = defaults.bool(forKey: "UseSymbolFont") ? .on : .off
         forceFallbackCheckbox.state = defaults.bool(forKey: "ForceGlyphFallback") ? .on : .off
     }
