@@ -49,7 +49,9 @@ function M.refresh()
   generation = generation + 1
   local this = generation
   local cwd = vim.fn.getcwd()
-  local ok = pcall(vim.system, { "git", "status", "--porcelain", "-z" }, {
+  -- --no-optional-locks: a background observer must never take the index
+  -- lock (it raced a real `git commit` during development).
+  local ok = pcall(vim.system, { "git", "--no-optional-locks", "status", "--porcelain", "-z" }, {
     cwd = cwd,
     text = true,
   }, function(result)
