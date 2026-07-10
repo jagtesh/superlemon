@@ -132,6 +132,45 @@ the GUI sidebar renders the badges:
 }
 ```
 
+### `superlemon.ui` — the component framework (DESIGN §15)
+
+One generic notification; array payload `[component, method, namespace, args]`
+(component/method/namespace strings, args a map). Colors are `"#RRGGBB"`
+strings. v1 components:
+
+| component | methods | args |
+|---|---|---|
+| `sidebar` | `set_badge` | `{path, text, color?}` (path cwd-relative) |
+| | `set_dot` | `{path, color}` |
+| | `clear` | `{}` (this namespace only) |
+| `palette` | `open` | `{placeholder?, query_cb, select_cb, close_cb?}` (cb = int callback id) |
+| | `close` | `{}` |
+| `toast` | `show` | `{text, kind}` kind ∈ info/warn/error |
+| `statusbar` | `set_segment` | `{text, color?}` |
+| | `clear` | `{}` |
+| `input` | `open` | `{prompt?, default?, submit_cb}` (Enter → cb(text), Esc → cb(nil)) |
+
+Namespaces isolate plugins: a namespace's `clear` never touches another's
+state; the GUI composes namespaces sorted by name. GUI invokes Lua callbacks
+via blocking request:
+
+```
+nvim_exec_lua("return require('superlemon.ui')._dispatch(...)", [cb_id, payload])
+```
+
+For `query_cb` the payload is `{query = "..."}` and the return value is
+`{ {id, title, subtitle?, positions?}, ... }` (positions = 1-based match
+indices into title for bold rendering). `select_cb` gets `{id = ...}`,
+fire-and-forget. Callback ids are freed when the palette/input closes.
+
+Lua public API (`require("superlemon.ui")`): `sidebar.namespace(name)` →
+`ns:set_badge(path, opts)` / `ns:set_dot(path, opts)` / `ns:clear()`;
+`palette.open{placeholder, on_query, on_select, on_close}` / `palette.close()`;
+`toast{text, kind}`; `statusbar.segment(ns, opts)` / `statusbar.clear(ns)`;
+`input{prompt, default, on_submit}`. At setup, `vim.ui.select` and
+`vim.ui.input` are overridden to route to palette/input (skipped if the user
+already replaced them; opt out with `g:superlemon_native_ui = 0`).
+
 ## nvim → GUI requests  (`vim.rpcrequest(chan, method, ...)`)
 
 ### `superlemon.clipboard_get` → `[lines, regtype]`

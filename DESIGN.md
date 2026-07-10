@@ -643,6 +643,30 @@ ui.statusbar.segment("my-plugin", { text = "⚡ 3", color = "#E0B268" })
 - Namespacing gives isolation: a plugin's `clear()` never touches another's
   badges; the GUI composes namespaces deterministically (sorted by name).
 
+### Externalization inventory — nvim constructs that can go native
+
+| Construct | Mechanism | Status |
+|---|---|---|
+| Cmdline (`:` `/` `?`, prompts) | `ext_cmdline` → ChromeKit palette | **enabled** |
+| Completion + wildmenu dropdown | `ext_popupmenu` → native panel | **enabled** |
+| Messages, confirms, hit-enter | `ext_messages` → toasts/NSAlert | **enabled** |
+| Windows, floats, message grid | `ext_multigrid` → CALayers | **enabled** |
+| Statusline (any plugin) | `nvim_eval_statusline` harvest | **enabled** |
+| Tabpages / buffer list | `ext_tabline` + superlemon.buffers | **enabled** (buffer strip) |
+| Generic "pick one" dropdowns (code actions, plugin choices) | `vim.ui.select` override → palette | superlemon.ui wave A |
+| Text prompts (LSP rename, plugin inputs) | `vim.ui.input` override → native field | superlemon.ui wave A |
+| Notifications | `vim.notify` override → toasts | trivial follow-on |
+| Picker plugins (telescope et al.) | adapter tier (model-layer glue) | wave B |
+| Quickfix / location list | adapter tier → native list panel | backlog |
+| LSP progress ($/progress) | handler → statusbar segment | backlog |
+| Float dressing (hover/signature) | detect + material/shadow per kind | cosmetic backlog |
+| Semantic highlight metadata | `ext_hlstate` | cosmetic backlog |
+
+`vim.ui.select`/`vim.ui.input` are the sleeper hits: they are nvim's OWN
+designed override points — every well-behaved plugin's dropdowns and prompts
+route through them, so two Lua overrides nativize a whole ecosystem's worth
+of interaction.
+
 ### Migration path
 
 1. Wave A: protocol plumbing (`superlemon.ui` module + dispatcher, GUI
@@ -675,6 +699,10 @@ out adopting NSSplitView's ENGINE, and each is load-bearing:
    every shipping nvim GUI keeps layout authority singular for this reason.
 4. **Atomicity** — win_pos batches arrive per flush (tear-free); NSSplitView
    resizes panes across frames, letterboxing grids mid-transition.
+
+**Status: DEPRIORITIZED** — the mouse-drag latch (below, implemented)
+made in-grid separator dragging feel right; the affordance overlay and
+hairline paint remain documented options, not scheduled work.
 
 **The hybrid that survives all four**: grid layers positioned verbatim from
 win_pos (atomic, one engine); native SEPARATOR AFFORDANCES overlaid on the
