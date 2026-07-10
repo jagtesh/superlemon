@@ -79,6 +79,24 @@ final class WorkspaceChrome {
             nativeStatusbar = payload["native_statusbar"]?.boolValue ?? false
             onChromeModeChange?(nativeTabs, nativeStatusbar)
             syncChrome()  // re-route the cmdline if one is active
+        case "superlemon.statusline":
+            // The user's own statusline, evaluated by nvim_eval_statusline —
+            // rendered natively instead of the built-in chips (CONTRACT.md).
+            guard let payload = params.first else { return }
+            guard let segmentValues = payload["segments"]?.arrayValue else {
+                statusBar.renderStatusline(nil)  // vim.NIL: no custom statusline
+                return
+            }
+            let segments = segmentValues.compactMap { value -> StatuslineSegment? in
+                guard let text = value["text"]?.stringValue else { return nil }
+                return StatuslineSegment(
+                    text: text,
+                    fg: value["fg"]?.intValue.map { UInt32(truncatingIfNeeded: $0) },
+                    bg: value["bg"]?.intValue.map { UInt32(truncatingIfNeeded: $0) },
+                    bold: value["bold"]?.boolValue ?? false,
+                    italic: value["italic"]?.boolValue ?? false)
+            }
+            statusBar.renderStatusline(segments)
         case "superlemon.buffers":
             guard let payload = params.first,
                 let bufferValues = payload["buffers"]?.arrayValue

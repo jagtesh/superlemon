@@ -21,6 +21,28 @@ local state = {
 
 local buffer_timer
 
+-- Adopt mode (DEFAULT while the native bar is on): the statusline moves OUT
+-- of the grid and INTO the native bar — the bar displays the user's own
+-- evaluated statusline (statusline.lua), so nothing is lost; laststatus is
+-- saved and restored exactly when the bar toggles off. Opt out with
+-- g:superlemon_adopt_statusline = 0 to keep both bars visible.
+local adopt_saved = nil
+local function apply_adopt_statusline()
+  local adopt = not (
+    vim.g.superlemon_adopt_statusline == 0
+    or vim.g.superlemon_adopt_statusline == false
+  )
+  if state.native_statusbar and adopt then
+    if adopt_saved == nil then
+      adopt_saved = vim.o.laststatus
+    end
+    vim.o.laststatus = 0
+  elseif adopt_saved ~= nil then
+    vim.o.laststatus = adopt_saved
+    adopt_saved = nil
+  end
+end
+
 local function active()
   return require("superlemon").active()
 end
@@ -84,11 +106,18 @@ function M.set(part, on)
       return
     end
     state.native_statusbar = on
+    apply_adopt_statusline()
+    if on then
+      pcall(function()
+        require("superlemon.statusline").push() -- seed the harvested segments
+      end)
+    end
   else
     return
   end
   push_chrome()
 end
+
 
 ---@param part '"tabs"'|'"statusbar"'
 function M.toggle(part)
@@ -110,6 +139,7 @@ function M.setup(group)
   end
   state.native_tabs = truthy(vim.g.superlemon_native_tabs)
   state.native_statusbar = truthy(vim.g.superlemon_native_statusbar)
+  apply_adopt_statusline()
 
   vim.api.nvim_create_autocmd(
     { "BufAdd", "BufDelete", "BufEnter", "BufFilePost", "BufModifiedSet" },

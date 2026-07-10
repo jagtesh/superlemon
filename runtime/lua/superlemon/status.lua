@@ -145,6 +145,11 @@ function M.push()
     return
   end
   vim.rpcnotify(chan, "superlemon.status", M.payload())
+  -- The evaluated-statusline harvest rides the same cadence (CONTRACT.md
+  -- superlemon.statusline); it no-ops unless the native bar is showing.
+  pcall(function()
+    require("superlemon.statusline").push()
+  end)
 end
 
 -- One shared timer; every cursor event restarts it, so a burst of motion

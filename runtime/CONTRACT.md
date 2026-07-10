@@ -77,6 +77,37 @@ turns on:
 GUI tab actions go through standard API: click →
 `nvim_set_current_buf`, close → `confirm bdelete N` via `nvim_command`.
 
+### `superlemon.statusline`
+One map argument; pushed on the `superlemon.status` cadence, but ONLY while
+`native_statusbar` is on (plus once when it turns on):
+
+```lua
+{
+  segments = {                        -- the USER'S statusline, evaluated
+    { text = " NORMAL ", fg = 0x1B2023, bg = 0xADC694, bold = true, italic = false },
+    ...
+  } | vim.NIL,                        -- NIL: statusline evaluated to nothing
+}                                     -- (rare; nvim 0.12's default is non-empty)
+```
+
+Produced by `nvim_eval_statusline(&statusline, {highlights = true})` on the
+current window — powerline/lualine/airline content comes through with its
+real colors (groups resolved via `nvim_get_hl`, links followed; fg/bg are
+24-bit ints, absent = use the bar's defaults). The GUI renders these segments
+INSTEAD of its built-in chips; NIL segments fall back to the chips.
+Customization therefore lives where it always did: the user's statusline
+config.
+
+**Adopt mode (default):** while the native bar is on, the plugin sets
+`laststatus=0` (saving the user's value, restored exactly when toggled off) —
+the statusline RELOCATES from the grid into the native bar, where the
+harvested segments display the same content. This is the deliberate meaning
+of the toggle: the statusline lives at the bottom of the Superlemon window,
+not inside the nvim grid. It remains faithful because the content is the
+user's own statusline and the round trip is lossless. Opt out with
+`vim.g.superlemon_adopt_statusline = 0` to keep both bars. No other option
+is ever touched.
+
 ## nvim → GUI requests  (`vim.rpcrequest(chan, method, ...)`)
 
 ### `superlemon.clipboard_get` → `[lines, regtype]`

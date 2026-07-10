@@ -9,7 +9,9 @@ import ShellKit
 import SurfaceKit
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
+    NSMenuItemValidation
+{
     private let smokeMode: Bool
     private var controller: NvimController?
     private var chrome: WorkspaceChrome?

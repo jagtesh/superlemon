@@ -491,14 +491,22 @@ final class NvimController {
 
     /// View menu → plugin truth: toggle native chrome (CONTRACT.md).
     func toggleNativeChrome(_ part: String) {
-        guard let session else { return }
+        guard let session else {
+            NSLog("superlemon: toggleNativeChrome(\(part)) — no session")
+            return
+        }
         Task {
-            _ = try? await session.request(
-                "nvim_exec_lua",
-                [
-                    .string("require('superlemon').chrome_toggle(...)"),
-                    .array([.string(part)]),
-                ])
+            do {
+                _ = try await session.request(
+                    "nvim_exec_lua",
+                    [
+                        .string("require('superlemon').chrome_toggle(...)"),
+                        .array([.string(part)]),
+                    ])
+            } catch {
+                // Most likely: the runtime plugin failed to bootstrap.
+                NSLog("superlemon: toggleNativeChrome(\(part)) failed: \(error)")
+            }
         }
     }
 

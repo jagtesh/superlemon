@@ -25,14 +25,15 @@ local chrome = last_notify("superlemon.chrome")
 H.ok(chrome ~= nil, "chrome state pushed at setup")
 H.eq(chrome, { native_tabs = false, native_statusbar = true }, "g: vars seed the state")
 
--- FAITHFULNESS (CONTRACT.md): toggles never touch user options — the user's
--- own statusline/cmdline stay exactly as their config set them.
-H.eq(vim.o.laststatus, user_laststatus, "laststatus untouched by native statusbar")
+-- Adopt-by-default (CONTRACT.md): the native bar RELOCATES the statusline
+-- (laststatus=0 while on, restored exactly when off); cmdheight is never
+-- touched. Detailed adopt/opt-out coverage lives in statusline_spec.lua.
+H.eq(vim.o.laststatus, 0, "native statusbar adopts the statusline (laststatus=0)")
 H.eq(vim.o.cmdheight, user_cmdheight, "cmdheight untouched by native statusbar")
 
 vim.cmd("SuperlemonChrome statusbar off")
 H.eq(last_notify("superlemon.chrome").native_statusbar, false, "off state pushed")
-H.eq(vim.o.laststatus, user_laststatus, "laststatus still untouched after toggling")
+H.eq(vim.o.laststatus, user_laststatus, "laststatus restored exactly on toggle off")
 
 -- Same-state set is a no-op (no extra push).
 local pushes = #notifies("superlemon.chrome")

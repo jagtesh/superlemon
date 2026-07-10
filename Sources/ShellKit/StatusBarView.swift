@@ -63,6 +63,27 @@ public struct StatusModel: Equatable, Sendable {
     }
 }
 
+/// One styled run of the user's evaluated statusline (CONTRACT.md
+/// `superlemon.statusline`): powerline/lualine content with real colors.
+public struct StatuslineSegment: Equatable, Sendable {
+    public var text: String
+    public var fg: UInt32?  // 0xRRGGBB; nil = bar default
+    public var bg: UInt32?
+    public var bold: Bool
+    public var italic: Bool
+
+    public init(
+        text: String, fg: UInt32? = nil, bg: UInt32? = nil,
+        bold: Bool = false, italic: Bool = false
+    ) {
+        self.text = text
+        self.fg = fg
+        self.bg = bg
+        self.bold = bold
+        self.italic = italic
+    }
+}
+
 @MainActor
 public final class StatusBarView: NSView {
 
@@ -83,6 +104,10 @@ public final class StatusBarView: NSView {
     /// Non-nil while the command-line overlay occupies the flexible middle
     /// of the bar (see `renderCommand(_:)`).
     public private(set) var activeCommand: NSAttributedString?
+    /// Non-nil while the bar displays the user's harvested statusline
+    /// instead of the built-in chips (see `renderStatusline(_:)`).
+    public private(set) var activeStatusline: [StatuslineSegment]?
+    private let statuslineLabel = NSTextField(labelWithString: "")
 
     public override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -139,6 +164,15 @@ public final class StatusBarView: NSView {
             commandLabel.centerYAnchor.constraint(equalTo: commandSegment.centerYAnchor),
         ])
 
+        // Harvested-statusline segment (superlemon.statusline): a single
+        // attributed line carrying the user's own powerline content.
+        statuslineLabel.setAccessibilityIdentifier("status.statusline")
+        statuslineLabel.isHidden = true
+        statuslineLabel.lineBreakMode = .byTruncatingTail
+        statuslineLabel.usesSingleLineMode = true
+        statuslineLabel.maximumNumberOfLines = 1
+        statuslineLabel.setContentCompressionResistancePriority(.init(249), for: .horizontal)
+
         let spacer = NSView()
         spacer.setContentHuggingPriority(.init(1), for: .horizontal)
 
@@ -146,6 +180,7 @@ public final class StatusBarView: NSView {
         stack.addArrangedSubview(fileChip)
         stack.addArrangedSubview(branchChip)
         stack.addArrangedSubview(commandSegment)
+        stack.addArrangedSubview(statuslineLabel)
         stack.addArrangedSubview(spacer)
         stack.addArrangedSubview(projectChip)
         stack.addArrangedSubview(lineColChip)
@@ -212,6 +247,12 @@ public final class StatusBarView: NSView {
             background: ShellPalette.lineColBackground(dark: dark)
         )
 
+        // Harvested statusline segments carry their own colors; rebuild so an
+        // appearance flip re-resolves the default-foreground fallbacks.
+        if let segments = activeStatusline {
+            statuslineLabel.attributedStringValue = Self.attributedStatusline(
+                segments, dark: dark)
+        }
         applyChipVisibility()
     }
 
@@ -228,12 +269,63 @@ public final class StatusBarView: NSView {
         applyChipVisibility()
     }
 
+    /// Display the user's evaluated statusline (powerline/lualine content,
+    /// CONTRACT.md superlemon.statusline) INSTEAD of the built-in chips.
+    /// nil or empty falls back to the chips. The command overlay still wins
+    /// while a cmdline is active.
+    public func renderStatusline(_ segments: [StatuslineSegment]?) {
+        activeStatusline = (segments?.isEmpty ?? true) ? nil : segments
+        if let segments = activeStatusline {
+            statuslineLabel.attributedStringValue = Self.attributedStatusline(
+                segments, dark: isDark)
+        } else {
+            statuslineLabel.attributedStringValue = NSAttributedString()
+        }
+        applyChipVisibility()
+    }
+
+    static func attributedStatusline(
+        _ segments: [StatuslineSegment], dark: Bool
+    ) -> NSAttributedString {
+        let result = NSMutableAttributedString()
+        for segment in segments {
+            var font = NSFont.monospacedSystemFont(ofSize: 11, weight: segment.bold ? .semibold : .regular)
+            if segment.italic,
+                let italic = NSFontManager.shared.convert(font, toHaveTrait: .italicFontMask) as NSFont?
+            {
+                font = italic
+            }
+            var attrs: [NSAttributedString.Key: Any] = [
+                .font: font,
+                .foregroundColor: segment.fg.map(Self.color)
+                    ?? ShellPalette.primaryText(dark: dark),
+            ]
+            if let bg = segment.bg { attrs[.backgroundColor] = Self.color(bg) }
+            result.append(NSAttributedString(string: segment.text, attributes: attrs))
+        }
+        return result
+    }
+
+    private static func color(_ rgb: UInt32) -> NSColor {
+        NSColor(
+            srgbRed: CGFloat((rgb >> 16) & 0xFF) / 255,
+            green: CGFloat((rgb >> 8) & 0xFF) / 255,
+            blue: CGFloat(rgb & 0xFF) / 255,
+            alpha: 1)
+    }
+
     private func applyChipVisibility() {
         let commandActive = activeCommand != nil
+        let statuslineActive = !commandActive && activeStatusline != nil
         commandSegment.isHidden = !commandActive
-        fileChip.isHidden = commandActive
-        branchChip.isHidden = commandActive || model.branch.isEmpty
-        projectChip.isHidden = commandActive || model.project.isEmpty
+        statuslineLabel.isHidden = !statuslineActive
+        // The harvested statusline carries everything (mode, file, position),
+        // so ALL chips yield to it; the command overlay keeps mode + line:col.
+        modeBadge.isHidden = statuslineActive
+        lineColChip.isHidden = statuslineActive
+        fileChip.isHidden = commandActive || statuslineActive
+        branchChip.isHidden = commandActive || statuslineActive || model.branch.isEmpty
+        projectChip.isHidden = commandActive || statuslineActive || model.project.isEmpty
     }
 }
 
