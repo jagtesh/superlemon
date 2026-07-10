@@ -226,7 +226,23 @@ final class TextRasterizer {
 
         // Glyphs.
         let baselineY = gridHeight - cellTop - fonts.baselineOffset
-        if run.synthetic, let replacement = Self.ligatureSubstitutions[run.text] {
+        if run.synthetic, let symbol = fonts.symbolFont {
+            // The symbol companion font's own calt ligatures do the fusing:
+            // shape the RAW sequence through it; per-glyph pieces land on
+            // the main font's cell grid via the snapping in GlyphCache.
+            let shaped = cache.shapedRun(
+                text: run.text, variant: .regular, font: symbol,
+                cellWidth: cw, baseAdvance: fonts.symbolBaseAdvance)
+            ctx.saveGState()
+            ctx.translateBy(x: originX, y: baselineY)
+            ctx.setFillColor(attrs.foreground.cgColor)
+            for segment in shaped.segments {
+                CTFontDrawGlyphs(
+                    segment.font, segment.glyphs, segment.positions,
+                    segment.glyphs.count, ctx)
+            }
+            ctx.restoreGState()
+        } else if run.synthetic, let replacement = Self.ligatureSubstitutions[run.text] {
             // Font-drawn substitution, centered across the sequence's cells.
             let variant = FontSet.Variant(bold: attrs.bold, italic: attrs.italic)
             let shaped = cache.shapedRun(

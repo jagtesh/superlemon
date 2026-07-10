@@ -35,6 +35,22 @@ struct FontSet {
     /// Rendering flags carried from the FontSpec (see FontSpec docs).
     let powerlineGlyphs: Bool
     let ligatures: Bool
+    /// The SYMBOL COMPANION font: ligature sequences shape through this
+    /// (real calt ligatures, e.g. bundled Fira Code) while all text keeps
+    /// the user's font. nil = no ligature-capable font available; the
+    /// Unicode-substitution fallback applies.
+    let symbolFont: CTFont?
+    /// The symbol font's own monospace advance — needed to map its shaped
+    /// positions onto the main font's cell grid.
+    let symbolBaseAdvance: CGFloat
+
+    /// Known ligature-capable monospace fonts, preferred order. The bundled
+    /// runtime/fonts/ directory is registered at app launch, so FiraCode
+    /// resolves even when not user-installed.
+    static let symbolFontCandidates = [
+        "FiraCode-Regular", "JetBrainsMono-Regular", "CascadiaCode-Regular",
+        "MonaspaceNeon-Regular", "Hasklig-Regular",
+    ]
 
     init(spec: FontSpec) {
         let base = spec.name.flatMap { NSFont(name: $0, size: spec.size) }
@@ -56,6 +72,26 @@ struct FontSet {
         let leading = CTFontGetLeading(ct)
         powerlineGlyphs = spec.powerlineGlyphs
         ligatures = spec.ligatures
+        var symbol: CTFont? = nil
+        if spec.ligatures {
+            for name in Self.symbolFontCandidates {
+                if let font = NSFont(name: name, size: spec.size) {
+                    symbol = font as CTFont
+                    break
+                }
+            }
+        }
+        symbolFont = symbol
+        if let symbol {
+            var symChars: [UniChar] = [0x4D]
+            var symGlyphs: [CGGlyph] = [0]
+            CTFontGetGlyphsForCharacters(symbol, &symChars, &symGlyphs, 1)
+            var symAdvance = CGSize.zero
+            CTFontGetAdvancesForGlyphs(symbol, .horizontal, &symGlyphs, &symAdvance, 1)
+            symbolBaseAdvance = max(1, symAdvance.width)
+        } else {
+            symbolBaseAdvance = 1
+        }
         baseAdvance = max(1, advance.width)
         cellSize = CGSize(
             width: max(1, ceil(advance.width)),

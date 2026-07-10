@@ -17,6 +17,18 @@ UserDefaults.standard.register(defaults: [
     NvimController.managedConfigDefaultsKey: true
 ])
 
+// Register bundled symbol fonts (runtime/fonts/, e.g. Fira Code under its
+// OFL license) for THIS PROCESS only — no system install. The renderer's
+// symbol-companion resolution then finds them by name.
+if let fontsDir = NvimController.runtimeDirectory()?.appendingPathComponent("fonts"),
+    let files = try? FileManager.default.contentsOfDirectory(
+        at: fontsDir, includingPropertiesForKeys: nil)
+{
+    for file in files where ["ttf", "otf"].contains(file.pathExtension.lowercased()) {
+        CTFontManagerRegisterFontsForURL(file as CFURL, .process, nil)
+    }
+}
+
 let app = NSApplication.shared
 let delegate = AppDelegate(smokeMode: smokeMode)
 app.delegate = delegate
