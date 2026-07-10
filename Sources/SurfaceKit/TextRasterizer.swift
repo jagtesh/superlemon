@@ -289,15 +289,16 @@ final class TextRasterizer {
             bar(midY + gap * 1.6)
             slash()
         case "<=", ">=":
-            // ≤/≥: chevron centered in the upper region, bar clearly BELOW.
+            // ≤/≥: the chevron spans the SAME width as the bar beneath it —
+            // tip at one edge, open end at the other, bar directly below.
             let pointLeft = seq == "<="
-            let tipX = pointLeft ? left + rect.width * 0.06 : right - rect.width * 0.06
-            let backX = pointLeft ? left + rect.width * 0.5 : right - rect.width * 0.5
-            let chevMid = midY + gap * 0.7
-            ctx.move(to: CGPoint(x: backX, y: chevMid + gap * 1.7))
+            let tipX = pointLeft ? left : right
+            let backX = pointLeft ? right : left
+            let chevMid = midY + gap * 1.1
+            ctx.move(to: CGPoint(x: backX, y: chevMid + gap * 2.0))
             ctx.addLine(to: CGPoint(x: tipX, y: chevMid))
-            ctx.addLine(to: CGPoint(x: backX, y: chevMid - gap * 1.7))
-            bar(midY - gap * 2.2)
+            ctx.addLine(to: CGPoint(x: backX, y: chevMid - gap * 2.0))
+            bar(midY - gap * 2.6)
         case "->", "<-":
             let pointLeft = seq == "<-"
             bar(midY)
