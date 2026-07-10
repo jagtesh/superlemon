@@ -107,11 +107,16 @@ final class NvimController {
             lastSentGridSize = grid
             // M2: multigrid on — every nvim window is its own CALayer
             // (SurfaceKit resolves frames/z-order via GridLayout).
+            // M3: full externalization — ChromeKit renders the cmdline (:),
+            // completion/wildmenu dropdowns, and messages natively.
             try await session.attachUI(
                 width: grid.cols, height: grid.rows,
                 options: [
                     "ext_linegrid": .bool(true),
                     "ext_multigrid": .bool(true),
+                    "ext_cmdline": .bool(true),
+                    "ext_popupmenu": .bool(true),
+                    "ext_messages": .bool(true),
                     "rgb": .bool(true),
                 ])
             attached = true
