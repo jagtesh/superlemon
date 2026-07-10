@@ -51,6 +51,44 @@ final class TextRasterizer {
         text.unicodeScalars.contains { powerlineScalars.contains($0) }
     }
 
+    /// Split runs so every powerline character stands alone in a single-cell
+    /// run (cell-accurate: columns come from the actual cells, so CJK or
+    /// other non-ASCII neighbors never desync the shape's position).
+    static func splitPowerlineRuns(
+        _ runs: [StyleRun], cells: ArraySlice<Cell>
+    ) -> [StyleRun] {
+        var result: [StyleRun] = []
+        let base = cells.startIndex
+        for run in runs {
+            guard containsPowerline(run.text) else {
+                result.append(run)
+                continue
+            }
+            var pending: StyleRun? = nil
+            for col in run.colRange {
+                let cell = cells[base + col]
+                let isPL =
+                    cell.text.unicodeScalars.count == 1
+                    && powerlineScalars.contains(cell.text.unicodeScalars.first!)
+                if isPL {
+                    if let p = pending { result.append(p) }
+                    pending = nil
+                    result.append(
+                        StyleRun(startCol: col, cellCount: 1, text: cell.text, hlID: run.hlID))
+                } else if var p = pending {
+                    p.cellCount += 1
+                    p.text += cell.text
+                    pending = p
+                } else {
+                    pending = StyleRun(
+                        startCol: col, cellCount: 1, text: cell.text, hlID: run.hlID)
+                }
+            }
+            if let p = pending { result.append(p) }
+        }
+        return result
+    }
+
     /// Merge a row's cells into style runs. Breaks on hlID change; empty-text
     /// cells extend the current run's width (they are wide-glyph trailing
     /// halves or never-drawn blanks — background only).
@@ -90,13 +128,15 @@ final class TextRasterizer {
 
         // Glyphs.
         let baselineY = gridHeight - cellTop - fonts.baselineOffset
-        if fonts.powerlineGlyphs, Self.containsPowerline(run.text),
-            run.text.unicodeScalars.allSatisfy({ $0.isASCII || Self.powerlineScalars.contains($0) })
+        if fonts.powerlineGlyphs,
+            run.text.unicodeScalars.count == 1,
+            let scalar = run.text.unicodeScalars.first,
+            Self.powerlineScalars.contains(scalar)
         {
-            // Mixed run of ASCII + powerline chars (the only context these
-            // appear in): draw powerline scalars as shapes, shape the rest.
-            drawMixedPowerlineRun(
-                run, rect: rect, baselineY: baselineY, attrs: attrs, into: ctx)
+            // Powerline cells are split into single-cell runs upstream
+            // (splitPowerlineRuns), so any neighbors — ASCII, CJK, airline's
+            // ≡/± — are unaffected. Draw the shape; done.
+            drawPowerlineShape(scalar, in: rect, color: attrs.foreground, into: ctx)
         } else if !run.text.isEmpty, !run.text.allSatisfy({ $0 == " " }) {
             let variant = FontSet.Variant(bold: attrs.bold, italic: attrs.italic)
             let shaped = cache.shapedRun(
@@ -114,57 +154,6 @@ final class TextRasterizer {
         }
 
         drawDecorations(attrs, runRect: rect, baselineY: baselineY, into: ctx)
-    }
-
-    /// Draw a run whose scalars are ASCII and/or powerline symbols: text
-    /// spans go through the normal shaping cache at their column offsets;
-    /// powerline scalars become vector shapes filling their cell.
-    private func drawMixedPowerlineRun(
-        _ run: StyleRun, rect: CGRect, baselineY: CGFloat,
-        attrs: ResolvedAttrs, into ctx: CGContext
-    ) {
-        let cw = fonts.cellSize.width
-        let variant = FontSet.Variant(bold: attrs.bold, italic: attrs.italic)
-        var col = run.startCol
-        var pending = ""
-        var pendingStart = col
-
-        func flushPending() {
-            guard !pending.isEmpty, !pending.allSatisfy({ $0 == " " }) else {
-                pending = ""
-                return
-            }
-            let shaped = cache.shapedRun(
-                text: pending, variant: variant, font: fonts.font(for: variant),
-                cellWidth: cw, baseAdvance: fonts.baseAdvance)
-            ctx.saveGState()
-            ctx.translateBy(x: CGFloat(pendingStart) * cw, y: baselineY)
-            ctx.setFillColor(attrs.foreground.cgColor)
-            for segment in shaped.segments {
-                CTFontDrawGlyphs(
-                    segment.font, segment.glyphs, segment.positions,
-                    segment.glyphs.count, ctx)
-            }
-            ctx.restoreGState()
-            pending = ""
-        }
-
-        for scalar in run.text.unicodeScalars {
-            if Self.powerlineScalars.contains(scalar) {
-                flushPending()
-                let cell = CGRect(
-                    x: CGFloat(col) * cw, y: rect.minY,
-                    width: cw, height: rect.height)
-                drawPowerlineShape(scalar, in: cell, color: attrs.foreground, into: ctx)
-                col += 1
-                pendingStart = col
-            } else {
-                if pending.isEmpty { pendingStart = col }
-                pending.unicodeScalars.append(scalar)
-                col += 1
-            }
-        }
-        flushPending()
     }
 
     /// The five classic powerline glyphs as geometry (unflipped ctx, y-up).

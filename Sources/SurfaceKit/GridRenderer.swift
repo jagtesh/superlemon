@@ -84,7 +84,10 @@ final class GridRenderer {
         row: Int, spans: [Range<Int>], grid: Grid,
         highlights: HighlightTable, into ctx: CGContext
     ) {
-        let runs = TextRasterizer.coalesce(grid.rowCells(row))
+        var runs = TextRasterizer.coalesce(grid.rowCells(row))
+        if rasterizer.fonts.powerlineGlyphs {
+            runs = TextRasterizer.splitPowerlineRuns(runs, cells: grid.rowCells(row))
+        }
         for run in runs {
             guard spans.contains(where: { $0.overlaps(run.colRange) }) else { continue }
             rasterizer.draw(
