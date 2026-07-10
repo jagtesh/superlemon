@@ -88,6 +88,9 @@ final class GridRenderer {
         if rasterizer.fonts.powerlineGlyphs {
             runs = TextRasterizer.splitPowerlineRuns(runs, cells: grid.rowCells(row))
         }
+        if rasterizer.fonts.ligatures {
+            runs = TextRasterizer.splitLigatureRuns(runs, cells: grid.rowCells(row))
+        }
         for run in runs {
             guard spans.contains(where: { $0.overlaps(run.colRange) }) else { continue }
             rasterizer.draw(

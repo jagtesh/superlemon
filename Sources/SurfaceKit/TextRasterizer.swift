@@ -23,6 +23,17 @@ struct StyleRun: Equatable {
     var cellCount: Int
     var text: String
     var hlID: Int
+    /// True for runs the rasterizer draws as vector geometry (synthesized
+    /// ligatures) instead of shaping through the font.
+    var synthetic: Bool
+
+    init(startCol: Int, cellCount: Int, text: String, hlID: Int, synthetic: Bool = false) {
+        self.startCol = startCol
+        self.cellCount = cellCount
+        self.text = text
+        self.hlID = hlID
+        self.synthetic = synthetic
+    }
 
     var colRange: Range<Int> { startCol..<(startCol + cellCount) }
 }
@@ -50,6 +61,76 @@ final class TextRasterizer {
 
     static func containsPowerline(_ text: String) -> Bool {
         text.unicodeScalars.contains { powerlineScalars.contains($0) }
+    }
+
+    /// Programming-ligature sequences synthesized as vector glyphs when the
+    /// FontSpec's `ligatures` flag is on — works with fonts that have no
+    /// ligature tables (SF Mono, Menlo…). Longest-match order.
+    static let ligatureSequences: [String] = [
+        "!==", "===", "<=", ">=", "!=", "==", "->", "=>", "<-",
+    ]
+
+    /// Split runs so ligature sequences become synthetic runs (cell-accurate,
+    /// same-highlight only — coalescing already guarantees that).
+    static func splitLigatureRuns(
+        _ runs: [StyleRun], cells: ArraySlice<Cell>
+    ) -> [StyleRun] {
+        var result: [StyleRun] = []
+        let base = cells.startIndex
+        for run in runs {
+            guard !run.synthetic else {
+                result.append(run)
+                continue
+            }
+            var pending: StyleRun? = nil
+            var col = run.startCol
+            let end = run.startCol + run.cellCount
+            func char(_ c: Int) -> String? {
+                guard c < end else { return nil }
+                let t = cells[base + c].text
+                return (t.count == 1 && t.unicodeScalars.first!.isASCII) ? t : nil
+            }
+            while col < end {
+                var matched: String? = nil
+                for seq in ligatureSequences {
+                    let n = seq.count
+                    guard col + n <= end else { continue }
+                    var joined = ""
+                    for k in 0..<n {
+                        guard let ch = char(col + k) else {
+                            joined = ""
+                            break
+                        }
+                        joined += ch
+                    }
+                    if joined == seq {
+                        matched = seq
+                        break
+                    }
+                }
+                if let seq = matched {
+                    if let p = pending { result.append(p) }
+                    pending = nil
+                    result.append(StyleRun(
+                        startCol: col, cellCount: seq.count, text: seq,
+                        hlID: run.hlID, synthetic: true))
+                    col += seq.count
+                } else {
+                    let cellText = cells[base + col].text
+                    if var p = pending {
+                        p.cellCount += 1
+                        p.text += cellText
+                        pending = p
+                    } else {
+                        pending = StyleRun(
+                            startCol: col, cellCount: 1, text: cellText, hlID: run.hlID)
+                    }
+                    col += 1
+                }
+            }
+            if let p = pending { result.append(p) }
+        }
+        return result
     }
 
     /// Split runs so every powerline character stands alone in a single-cell
@@ -129,7 +210,9 @@ final class TextRasterizer {
 
         // Glyphs.
         let baselineY = gridHeight - cellTop - fonts.baselineOffset
-        if fonts.powerlineGlyphs,
+        if run.synthetic, Self.ligatureSequences.contains(run.text) {
+            drawLigatureShape(run.text, in: rect, color: attrs.foreground, into: ctx)
+        } else if fonts.powerlineGlyphs,
             run.text.unicodeScalars.count == 1,
             let scalar = run.text.unicodeScalars.first,
             Self.powerlineScalars.contains(scalar)
@@ -155,6 +238,80 @@ final class TextRasterizer {
         }
 
         drawDecorations(attrs, runRect: rect, baselineY: baselineY, into: ctx)
+    }
+
+    /// Fira-style synthesized ligatures as geometry (unflipped ctx, y-up).
+    private func drawLigatureShape(
+        _ seq: String, in rect: CGRect, color: NvimKit.RGBColor, into ctx: CGContext
+    ) {
+        ctx.saveGState()
+        defer { ctx.restoreGState() }
+        ctx.setStrokeColor(color.cgColor)
+        let thickness = max(1.2, fonts.underlineThickness * 1.2)
+        ctx.setLineWidth(thickness)
+        ctx.setLineCap(.round)
+
+        let inset = rect.width * 0.14
+        let left = rect.minX + inset
+        let right = rect.maxX - inset
+        let midY = rect.midY
+        let gap = rect.height * 0.13
+
+        func bar(_ y: CGFloat, from x0: CGFloat? = nil, to x1: CGFloat? = nil) {
+            ctx.move(to: CGPoint(x: x0 ?? left, y: y))
+            ctx.addLine(to: CGPoint(x: x1 ?? right, y: y))
+        }
+        func slash() {
+            ctx.move(to: CGPoint(x: rect.midX - rect.width * 0.11, y: midY - gap * 2.1))
+            ctx.addLine(to: CGPoint(x: rect.midX + rect.width * 0.11, y: midY + gap * 2.1))
+        }
+        func arrowHead(at x: CGFloat, y: CGFloat, back: CGFloat) {
+            ctx.move(to: CGPoint(x: back, y: y + rect.height * 0.16))
+            ctx.addLine(to: CGPoint(x: x, y: y))
+            ctx.addLine(to: CGPoint(x: back, y: y - rect.height * 0.16))
+        }
+
+        switch seq {
+        case "==":
+            bar(midY - gap)
+            bar(midY + gap)
+        case "===":
+            bar(midY - gap * 1.6)
+            bar(midY)
+            bar(midY + gap * 1.6)
+        case "!=":
+            bar(midY - gap)
+            bar(midY + gap)
+            slash()
+        case "!==":
+            bar(midY - gap * 1.6)
+            bar(midY)
+            bar(midY + gap * 1.6)
+            slash()
+        case "<=", ">=":
+            let pointLeft = seq == "<="
+            let tipX = pointLeft ? left : right
+            let backX = pointLeft ? left + rect.width * 0.42 : right - rect.width * 0.42
+            ctx.move(to: CGPoint(x: backX, y: midY + gap * 2.4))
+            ctx.addLine(to: CGPoint(x: tipX, y: midY + gap * 0.4))
+            ctx.addLine(to: CGPoint(x: backX, y: midY - gap * 1.6))
+            bar(midY + gap * 2.4)
+        case "->", "<-":
+            let pointLeft = seq == "<-"
+            bar(midY)
+            if pointLeft {
+                arrowHead(at: left, y: midY, back: left + rect.width * 0.24)
+            } else {
+                arrowHead(at: right, y: midY, back: right - rect.width * 0.24)
+            }
+        case "=>":
+            bar(midY - gap, to: right - rect.width * 0.18)
+            bar(midY + gap, to: right - rect.width * 0.18)
+            arrowHead(at: right, y: midY, back: right - rect.width * 0.26)
+        default:
+            break
+        }
+        ctx.strokePath()
     }
 
     /// The five classic powerline glyphs as geometry (unflipped ctx, y-up).

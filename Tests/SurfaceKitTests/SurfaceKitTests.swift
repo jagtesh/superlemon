@@ -512,3 +512,76 @@ extension CursorRenderTests {
         #expect(Bool(true))
     }
 }
+
+
+// MARK: - Synthesized programming ligatures (any font)
+
+@MainActor
+@Suite struct LigatureSynthesisTests {
+    private func render(_ text: String) -> (CGImage, FontSet) {
+        let store = GridStore()
+        let result = flush(store, [
+            .gridResize(grid: 1, width: 12, height: 1),
+            .defaultColorsSet(fg: rgb(0xFF0000), bg: rgb(0x000000), special: rgb(0x00FF00)),
+            line(0, text, hl: 0),
+        ])
+        let fonts = FontSet(spec: menlo)  // ligatures default ON
+        let renderer = GridRenderer(rasterizer: TextRasterizer(fonts: fonts), scale: 1)
+        let d = result.damagedGrids.first { $0.grid.id == 1 }!
+        renderer.apply(grid: d.grid, damage: d.damage, highlights: result.highlights)
+        return (renderer.image()!, fonts)
+    }
+
+    @Test func doubleEqualsRendersAsLongBars() {
+        let (image, fonts) = render("a==b")
+        let cw = Int(fonts.cellSize.width)
+        let ch = Int(fonts.cellSize.height)
+        _ = fonts
+        // A bar crosses the CELL BOUNDARY between cols 1 and 2 — impossible
+        // with per-character '=' glyphs (they leave side bearings). Scan the
+        // boundary column; antialiasing means partial coverage, so assert
+        // strong red ink rather than an exact byte.
+        var maxRed: UInt8 = 0
+        for y in 0..<ch {
+            maxRed = max(maxRed, pixel(image, x: 2 * cw, y: y).r)
+        }
+        #expect(maxRed >= 120, "bars span the two-cell boundary (got max r=\(maxRed))")
+    }
+
+    @Test func splitterExtractsSequencesCellAccurately() {
+        let cells: [Cell] = "x!==y".map { Cell(text: String($0), hlID: 1) }
+        let runs = TextRasterizer.splitLigatureRuns(
+            TextRasterizer.coalesce(cells[...]), cells: cells[...])
+        #expect(runs == [
+            StyleRun(startCol: 0, cellCount: 1, text: "x", hlID: 1),
+            StyleRun(startCol: 1, cellCount: 3, text: "!==", hlID: 1, synthetic: true),
+            StyleRun(startCol: 4, cellCount: 1, text: "y", hlID: 1),
+        ])
+    }
+
+    @Test func ligaturesOffLeavesRunsAlone() {
+        let store = GridStore()
+        let result = flush(store, [
+            .gridResize(grid: 1, width: 8, height: 1),
+            .defaultColorsSet(fg: rgb(0xFF0000), bg: rgb(0x000000), special: rgb(0x00FF00)),
+            line(0, "a==b", hl: 0),
+        ])
+        var spec = menlo
+        spec.ligatures = false
+        let fonts = FontSet(spec: spec)
+        let renderer = GridRenderer(rasterizer: TextRasterizer(fonts: fonts), scale: 1)
+        let d = result.damagedGrids.first { $0.grid.id == 1 }!
+        renderer.apply(grid: d.grid, damage: d.damage, highlights: result.highlights)
+        let image = renderer.image()!
+        let cw = Int(fonts.cellSize.width)
+        let ch = Int(fonts.cellSize.height)
+        _ = (fonts, cw, ch)
+        // The toggle must change rendering: compare against the ON pipeline.
+        let (onImage, _) = renderWithLigatures("a==b")
+        #expect(!identical(image, onImage), "ligature toggle changes the pixels")
+    }
+
+    private func renderWithLigatures(_ text: String) -> (CGImage, FontSet) {
+        render(text)
+    }
+}
