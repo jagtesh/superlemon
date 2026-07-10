@@ -69,13 +69,24 @@ local function push_buffers()
       if name ~= "" then
         rel = vim.fs.relpath(vim.fn.getcwd(), name) or name
       end
-      table.insert(buffers, { bufnr = b, name = rel, modified = vim.bo[b].modified })
+      table.insert(buffers, {
+        bufnr = b,
+        name = rel,
+        modified = vim.bo[b].modified,
+        preview = require("superlemon.preview").is_preview(b),
+      })
     end
   end
   vim.rpcnotify(vim.g.superlemon_channel, "superlemon.buffers", {
     current = vim.api.nvim_get_current_buf(),
     buffers = buffers,
   })
+end
+
+--- Immediate (non-debounced) buffer push — preview open/promote call this so
+--- the italic flag updates without waiting for a buffer event.
+function M.push_buffers()
+  push_buffers()
 end
 
 -- Debounced (~50 ms): buffer events arrive in bursts (`:bufdo`, session load).

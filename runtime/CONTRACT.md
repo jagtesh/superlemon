@@ -68,7 +68,7 @@ turns on:
 {
   current = 3,                     -- current buffer number
   buffers = {                      -- listed buffers, stable order
-    { bufnr = 3, name = "Sources/a.swift", modified = false },
+    { bufnr = 3, name = "Sources/a.swift", modified = false, preview = false },
     ...                            -- name cwd-relative, "" if unnamed
   },
 }
@@ -76,6 +76,14 @@ turns on:
 
 GUI tab actions go through standard API: click →
 `nvim_set_current_buf`, close → `confirm bdelete N` via `nvim_command`.
+
+**Preview buffers (VS Code/Sublime semantics, superlemon.preview module):**
+at most one buffer is the preview (`preview = true`; the GUI renders its tab
+italic). Sidebar single-click → `require('superlemon.preview').open(path)`:
+switches if the file is already open, otherwise replaces the previous clean
+preview. Double-click (file or tab) → `.promote()`. Editing a preview
+promotes it automatically; a modified preview is promoted, never discarded,
+when a new preview replaces it.
 
 ### `superlemon.statusline`
 One map argument; pushed on the `superlemon.status` cadence, but ONLY while

@@ -16,11 +16,15 @@ public struct BufferTab: Equatable, Sendable {
     public var bufnr: Int
     public var name: String
     public var modified: Bool
+    /// VS Code/Sublime preview tab: rendered italic; promoted (pinned) by
+    /// double-clicking the tab or the file in the sidebar.
+    public var preview: Bool
 
-    public init(bufnr: Int, name: String, modified: Bool = false) {
+    public init(bufnr: Int, name: String, modified: Bool = false, preview: Bool = false) {
         self.bufnr = bufnr
         self.name = name
         self.modified = modified
+        self.preview = preview
     }
 }
 
@@ -33,6 +37,9 @@ public final class BufferTabStripView: NSView {
     public var onSelect: ((Int) -> Void)?
     /// Fired with the tab's `bufnr` when its ✕ is clicked.
     public var onClose: ((Int) -> Void)?
+    /// Fired with the tab's `bufnr` on double-click: promote a preview tab
+    /// to permanent (no-op for tabs that are already permanent).
+    public var onPromote: ((Int) -> Void)?
 
     public private(set) var tabs: [BufferTab] = []
     public private(set) var current: Int = -1
@@ -127,6 +134,7 @@ public final class BufferTabStripView: NSView {
             let item = BufferTabItemView(tab: tab, active: tab.bufnr == current, dark: dark)
             item.onSelect = { [weak self] bufnr in self?.onSelect?(bufnr) }
             item.onClose = { [weak self] bufnr in self?.onClose?(bufnr) }
+            item.onPromote = { [weak self] bufnr in self?.onPromote?(bufnr) }
             stack.addArrangedSubview(item)
             item.heightAnchor.constraint(equalTo: stack.heightAnchor).isActive = true
         }
@@ -152,6 +160,7 @@ final class BufferTabItemView: NSView {
 
     var onSelect: ((Int) -> Void)?
     var onClose: ((Int) -> Void)?
+    var onPromote: ((Int) -> Void)?
 
     let label = NSTextField(labelWithString: "")
     let closeButton = NSButton(title: "", target: nil, action: nil)
@@ -169,7 +178,12 @@ final class BufferTabItemView: NSView {
         let basename = tab.name.isEmpty
             ? "[No Name]" : (tab.name as NSString).lastPathComponent
         label.stringValue = tab.modified ? "● \(basename)" : basename
-        label.font = .systemFont(ofSize: 13)
+        // Preview tabs render italic (VS Code/Sublime); double-click pins.
+        let base = NSFont.systemFont(ofSize: 13)
+        label.font =
+            tab.preview
+            ? NSFontManager.shared.convert(base, toHaveTrait: .italicFontMask)
+            : base
         label.textColor = active
             ? ShellPalette.tabActiveText(dark: dark)
             : ShellPalette.tabInactiveText(dark: dark)
@@ -213,7 +227,16 @@ final class BufferTabItemView: NSView {
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
     override func mouseDown(with event: NSEvent) {
-        performSelect()
+        if event.clickCount >= 2 {
+            performPromote()
+        } else {
+            performSelect()
+        }
+    }
+
+    /// Programmatic stand-in for a double-click (also the test hook).
+    func performPromote() {
+        onPromote?(bufnr)
     }
 
     /// Programmatic stand-in for a body click (also the test hook).

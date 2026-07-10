@@ -123,6 +123,9 @@ public final class FileTreeSidebarView: NSView {
 
     // Callbacks
     public var onOpenFile: ((String) -> Void)?
+    /// Double-click: open as a permanent (pinned) buffer. Falls back to
+    /// `onOpenFile` when unset.
+    public var onOpenFilePermanently: ((String) -> Void)?
     public var onFileOperation: ((FileOperation) -> Void)?
 
     /// Show dotfiles (`.git` stays hidden always).
@@ -230,22 +233,28 @@ public final class FileTreeSidebarView: NSView {
     // MARK: Clicks
 
     @objc private func rowClicked() {
-        openRow(outlineView.clickedRow, toggleDirectories: false)
+        openRow(outlineView.clickedRow, isDoubleClick: false)
     }
 
     @objc private func rowDoubleClicked() {
-        openRow(outlineView.clickedRow, toggleDirectories: true)
+        openRow(outlineView.clickedRow, isDoubleClick: true)
     }
 
-    private func openRow(_ row: Int, toggleDirectories: Bool) {
+    /// Single-click on a file fires `onOpenFile` (the app opens it as a
+    /// PREVIEW — VS Code/Sublime semantics); double-click fires
+    /// `onOpenFilePermanently` (promotes/pins). Directories toggle on
+    /// double-click only.
+    private func openRow(_ row: Int, isDoubleClick: Bool) {
         guard row >= 0, let node = outlineView.item(atRow: row) as? FileTreeNode else { return }
         if node.isDirectory {
-            guard toggleDirectories else { return }
+            guard isDoubleClick else { return }
             if outlineView.isItemExpanded(node) {
                 outlineView.collapseItem(node)
             } else {
                 outlineView.expandItem(node)
             }
+        } else if isDoubleClick {
+            (onOpenFilePermanently ?? onOpenFile)?(node.url.path)
         } else {
             onOpenFile?(node.url.path)
         }

@@ -383,25 +383,143 @@ final class NvimController {
         return .terminateLater
     }
 
-    /// Ask nvim to quit with `:confirm qa` semantics. Any command error
-    /// (e.g. the user cancels the unsaved-changes prompt) cancels the quit.
+    /// Quit without ever blocking on nvim (a blocking `:confirm qa` request
+    /// wedged termination: AppKit ignores further ⌘Q while a .terminateLater
+    /// reply is pending, so a missed in-grid prompt looked like a lockup and
+    /// grayed the Quit item). Instead: query modified buffers with a hang
+    /// timeout, then drive a NATIVE save/discard/cancel dialog; every path
+    /// resolves the pending termination reply.
     func requestQuit() {
         guard let session, !sessionExited, !quitRequestInFlight else { return }
         quitRequestInFlight = true
         Task { [weak self] in
-            do {
-                _ = try await session.request("nvim_command", [.string("confirm qa")])
-                // On success nvim is exiting; the lifecycle event finishes the job.
-            } catch {
-                if let nvimError = error as? NvimError,
-                    case .sessionTerminated = nvimError
-                {
-                    // nvim died mid-request because it quit — expected.
-                } else {
-                    self?.cancelQuit()
-                }
-            }
+            await self?.runQuitFlow(session)
             self?.quitRequestInFlight = false
+        }
+    }
+
+    private func runQuitFlow(_ session: NvimSession) async {
+        // 1. What would be lost? (2s guard: nvim may itself be stuck at a
+        //    blocking prompt — swapfile dialog, hit-enter — and never answer.)
+        let modified = await Self.withTimeout(seconds: 2) {
+            () -> [String]? in
+            let lua = """
+                local names = {}
+                for _, b in ipairs(vim.api.nvim_list_bufs()) do
+                  if vim.bo[b].buflisted and vim.bo[b].modified then
+                    local n = vim.api.nvim_buf_get_name(b)
+                    names[#names + 1] = n ~= "" and vim.fn.fnamemodify(n, ":t") or "[No Name]"
+                  end
+                end
+                return names
+                """
+            let reply = try? await session.request("nvim_exec_lua", [.string(lua), .array([])])
+            return reply?.arrayValue?.compactMap(\.stringValue) ?? []
+        }
+
+        guard let modified else {
+            presentUnresponsiveAlert(session)
+            return
+        }
+        if modified.isEmpty {
+            // Nothing to lose; qa! cannot prompt. Lifecycle exit finishes it.
+            _ = try? await session.request("nvim_command", [.string("qa!")])
+            return
+        }
+        presentUnsavedAlert(modified, session: session)
+    }
+
+    /// Native Save All / Discard All / Cancel — replaces nvim's in-grid
+    /// y/n/c confirm prompt for the quit path.
+    private func presentUnsavedAlert(_ names: [String], session: NvimSession) {
+        guard let window else {
+            cancelQuit()  // headless: never discard silently
+            return
+        }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText =
+            names.count == 1
+            ? "“\(names[0])” has unsaved changes"
+            : "\(names.count) buffers have unsaved changes"
+        let shown = names.prefix(6).joined(separator: "\n")
+        alert.informativeText =
+            names.count > 6 ? shown + "\n… and \(names.count - 6) more" : shown
+        alert.addButton(withTitle: "Save All & Quit")
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Discard All & Quit")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard let self else { return }
+            switch response {
+            case .alertFirstButtonReturn:  // Save All & Quit
+                Task {
+                    do {
+                        _ = try await session.request("nvim_command", [.string("wall")])
+                        _ = try await session.request("nvim_command", [.string("qa!")])
+                    } catch {
+                        // E.g. E141: a buffer has no file name. Stay open.
+                        self.cancelQuit()
+                        self.presentInfoAlert(
+                            "Couldn’t save all buffers",
+                            detail:
+                                "Some buffers could not be written (unnamed buffer?). "
+                                + "Save them in the editor, then quit again.")
+                    }
+                }
+            case .alertThirdButtonReturn:  // Discard All & Quit
+                Task { _ = try? await session.request("nvim_command", [.string("qa!")]) }
+            default:  // Cancel
+                self.cancelQuit()
+            }
+        }
+    }
+
+    /// nvim didn't answer within the guard window (stuck at a blocking
+    /// prompt or hung): offer a way out that always resolves.
+    private func presentUnresponsiveAlert(_ session: NvimSession) {
+        guard let window else {
+            cancelQuit()
+            return
+        }
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = "Neovim is not responding"
+        alert.informativeText =
+            "It may be waiting at a prompt inside the editor. "
+            + "You can force quit (unsaved changes will be lost) or cancel and check the editor."
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Force Quit")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard let self else { return }
+            if response == .alertSecondButtonReturn {
+                Task { await session.terminate() }  // exit → lifecycle → reply
+            } else {
+                self.cancelQuit()
+            }
+        }
+    }
+
+    private func presentInfoAlert(_ message: String, detail: String) {
+        guard let window else { return }
+        let alert = NSAlert()
+        alert.messageText = message
+        alert.informativeText = detail
+        alert.beginSheetModal(for: window)
+    }
+
+    /// First result wins: the operation, or nil at the deadline.
+    private static func withTimeout<T: Sendable>(
+        seconds: Double, _ operation: @escaping @Sendable () async -> T?
+    ) async -> T? {
+        await withTaskGroup(of: T?.self) { group in
+            group.addTask { await operation() }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                return nil
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first
         }
     }
 
@@ -520,6 +638,46 @@ final class NvimController {
                 [
                     .string("vim.cmd.drop(vim.fn.fnameescape(...))"),
                     .array([.string(absolutePath)]),
+                ])
+        }
+    }
+
+    /// Sidebar single-click: open as a PREVIEW buffer (VS Code/Sublime
+    /// semantics — see superlemon.preview and CONTRACT.md).
+    func previewFile(_ absolutePath: String) {
+        guard let session else { return }
+        Task {
+            _ = try? await session.request(
+                "nvim_exec_lua",
+                [
+                    .string("require('superlemon.preview').open(...)"),
+                    .array([.string(absolutePath)]),
+                ])
+        }
+    }
+
+    /// Sidebar double-click: open pinned (promotes if currently previewed).
+    func openFilePermanently(_ absolutePath: String) {
+        guard let session else { return }
+        Task {
+            _ = try? await session.request(
+                "nvim_exec_lua",
+                [
+                    .string("require('superlemon.preview').open_permanent(...)"),
+                    .array([.string(absolutePath)]),
+                ])
+        }
+    }
+
+    /// Double-click (file or tab): pin the preview buffer permanently.
+    func promoteBuffer(_ bufnr: Int) {
+        guard let session else { return }
+        Task {
+            _ = try? await session.request(
+                "nvim_exec_lua",
+                [
+                    .string("require('superlemon.preview').promote(...)"),
+                    .array([.int(Int64(bufnr))]),
                 ])
         }
     }

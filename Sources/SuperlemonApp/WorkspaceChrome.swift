@@ -106,7 +106,8 @@ final class WorkspaceChrome {
                 return BufferTab(
                     bufnr: bufnr,
                     name: value["name"]?.stringValue ?? "",
-                    modified: value["modified"]?.boolValue ?? false)
+                    modified: value["modified"]?.boolValue ?? false,
+                    preview: value["preview"]?.boolValue ?? false)
             }
             tabStrip.render(
                 tabs: tabs, current: payload["current"]?.intValue ?? -1, dark: isDark)
@@ -282,9 +283,17 @@ final class WorkspaceChrome {
         tabStrip.onClose = { [weak self] bufnr in
             self?.controller.closeBuffer(bufnr)
         }
+        tabStrip.onPromote = { [weak self] bufnr in
+            self?.controller.promoteBuffer(bufnr)
+        }
 
+        // VS Code/Sublime semantics: single-click previews (italic tab,
+        // replaced by the next preview); double-click opens permanently.
         sidebar.onOpenFile = { [weak self] absolutePath in
-            self?.controller.openFile(absolutePath)
+            self?.controller.previewFile(absolutePath)
+        }
+        sidebar.onOpenFilePermanently = { [weak self] absolutePath in
+            self?.controller.openFilePermanently(absolutePath)
         }
         sidebar.onFileOperation = { [weak self] op in
             guard let self else { return }
