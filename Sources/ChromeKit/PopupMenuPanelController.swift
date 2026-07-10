@@ -65,6 +65,11 @@ public final class PopupMenuPanelController: NSObject {
         scrollView.documentView = tableView
         scrollView.hasVerticalScroller = true
         scrollView.autohidesScrollers = true
+        // Legacy (always-visible-when-overflowing) scroller: the popup is
+        // driven programmatically (nvim moves the selection), so an overlay
+        // scroller never gets a gesture to appear for — the list looked
+        // unscrollable whenever completions overflowed.
+        scrollView.scrollerStyle = .legacy
         scrollView.drawsBackground = false
         scrollView.autoresizingMask = [.width, .height]
         effectView.addSubview(scrollView)
@@ -160,8 +165,13 @@ public final class PopupMenuPanelController: NSObject {
             }
             maxWidth = max(maxWidth, width)
         }
-        let width = min(max(maxWidth + 24, 160), 480)
+        var width = min(max(maxWidth + 24, 160), 480)
         let rows = min(max(model.items.count, 1), Self.maxVisibleRows)
+        if model.items.count > Self.maxVisibleRows {
+            // Room for the legacy scroller so it never covers content.
+            width = min(width + NSScroller.scrollerWidth(
+                for: .regular, scrollerStyle: .legacy), 496)
+        }
         let height = CGFloat(rows) * Self.rowHeight + 8
         return NSSize(width: width, height: height)
     }
