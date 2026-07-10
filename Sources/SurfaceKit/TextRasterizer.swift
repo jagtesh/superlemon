@@ -266,9 +266,9 @@ final class TextRasterizer {
             ctx.addLine(to: CGPoint(x: rect.midX + rect.width * 0.11, y: midY + gap * 2.1))
         }
         func arrowHead(at x: CGFloat, y: CGFloat, back: CGFloat) {
-            ctx.move(to: CGPoint(x: back, y: y + rect.height * 0.16))
+            ctx.move(to: CGPoint(x: back, y: y + rect.height * 0.24))
             ctx.addLine(to: CGPoint(x: x, y: y))
-            ctx.addLine(to: CGPoint(x: back, y: y - rect.height * 0.16))
+            ctx.addLine(to: CGPoint(x: back, y: y - rect.height * 0.24))
         }
 
         switch seq {
@@ -289,25 +289,28 @@ final class TextRasterizer {
             bar(midY + gap * 1.6)
             slash()
         case "<=", ">=":
+            // ≤/≥: chevron centered in the upper region, bar clearly BELOW.
             let pointLeft = seq == "<="
-            let tipX = pointLeft ? left : right
-            let backX = pointLeft ? left + rect.width * 0.42 : right - rect.width * 0.42
-            ctx.move(to: CGPoint(x: backX, y: midY + gap * 2.4))
-            ctx.addLine(to: CGPoint(x: tipX, y: midY + gap * 0.4))
-            ctx.addLine(to: CGPoint(x: backX, y: midY - gap * 1.6))
-            bar(midY + gap * 2.4)
+            let tipX = pointLeft ? left + rect.width * 0.06 : right - rect.width * 0.06
+            let backX = pointLeft ? left + rect.width * 0.5 : right - rect.width * 0.5
+            let chevMid = midY + gap * 0.7
+            ctx.move(to: CGPoint(x: backX, y: chevMid + gap * 1.7))
+            ctx.addLine(to: CGPoint(x: tipX, y: chevMid))
+            ctx.addLine(to: CGPoint(x: backX, y: chevMid - gap * 1.7))
+            bar(midY - gap * 2.2)
         case "->", "<-":
             let pointLeft = seq == "<-"
             bar(midY)
             if pointLeft {
-                arrowHead(at: left, y: midY, back: left + rect.width * 0.24)
+                arrowHead(at: left, y: midY, back: left + rect.width * 0.3)
             } else {
-                arrowHead(at: right, y: midY, back: right - rect.width * 0.24)
+                arrowHead(at: right, y: midY, back: right - rect.width * 0.3)
             }
         case "=>":
-            bar(midY - gap, to: right - rect.width * 0.18)
-            bar(midY + gap, to: right - rect.width * 0.18)
-            arrowHead(at: right, y: midY, back: right - rect.width * 0.26)
+            // Double shaft stops well short of the tip; a FULL-SIZE head.
+            bar(midY - gap, to: right - rect.width * 0.3)
+            bar(midY + gap, to: right - rect.width * 0.3)
+            arrowHead(at: right, y: midY, back: right - rect.width * 0.38)
         default:
             break
         }
