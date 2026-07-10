@@ -159,13 +159,32 @@ final class NvimController {
         }
     }
 
-    /// Binary discovery per DESIGN §3: login-shell PATH (GUI apps don't
-    /// inherit shell PATH), then the Homebrew location as fallback.
+    /// Binary discovery per DESIGN §3, in order:
+    /// 1. SUPERLEMON_NVIM env override
+    /// 2. a bundled copy (Contents/Helpers/nvim in an .app, or next to the
+    ///    executable in dev builds) — the packaging step drops it in here
+    /// 3. login-shell PATH (GUI apps don't inherit shell PATH)
+    /// 4. the Homebrew location as a last resort
     private nonisolated static func resolveNvimBinary() async -> URL {
         await Task.detached(priority: .userInitiated) { () -> URL in
-            if let path = loginShellNvimPath(),
-                FileManager.default.isExecutableFile(atPath: path)
+            let fm = FileManager.default
+            if let env = ProcessInfo.processInfo.environment["SUPERLEMON_NVIM"],
+                fm.isExecutableFile(atPath: env)
             {
+                return URL(fileURLWithPath: env)
+            }
+            let executable = URL(fileURLWithPath: Bundle.main.executablePath ?? "")
+            let bundled = [
+                executable.deletingLastPathComponent()
+                    .deletingLastPathComponent()
+                    .appendingPathComponent("Helpers/nvim"),  // .app layout
+                executable.deletingLastPathComponent()
+                    .appendingPathComponent("nvim"),  // dev layout
+            ]
+            if let found = bundled.first(where: { fm.isExecutableFile(atPath: $0.path) }) {
+                return found
+            }
+            if let path = loginShellNvimPath(), fm.isExecutableFile(atPath: path) {
                 return URL(fileURLWithPath: path)
             }
             return URL(fileURLWithPath: "/opt/homebrew/bin/nvim")
