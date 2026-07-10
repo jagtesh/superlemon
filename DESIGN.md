@@ -599,7 +599,67 @@ palette joins M3; preview/image panes and workspace strip join M4.
 
 ---
 
-## 15. What makes it feel right (checklist to protect)
+## 15. The component framework — `superlemon.ui` (Lua-scriptable native UI)
+
+The architectural inversion that turns Superlemon from an app into a
+platform: native components stop being hard-wired feature consumers and
+become **servers scriptable from Lua**. Built-in features (git badges, ⌘P
+quick-open) are reimplemented as bundled plugins on the same public API any
+third-party plugin uses — permanent dogfooding.
+
+### Lua surface (sketch)
+
+```lua
+local ui = require("superlemon.ui")
+
+-- Sidebar decorations: plugins own namespaces; the GUI merges them.
+local ns = ui.sidebar.namespace("gitsigns-native")
+ns:set_badge("Sources/a.swift", { text = "M", color = "#E0B268" })
+ns:set_dot("Sources", { color = "#ADC694" })
+ns:clear()
+
+-- The palette is a generic fuzzy-picker COMPONENT; ⌘P is just one user.
+ui.palette.open({
+  placeholder = "Buffers…",
+  on_query = function(q) return {
+    { id = 3, title = "a.swift", subtitle = "Sources", positions = { 1, 2 } },
+  } end,
+  on_select = function(id) vim.api.nvim_set_current_buf(id) end,
+})
+
+ui.toast({ text = "Build failed", kind = "error" })          -- MessageToast
+ui.statusbar.segment("my-plugin", { text = "⚡ 3", color = "#E0B268" })
+```
+
+### Wire protocol (one generic pair, replacing bespoke notifications)
+
+- nvim → GUI: `superlemon.ui` notification
+  `{ component, method, namespace, args }` — e.g.
+  `{ "sidebar", "set_badge", "gitsigns-native", { path, text, color } }`.
+- GUI → Lua callbacks: the Lua side registers functions in a registry keyed
+  by callback id; the GUI invokes them via
+  `nvim_exec_lua("require('superlemon.ui')._dispatch(...)", [id, payload])`
+  and awaits the return value (palette on_query round-trips in ~1 ms).
+- Namespacing gives isolation: a plugin's `clear()` never touches another's
+  badges; the GUI composes namespaces deterministically (sorted by name).
+
+### Migration path
+
+1. Wave A: protocol plumbing (`superlemon.ui` module + dispatcher, GUI
+   router in WorkspaceChrome) + sidebar decorations as the first component;
+   port git badges onto it.
+2. Wave B: palette component; port ⌘P (the file picker moves into Lua —
+   FileIndex/FuzzyScorer stay as the GUI-side engine the built-in picker
+   uses, but any picker can bring its own source). `<D-p>` becomes a normal
+   plugin-owned mapping, rebindable from any vimrc — CtrlP semantics on a
+   native panel.
+3. Wave C: statusbar segments, toasts, prompts; document as the public
+   plugin-author API; CONTRACT.md's bespoke `superlemon.git`/quick-open
+   paths are subsumed and deprecated.
+
+---
+
+## 16. What makes it feel right (checklist to protect)
 
 - Your `init.lua` loads unmodified; every plugin works
 - Keystroke latency indistinguishable from Terminal.app, UI polish
