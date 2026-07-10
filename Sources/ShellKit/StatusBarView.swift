@@ -527,13 +527,18 @@ public final class StatusBarView: NSView {
         content.translatesAutoresizingMaskIntoConstraints = false
         container.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(content)
+        // No inset on glyph edges: a transition triangle must sit flush
+        // against its neighbor blocks — 2pt text padding around the shape
+        // showed as dark slivers splitting the powerline.
+        let leadInset: CGFloat = (tokens.first?.isGlyph ?? false) ? 0 : 2
+        let trailInset: CGFloat = (tokens.last?.isGlyph ?? false) ? 0 : -2
         NSLayoutConstraint.activate([
             // Full bar height minus the 1px top border: blocks reach the
             // bar's edges like the command overlay does.
             container.heightAnchor.constraint(equalToConstant: StatusBarView.barHeight - 1),
             container.widthAnchor.constraint(lessThanOrEqualToConstant: 480),
-            content.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 2),
-            content.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -2),
+            content.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: leadInset),
+            content.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: trailInset),
             content.centerYAnchor.constraint(equalTo: container.centerYAnchor),
             content.heightAnchor.constraint(equalTo: container.heightAnchor),
         ])
