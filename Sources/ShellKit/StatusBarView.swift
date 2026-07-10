@@ -108,6 +108,7 @@ public final class StatusBarView: NSView {
     /// instead of the built-in chips (see `renderStatusline(_:)`).
     public private(set) var activeStatusline: [StatuslineSegment]?
     private let statuslineLabel = NSTextField(labelWithString: "")
+    private let statuslineRightLabel = NSTextField(labelWithString: "")
 
     public override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -167,11 +168,15 @@ public final class StatusBarView: NSView {
         // Harvested-statusline segment (superlemon.statusline): a single
         // attributed line carrying the user's own powerline content.
         statuslineLabel.setAccessibilityIdentifier("status.statusline")
-        statuslineLabel.isHidden = true
-        statuslineLabel.lineBreakMode = .byTruncatingTail
-        statuslineLabel.usesSingleLineMode = true
-        statuslineLabel.maximumNumberOfLines = 1
-        statuslineLabel.setContentCompressionResistancePriority(.init(249), for: .horizontal)
+        statuslineRightLabel.setAccessibilityIdentifier("status.statusline.right")
+        for label in [statuslineLabel, statuslineRightLabel] {
+            label.isHidden = true
+            label.lineBreakMode = .byTruncatingTail
+            label.usesSingleLineMode = true
+            label.maximumNumberOfLines = 1
+            label.setContentCompressionResistancePriority(.init(249), for: .horizontal)
+        }
+        statuslineRightLabel.setContentCompressionResistancePriority(.init(251), for: .horizontal)
 
         let spacer = NSView()
         spacer.setContentHuggingPriority(.init(1), for: .horizontal)
@@ -182,6 +187,7 @@ public final class StatusBarView: NSView {
         stack.addArrangedSubview(commandSegment)
         stack.addArrangedSubview(statuslineLabel)
         stack.addArrangedSubview(spacer)
+        stack.addArrangedSubview(statuslineRightLabel)
         stack.addArrangedSubview(projectChip)
         stack.addArrangedSubview(lineColChip)
 
@@ -250,8 +256,11 @@ public final class StatusBarView: NSView {
         // Harvested statusline segments carry their own colors; rebuild so an
         // appearance flip re-resolves the default-foreground fallbacks.
         if let segments = activeStatusline {
+            let (left, right) = Self.splitAtFill(segments)
             statuslineLabel.attributedStringValue = Self.attributedStatusline(
-                segments, dark: dark)
+                left, dark: dark)
+            statuslineRightLabel.attributedStringValue = Self.attributedStatusline(
+                right, dark: dark)
         }
         applyChipVisibility()
     }
@@ -276,12 +285,61 @@ public final class StatusBarView: NSView {
     public func renderStatusline(_ segments: [StatuslineSegment]?) {
         activeStatusline = (segments?.isEmpty ?? true) ? nil : segments
         if let segments = activeStatusline {
+            let (left, right) = Self.splitAtFill(segments)
             statuslineLabel.attributedStringValue = Self.attributedStatusline(
-                segments, dark: isDark)
+                left, dark: isDark)
+            statuslineRightLabel.attributedStringValue = Self.attributedStatusline(
+                right, dark: isDark)
         } else {
             statuslineLabel.attributedStringValue = NSAttributedString()
+            statuslineRightLabel.attributedStringValue = NSAttributedString()
         }
         applyChipVisibility()
+    }
+
+    /// Split at the `%=` fill (a long run of spaces from nvim_eval_statusline)
+    /// so the bar's own flexible spacer provides true right-alignment instead
+    /// of hundreds of literal space characters.
+    static func splitAtFill(
+        _ segments: [StatuslineSegment]
+    ) -> (left: [StatuslineSegment], right: [StatuslineSegment]) {
+        var left: [StatuslineSegment] = []
+        var right: [StatuslineSegment] = []
+        var filled = false
+        for segment in segments {
+            let trimmed = segment.text.trimmingCharacters(in: .whitespaces)
+            if !filled, trimmed.isEmpty, segment.text.count >= 4 {
+                filled = true  // the fill itself is dropped
+                continue
+            }
+            if filled {
+                right.append(segment)
+            } else if !filled, trimmed.isEmpty, segment.text.count >= 4 {
+                continue
+            } else {
+                // Long space runs INSIDE a styled segment (fill inherits the
+                // neighboring highlight) also mark the split.
+                if !filled, let range = segment.text.range(of: "    "),
+                    segment.text.count >= 8
+                {
+                    var head = segment
+                    head.text = String(segment.text[..<range.lowerBound])
+                    var tail = segment
+                    tail.text = segment.text[range.upperBound...]
+                        .trimmingCharacters(in: .whitespaces)
+                    if !head.text.trimmingCharacters(in: .whitespaces).isEmpty {
+                        left.append(head)
+                    }
+                    if !tail.text.isEmpty {
+                        right.append(tail)
+                    }
+                    filled = true
+                } else {
+                    left.append(segment)
+                }
+            }
+        }
+        return (left, right)
     }
 
     static func attributedStatusline(
@@ -319,6 +377,7 @@ public final class StatusBarView: NSView {
         let statuslineActive = !commandActive && activeStatusline != nil
         commandSegment.isHidden = !commandActive
         statuslineLabel.isHidden = !statuslineActive
+        statuslineRightLabel.isHidden = !statuslineActive
         // The harvested statusline carries everything (mode, file, position),
         // so ALL chips yield to it; the command overlay keeps mode + line:col.
         modeBadge.isHidden = statuslineActive

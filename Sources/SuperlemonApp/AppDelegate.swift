@@ -196,8 +196,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         let alert = NSAlert()
         alert.messageText =
             defaults.bool(forKey: key)
-            ? "Superlemon will use its own configuration"
-            : "Superlemon will use your Neovim configuration"
+            ? "Superlemon will use its built-in configuration"
+            : "Superlemon will use your own Neovim configuration (init.vim/init.lua)"
         alert.informativeText = "The change applies when Superlemon relaunches."
         alert.addButton(withTitle: "Relaunch Now")
         alert.addButton(withTitle: "Later")
@@ -227,9 +227,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         case #selector(toggleNativeStatusBar(_:)):
             menuItem.state = (chrome?.nativeStatusbar ?? false) ? .on : .off
         case #selector(toggleManagedConfig(_:)):
+            // Checked = the USER's init.vim is in charge (managed config off).
             menuItem.state =
                 UserDefaults.standard.bool(
-                    forKey: NvimController.managedConfigDefaultsKey) ? .on : .off
+                    forKey: NvimController.managedConfigDefaultsKey) ? .off : .on
         default:
             break
         }
@@ -278,7 +279,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                 keyEquivalent: ""))
         appMenu.addItem(.separator())
         let managedConfigItem = NSMenuItem(
-            title: "Use Superlemon Config",
+            title: "Use My Neovim Config",
             action: #selector(toggleManagedConfig(_:)),
             keyEquivalent: "")
         managedConfigItem.target = self

@@ -32,3 +32,67 @@ vim.opt.showmode = false
 
 -- Ships with nvim; calm and readable in both appearances.
 vim.cmd.colorscheme("habamax")
+
+---------------------------------------------------------------------------
+-- Statusline (powerline-style) ────────────────────────────────────────────
+--
+-- This is a PLAIN vim 'statusline' (:h 'statusline') — even though
+-- laststatus=0 hides it in the grid, the native bar harvests whatever it
+-- evaluates to (nvim_eval_statusline; CONTRACT.md superlemon.statusline).
+-- CUSTOMIZE IT LIKE ANY VIMRC: edit the highlight colors, reorder the
+-- segments, add your own %{} items — the native bar follows live.
+---------------------------------------------------------------------------
+
+local hl = vim.api.nvim_set_hl
+-- Mode badge colors (mirrors the classic airline scheme + NORTHSTAR caps).
+hl(0, "SLModeNormal", { fg = "#FFFFFF", bg = "#004DC8", bold = true })
+hl(0, "SLModeInsert", { fg = "#1B2023", bg = "#ADC694", bold = true })
+hl(0, "SLModeVisual", { fg = "#FFFFFF", bg = "#8E24AA", bold = true })
+hl(0, "SLModeReplace", { fg = "#FFFFFF", bg = "#C42B1C", bold = true })
+hl(0, "SLModeCommand", { fg = "#1B2023", bg = "#E0B268", bold = true })
+hl(0, "SLGit", { fg = "#CDD2D7", bg = "#4A4A49" })
+hl(0, "SLFile", { fg = "#CDD2D7", bg = "#373736" })
+hl(0, "SLInfo", { fg = "#A6ABB0", bg = "#2B2B2A" })
+hl(0, "SLPos", { fg = "#FFFFFF", bg = "#005A37", bold = true })
+
+local MODE_NAMES = {
+  n = "NORMAL", i = "INSERT", v = "VISUAL", V = "V-LINE", ["\22"] = "V-BLOCK",
+  c = "COMMAND", R = "REPLACE", s = "SELECT", S = "S-LINE", t = "TERMINAL",
+}
+local MODE_GROUPS = {
+  n = "SLModeNormal", i = "SLModeInsert", v = "SLModeVisual",
+  V = "SLModeVisual", ["\22"] = "SLModeVisual", c = "SLModeCommand",
+  R = "SLModeReplace", t = "SLModeInsert",
+}
+
+-- Mode badge: name and color react to the current mode. (`mode` argument
+-- is for testing; it defaults to the live mode.)
+function _G.superlemon_sl_mode(mode)
+  mode = mode or vim.fn.mode()
+  local key = mode:sub(1, 1)
+  local group = MODE_GROUPS[key] or "SLModeNormal"
+  local name = MODE_NAMES[key] or mode:upper()
+  return "%#" .. group .. "# " .. name .. " "
+end
+
+-- Git branch segment (data from the superlemon plugin's cached provider;
+-- empty outside a repository).
+function _G.superlemon_sl_git()
+  local ok, status = pcall(require, "superlemon.status")
+  local branch = ok and status.branch_for(vim.fn.getcwd()) or ""
+  if branch == "" then
+    return ""
+  end
+  return "%#SLGit# ⎇ " .. branch .. " "
+end
+
+vim.o.statusline = table.concat({
+  "%{%v:lua.superlemon_sl_mode()%}",
+  "%{%v:lua.superlemon_sl_git()%}",
+  "%#SLFile# %f %m%r ",
+  "%=",  -- ── right side ──
+  "%#SLInfo# %{&filetype == '' ? 'text' : &filetype} ",
+  "%#SLInfo# %{&fileencoding == '' ? &encoding : &fileencoding}[%{&fileformat}] ",
+  "%#SLInfo# %p%% ",
+  "%#SLPos# ln:%l/%L ≡ :%c ",
+})
