@@ -141,6 +141,16 @@ public final class StatusBarView: NSView {
         NSSize(width: NSView.noIntrinsicMetric, height: Self.barHeight)
     }
 
+    /// Bar-content edge pins are 999, not required: an over-wide statusline
+    /// (airline + a term://…fzf… buffer name was the field case) must clip
+    /// inside the bar — a required chain here makes Auto Layout GROW THE
+    /// WINDOW, triggering a resize feedback loop (window → columns →
+    /// wider statusline → window…).
+    private func pinned(_ constraint: NSLayoutConstraint) -> NSLayoutConstraint {
+        constraint.priority = .init(999)
+        return constraint
+    }
+
     private func setUp() {
         wantsLayer = true
 
@@ -211,8 +221,8 @@ public final class StatusBarView: NSView {
             topBorder.heightAnchor.constraint(equalToConstant: 1),
             stack.topAnchor.constraint(equalTo: topBorder.bottomAnchor),
             stack.bottomAnchor.constraint(equalTo: bottomAnchor),
-            stack.leadingAnchor.constraint(equalTo: leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: trailingAnchor),
+            pinned(stack.leadingAnchor.constraint(equalTo: leadingAnchor)),
+            pinned(stack.trailingAnchor.constraint(equalTo: trailingAnchor)),
             heightAnchor.constraint(equalToConstant: Self.barHeight),
         ])
 
@@ -424,7 +434,12 @@ public final class StatusBarView: NSView {
         guard let segments else { return }
         let (left, right) = Self.splitAtFill(segments)
         for (side, stackView) in [(left, statuslineLeftStack), (right, statuslineRightStack)] {
-            for segment in side {
+            for var segment in side {
+                // Collapse residual fill runs (airline pads sections with
+                // literal spaces up to the eval width) — the bar's spacer
+                // owns alignment; giant space runs must not demand width.
+                segment.text = segment.text.replacingOccurrences(
+                    of: "   +", with: "  ", options: .regularExpression)
                 stackView.addArrangedSubview(Self.segmentBlock(segment, dark: dark))
             }
         }
@@ -449,8 +464,10 @@ public final class StatusBarView: NSView {
         label.font = font
         label.textColor =
             segment.fg.map(colorFromRGB) ?? ShellPalette.primaryText(dark: dark)
-        label.lineBreakMode = .byTruncatingTail
+        label.lineBreakMode = .byTruncatingMiddle
         label.usesSingleLineMode = true
+        // Truncate rather than demand width (long paths, term:// names).
+        label.setContentCompressionResistancePriority(.init(240), for: .horizontal)
         label.translatesAutoresizingMaskIntoConstraints = false
         container.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(label)
@@ -458,6 +475,7 @@ public final class StatusBarView: NSView {
             // Full bar height minus the 1px top border: blocks reach the
             // bar's edges like the command overlay does.
             container.heightAnchor.constraint(equalToConstant: barHeight - 1),
+            container.widthAnchor.constraint(lessThanOrEqualToConstant: 480),
             label.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 2),
             label.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -2),
             label.centerYAnchor.constraint(equalTo: container.centerYAnchor),

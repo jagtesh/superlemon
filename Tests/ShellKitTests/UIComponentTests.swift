@@ -355,3 +355,38 @@ struct QuickOpenSubtitleTests {
         return nil
     }
 }
+
+
+// MARK: - Window-width forcing regression (the fzf/airline blowup)
+
+@MainActor
+@Suite struct StatusBarWindowForcingTests {
+    /// An over-wide harvested statusline (airline + term://…fzf… names,
+    /// literal %= fill runs) must CLIP inside the bar — never grow the
+    /// window via required constraint chains (the 3x-window feedback loop).
+    @Test func absurdStatuslineCannotGrowTheWindow() {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
+            styleMask: [.titled], backing: .buffered, defer: false)
+        let bar = StatusBarView(frame: .zero)
+        bar.translatesAutoresizingMaskIntoConstraints = false
+        window.contentView?.addSubview(bar)
+        NSLayoutConstraint.activate([
+            bar.leadingAnchor.constraint(equalTo: window.contentView!.leadingAnchor),
+            bar.trailingAnchor.constraint(equalTo: window.contentView!.trailingAnchor),
+            bar.bottomAnchor.constraint(equalTo: window.contentView!.bottomAnchor),
+        ])
+
+        let monster = (0..<12).map { i in
+            StatuslineSegment(
+                text: "segment\(i) " + String(repeating: "x", count: 200)
+                    + String(repeating: " ", count: 120),
+                fg: 0xFFFFFF, bg: 0x004DC8)
+        }
+        bar.renderStatusline(monster)
+        window.contentView?.layoutSubtreeIfNeeded()
+        window.layoutIfNeeded()
+
+        #expect(window.frame.width == 600, "the bar must clip, not resize the window")
+    }
+}
