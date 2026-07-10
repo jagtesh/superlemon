@@ -37,6 +37,14 @@ final class WorkspaceChrome {
     /// Returns key focus to the editor (set by AppDelegate).
     var restoreFocus: (() -> Void)?
 
+    /// The superlemon.ui component framework router (CONTRACT.md,
+    /// DESIGN §15). Lazy so `self` is fully initialized when created.
+    private(set) lazy var uiRouter = UIComponentRouter(
+        chrome: self, controller: controller, projectRoot: projectRoot)
+
+    /// The attached window; UIComponentRouter presents panels/sheets over it.
+    var attachedWindow: NSWindow? { window }
+
     init(controller: NvimController, projectRoot: URL) {
         self.controller = controller
         self.projectRoot = projectRoot
@@ -111,6 +119,10 @@ final class WorkspaceChrome {
                 statuses[projectRoot.appendingPathComponent(rel).path] = status
             }
             sidebar.setGitStatus(statuses)
+        case "superlemon.ui":
+            // The component framework (CONTRACT.md, DESIGN §15): one generic
+            // notification routed to the native components.
+            uiRouter.handle(params)
         case "superlemon.buffers":
             guard let payload = params.first,
                 let bufferValues = payload["buffers"]?.arrayValue
@@ -327,6 +339,9 @@ final class WorkspaceChrome {
     }
 
     func presentQuickOpen() {
+        // ⌘P during a plugin palette session: end the session first so the
+        // built-in file-picker wiring (restored on session close) is live.
+        uiRouter.closePaletteSession()
         quickOpen.present(over: window)
     }
 

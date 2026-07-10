@@ -132,6 +132,23 @@ public final class FileTreeSidebarView: NSView {
     private var gitStatuses: [String: String] = [:]
     private var gitDirtyDirs: Set<String> = []
 
+    /// superlemon.ui sidebar decorations (runtime/CONTRACT.md), already
+    /// COMPOSED across namespaces by the embedder: absolute path →
+    /// decoration. Precedence rule: where a ui decoration and a git badge
+    /// target the same path, the UI DECORATION WINS — explicit plugin
+    /// intent outranks the built-in git provider (which is itself being
+    /// migrated onto this API, DESIGN §15). Paths without a ui decoration
+    /// keep their git badge; `setGitStatus` keeps working unchanged.
+    private var uiDecorations: [String: SidebarDecoration] = [:]
+
+    /// Additive superlemon.ui entry point: replaces the full composed
+    /// decoration map (keys are absolute paths). Coexists with
+    /// `setGitStatus`; see `uiDecorations` for the precedence rule.
+    public func setUIDecorations(_ decorations: [String: SidebarDecoration]) {
+        uiDecorations = decorations
+        outlineView.reloadData()
+    }
+
     public func setGitStatus(_ statuses: [String: String]) {
         gitStatuses = statuses
         gitDirtyDirs = []
@@ -370,7 +387,19 @@ extension FileTreeSidebarView: NSOutlineViewDataSource, NSOutlineViewDelegate {
         let cell = outlineView.makeView(withIdentifier: identifier, owner: nil)
             as? FileTreeCellView ?? FileTreeCellView(identifier: identifier)
         cell.configure(node: node, dark: isDark)
-        if node.isDirectory {
+        if let decoration = uiDecorations[node.url.path] {
+            // superlemon.ui decoration wins over git for the same path.
+            switch decoration.kind {
+            case .badge(let text):
+                cell.setGitBadge(
+                    text,
+                    color: decoration.color ?? ShellPalette.secondaryText(dark: isDark))
+            case .dot:
+                cell.setGitBadge(
+                    "●",
+                    color: decoration.color ?? ShellPalette.secondaryText(dark: isDark))
+            }
+        } else if node.isDirectory {
             if gitDirtyDirs.contains(node.url.path) {
                 cell.setGitBadge("•", color: ShellPalette.gitModified(dark: isDark))
             }

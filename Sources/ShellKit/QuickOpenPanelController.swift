@@ -16,13 +16,24 @@
 import AppKit
 
 public struct QuickOpenResult: Equatable, Sendable {
-    /// Relative path, e.g. "src/pages/index.astro".
+    /// Relative path, e.g. "src/pages/index.astro" — or, for superlemon.ui
+    /// palette sessions, the plugin-provided row title.
     public let path: String
     /// Matched character indices into `path` (from FuzzyScorer) for bolding.
     public let positions: [Int]
+    /// Additive (superlemon.ui palette): explicit second line. nil keeps
+    /// the classic rendering that derives basename + directory from `path`;
+    /// non-nil renders `path` whole as the primary line and this as the
+    /// secondary line (empty string hides the secondary line).
+    public let subtitle: String?
 
     public init(path: String, positions: [Int] = []) {
+        self.init(path: path, subtitle: nil, positions: positions)
+    }
+
+    public init(path: String, subtitle: String?, positions: [Int] = []) {
         self.path = path
+        self.subtitle = subtitle
         self.positions = positions
     }
 }
@@ -44,6 +55,17 @@ public final class QuickOpenPanelController: NSObject {
     /// Fired on every keystroke in the search field; embedder queries the
     /// index and calls `display(results:totalCount:)`.
     public var onQueryChange: ((String) -> Void)?
+    /// Additive (superlemon.ui palette): fired with the selected row INDEX
+    /// (into the last `display` results) when a row is opened, BEFORE the
+    /// panel closes — sessions that key rows by opaque ids resolve them
+    /// here. `onOpen` still fires with the path afterwards.
+    public var onOpenIndex: ((Int) -> Void)?
+
+    /// Additive (superlemon.ui palette): the search field's placeholder.
+    public var placeholder: String {
+        get { searchField.placeholderString ?? "" }
+        set { searchField.placeholderString = newValue }
+    }
 
     // UI
     public let panel: NSPanel
@@ -284,6 +306,8 @@ public final class QuickOpenPanelController: NSObject {
 
     @objc func openSelection() {
         guard let path = selectedPath else { return }
+        let row = tableView.selectedRow
+        onOpenIndex?(row)
         close()
         onOpen?(path)
     }
@@ -403,6 +427,20 @@ final class QuickOpenCellView: NSView {
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
     func configure(result: QuickOpenResult, dark: Bool) {
+        if let subtitle = result.subtitle {
+            // superlemon.ui palette row: the title renders whole as the
+            // primary line (positions index into it), subtitle below.
+            titleLabel.attributedStringValue = Self.emphasized(
+                result.path, positions: result.positions, size: 13,
+                color: ShellPalette.primaryText(dark: dark)
+            )
+            pathLabel.attributedStringValue = Self.emphasized(
+                subtitle, positions: [], size: 11,
+                color: ShellPalette.paletteSecondary(dark: dark)
+            )
+            pathLabel.isHidden = subtitle.isEmpty
+            return
+        }
         let path = result.path
         let chars = Array(path)
         let slashIndex = chars.lastIndex(of: "/")

@@ -110,6 +110,15 @@ public final class StatusBarView: NSView {
     private let statuslineLabel = NSTextField(labelWithString: "")
     private let statuslineRightLabel = NSTextField(labelWithString: "")
 
+    /// superlemon.ui statusbar segments (runtime/CONTRACT.md): namespace →
+    /// (text, color). Rendered as chips AFTER all built-in content, composed
+    /// sorted by namespace name. Visible in both chip and
+    /// harvested-statusline modes; hidden while the command overlay is up.
+    private var pluginSegments: [String: (text: String, color: NSColor?)] = [:]
+    private var pluginChips: [ChipView] = []
+    /// Composed plugin chip texts in render order (test hook).
+    var pluginChipTexts: [String] { pluginChips.map(\.text) }
+
     public override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         // The bar collapses to height 0 when native chrome is off — without
@@ -262,7 +271,48 @@ public final class StatusBarView: NSView {
             statuslineRightLabel.attributedStringValue = Self.attributedStatusline(
                 right, dark: dark)
         }
+        rebuildPluginChips()  // re-resolve default colors on appearance flips
         applyChipVisibility()
+    }
+
+    // MARK: superlemon.ui plugin segments (additive)
+
+    /// Sets (or replaces) the plugin segment owned by `namespace`.
+    /// `color` tints the chip text; nil uses the standard chip text color.
+    public func setPluginSegment(namespace: String, text: String, color: NSColor? = nil) {
+        pluginSegments[namespace] = (text, color)
+        rebuildPluginChips()
+        applyChipVisibility()
+    }
+
+    /// Removes `namespace`'s segment; other namespaces are untouched.
+    public func clearPluginSegment(namespace: String) {
+        guard pluginSegments.removeValue(forKey: namespace) != nil else { return }
+        rebuildPluginChips()
+        applyChipVisibility()
+    }
+
+    /// Rebuilds the trailing plugin chips, composed sorted by namespace
+    /// name (the contract's deterministic composition order). Chips append
+    /// after every built-in arranged view, so they sit at the bar's right
+    /// edge in both chip and harvested-statusline modes.
+    private func rebuildPluginChips() {
+        for chip in pluginChips {
+            stack.removeArrangedSubview(chip)
+            chip.removeFromSuperview()
+        }
+        pluginChips = []
+        for namespace in pluginSegments.keys.sorted() {
+            guard let segment = pluginSegments[namespace] else { continue }
+            let chip = ChipView()
+            chip.setAccessibilityIdentifier("status.plugin.\(namespace)")
+            chip.configure(
+                text: segment.text,
+                textColor: segment.color ?? ShellPalette.statusChipText(dark: isDark),
+                background: ShellPalette.statusChipBackground(dark: isDark))
+            stack.addArrangedSubview(chip)
+            pluginChips.append(chip)
+        }
     }
 
     /// Command-line overlay for the flexible middle of the bar. Non-nil:
@@ -385,6 +435,9 @@ public final class StatusBarView: NSView {
         fileChip.isHidden = commandActive || statuslineActive
         branchChip.isHidden = commandActive || statuslineActive || model.branch.isEmpty
         projectChip.isHidden = commandActive || statuslineActive || model.project.isEmpty
+        // Plugin segments stay up alongside chips AND the harvested
+        // statusline; only the command overlay hides them.
+        for chip in pluginChips { chip.isHidden = commandActive }
     }
 }
 

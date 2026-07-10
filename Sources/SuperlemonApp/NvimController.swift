@@ -712,6 +712,25 @@ final class NvimController {
         }
     }
 
+    /// superlemon.ui callback dispatch (runtime/CONTRACT.md): blocking
+    /// request into the Lua-side callback registry. Returns the callback's
+    /// return value, or nil on any error (freed id, Lua error, no session).
+    func dispatchUICallback(_ id: Int, payload: [(Value, Value)]) async -> Value? {
+        guard let session else { return nil }
+        return try? await session.request(
+            "nvim_exec_lua",
+            [
+                .string("return require('superlemon.ui')._dispatch(...)"),
+                .array([.int(Int64(id)), .map(payload)]),
+            ])
+    }
+
+    /// Fire-and-forget variant of `dispatchUICallback` for select/submit
+    /// callbacks whose return value is irrelevant.
+    func dispatchUICallbackDetached(_ id: Int, payload: [(Value, Value)]) {
+        Task { _ = await self.dispatchUICallback(id, payload: payload) }
+    }
+
     /// ⌘V: `nvim_paste` of the pasteboard string, single phase (-1).
     func pasteFromPasteboard() {
         guard let session,

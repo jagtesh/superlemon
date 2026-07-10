@@ -6,6 +6,15 @@
 // `ChromeState.pendingConfirm` and routes those to NSAlert.
 import AppKit
 
+/// superlemon.ui `toast show` kinds (runtime/CONTRACT.md). Mapped onto the
+/// nvim message-kind styling: `error` gets the red persistent treatment,
+/// `info`/`warn` the standard auto-dismissing one.
+public enum ToastKind: String, Sendable {
+    case info
+    case warn
+    case error
+}
+
 @MainActor
 public final class MessageToastController {
     public static let toastWidth: CGFloat = 320
@@ -25,6 +34,10 @@ public final class MessageToastController {
     /// User-dismissed messages: never resurrected by a later render of the
     /// same model list. Pruned to the live message set on each render.
     private var dismissedIDs: Set<UUID> = []
+    /// Ad-hoc toasts (superlemon.ui `toast show`): owned by this controller
+    /// rather than ChromeState, so `render(_:)`'s model sync must never
+    /// remove them.
+    private var adHocIDs: Set<UUID> = []
     private var order: [UUID] = []
     private weak var container: NSView?
 
@@ -65,23 +78,46 @@ public final class MessageToastController {
         let visibleIDs = Set(visible.map(\.id))
 
         // Remove toasts whose message is gone (msg_clear, replace_last).
-        for id in order where !visibleIDs.contains(id) {
+        // Ad-hoc toasts live outside the model list and are kept.
+        for id in order where !visibleIDs.contains(id) && !adHocIDs.contains(id) {
             removeToast(id)
         }
 
         // Add toasts for new messages.
         for message in visible where toastViews[message.id] == nil {
-            let toast = ToastView(message: message, width: Self.toastWidth)
-            toast.onClick = { [weak self] in self?.dismissToast(message.id) }
-            toastViews[message.id] = toast
-            container?.addSubview(toast)
-            if !message.isError {
-                scheduleAutoDismiss(of: message.id)
-            }
+            addToast(for: message)
         }
 
-        order = visible.map(\.id)
+        order = visible.map(\.id) + order.filter { adHocIDs.contains($0) }
         layoutToasts()
+    }
+
+    /// superlemon.ui `toast show` (runtime/CONTRACT.md): an ad-hoc toast
+    /// through the same view pipeline as ext_messages, but owned by this
+    /// controller — model re-renders never clear it. `error` persists until
+    /// clicked; `info`/`warn` auto-dismiss.
+    public func showAdHoc(text: String, kind: ToastKind) {
+        let nvimKind: String
+        switch kind {
+        case .info: nvimKind = "echo"
+        case .warn: nvimKind = "wmsg"
+        case .error: nvimKind = "emsg"
+        }
+        let message = MessageModel(kind: nvimKind, content: [Chunk(hlID: 0, text: text)])
+        adHocIDs.insert(message.id)
+        addToast(for: message)
+        order.append(message.id)
+        layoutToasts()
+    }
+
+    private func addToast(for message: MessageModel) {
+        let toast = ToastView(message: message, width: Self.toastWidth)
+        toast.onClick = { [weak self] in self?.dismissToast(message.id) }
+        toastViews[message.id] = toast
+        container?.addSubview(toast)
+        if !message.isError {
+            scheduleAutoDismiss(of: message.id)
+        }
     }
 
     /// Click-to-dismiss (also used by the auto-dismiss task). The message
@@ -109,6 +145,7 @@ public final class MessageToastController {
         dismissTasks[id] = nil
         toastViews[id]?.removeFromSuperview()
         toastViews[id] = nil
+        adHocIDs.remove(id)
         order.removeAll { $0 == id }
     }
 
