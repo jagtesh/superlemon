@@ -34,6 +34,7 @@ function M.setup(channel)
   require("superlemon.clipboard").setup()
   require("superlemon.keymaps").setup()
   require("superlemon.chrome").setup(group)
+  require("superlemon.git").setup(group)
 
   -- Seed the GUI with the current state right away.
   require("superlemon.status").push()

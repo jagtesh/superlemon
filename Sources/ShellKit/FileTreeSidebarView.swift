@@ -126,6 +126,37 @@ public final class FileTreeSidebarView: NSView {
     /// Double-click: open as a permanent (pinned) buffer. Falls back to
     /// `onOpenFile` when unset.
     public var onOpenFilePermanently: ((String) -> Void)?
+
+    /// Git badges (superlemon.git): absolute file path → one-letter status
+    /// (M A D R C U ?). Directories containing a flagged file get a dot.
+    private var gitStatuses: [String: String] = [:]
+    private var gitDirtyDirs: Set<String> = []
+
+    public func setGitStatus(_ statuses: [String: String]) {
+        gitStatuses = statuses
+        gitDirtyDirs = []
+        let rootPath = rootNode?.url.path ?? "/"
+        for path in statuses.keys {
+            var dir = (path as NSString).deletingLastPathComponent
+            while dir.count >= rootPath.count, dir != "/" {
+                gitDirtyDirs.insert(dir)
+                dir = (dir as NSString).deletingLastPathComponent
+            }
+        }
+        outlineView.reloadData()
+    }
+
+    static func gitBadge(status: String, dark: Bool) -> (text: String, color: NSColor) {
+        switch status {
+        case "M": return ("M", ShellPalette.gitModified(dark: dark))
+        case "A": return ("A", ShellPalette.gitAdded(dark: dark))
+        case "D": return ("D", ShellPalette.gitDeleted(dark: dark))
+        case "R", "C": return ("R", ShellPalette.gitRenamed(dark: dark))
+        case "U": return ("U", ShellPalette.gitDeleted(dark: dark))
+        case "?": return ("?", ShellPalette.gitUntracked(dark: dark))
+        default: return (status, ShellPalette.secondaryText(dark: dark))
+        }
+    }
     public var onFileOperation: ((FileOperation) -> Void)?
 
     /// Show dotfiles (`.git` stays hidden always).
@@ -339,6 +370,14 @@ extension FileTreeSidebarView: NSOutlineViewDataSource, NSOutlineViewDelegate {
         let cell = outlineView.makeView(withIdentifier: identifier, owner: nil)
             as? FileTreeCellView ?? FileTreeCellView(identifier: identifier)
         cell.configure(node: node, dark: isDark)
+        if node.isDirectory {
+            if gitDirtyDirs.contains(node.url.path) {
+                cell.setGitBadge("•", color: ShellPalette.gitModified(dark: isDark))
+            }
+        } else if let status = gitStatuses[node.url.path] {
+            let badge = Self.gitBadge(status: status, dark: isDark)
+            cell.setGitBadge(badge.text, color: badge.color)
+        }
         return cell
     }
 
@@ -396,6 +435,7 @@ final class FileTreeRowView: NSTableRowView {
 final class FileTreeCellView: NSView {
     private let dotLabel = NSTextField(labelWithString: "●")
     private let nameLabel = NSTextField(labelWithString: "")
+    private let gitBadgeLabel = NSTextField(labelWithString: "")
     private var commitHandler: ((String) -> Void)?
 
     init(identifier: NSUserInterfaceItemIdentifier) {
@@ -409,8 +449,14 @@ final class FileTreeCellView: NSView {
         nameLabel.translatesAutoresizingMaskIntoConstraints = false
         nameLabel.setAccessibilityIdentifier("sidebar.cell.name")
         nameLabel.delegate = self
+        gitBadgeLabel.font = .monospacedSystemFont(ofSize: 10, weight: .bold)
+        gitBadgeLabel.translatesAutoresizingMaskIntoConstraints = false
+        gitBadgeLabel.setAccessibilityIdentifier("sidebar.cell.gitBadge")
+        gitBadgeLabel.setContentHuggingPriority(.required, for: .horizontal)
+        gitBadgeLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
         addSubview(dotLabel)
         addSubview(nameLabel)
+        addSubview(gitBadgeLabel)
         NSLayoutConstraint.activate([
             dotLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
             // Fixed width so file names align whether the row shows a type
@@ -419,8 +465,11 @@ final class FileTreeCellView: NSView {
             dotLabel.widthAnchor.constraint(equalToConstant: 12),
             dotLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
             nameLabel.leadingAnchor.constraint(equalTo: dotLabel.trailingAnchor, constant: 5),
-            nameLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -4),
+            nameLabel.trailingAnchor.constraint(
+                lessThanOrEqualTo: gitBadgeLabel.leadingAnchor, constant: -4),
             nameLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+            gitBadgeLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
+            gitBadgeLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
         ])
     }
 
@@ -439,7 +488,14 @@ final class FileTreeCellView: NSView {
                 forExtension: node.url.pathExtension, dark: dark
             )
         }
+        gitBadgeLabel.stringValue = ""  // reset; the sidebar re-applies per row
         endEditing(commit: false)
+    }
+
+    /// NERDTree-git-style trailing badge (M/A/D/R/?/• for dirty dirs).
+    func setGitBadge(_ text: String, color: NSColor) {
+        gitBadgeLabel.stringValue = text
+        gitBadgeLabel.textColor = color
     }
 
     func beginEditing(onCommit: @escaping (String) -> Void) {

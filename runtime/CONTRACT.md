@@ -116,6 +116,22 @@ user's own statusline and the round trip is lossless. Opt out with
 `vim.g.superlemon_adopt_statusline = 0` to keep both bars. No other option
 is ever touched.
 
+### `superlemon.git`
+One map argument; pushed (debounced ~150 ms) on BufWritePost/FocusGained/
+DirChanged/VimResume plus once at setup. Gathered asynchronously via
+`vim.system git status --porcelain` — the plugin is a DATA PROVIDER only;
+the GUI sidebar renders the badges:
+
+```lua
+{
+  files = {                          -- cwd-relative; empty = clean/not a repo
+    { path = "Sources/a.swift", status = "M" },
+    { path = "new.txt", status = "?" },
+    ...   -- status: M A D R C U ? (worktree column, else index column)
+  },
+}
+```
+
 ## nvim → GUI requests  (`vim.rpcrequest(chan, method, ...)`)
 
 ### `superlemon.clipboard_get` → `[lines, regtype]`

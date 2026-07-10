@@ -75,6 +75,13 @@ enum ShellPalette {
         }
     }
 
+    // Git badges (superlemon.git): NERDTree-git conventions, pastel in dark.
+    static func gitModified(dark: Bool) -> NSColor { dark ? color(0xE0B268) : color(0xB2621B) }
+    static func gitAdded(dark: Bool) -> NSColor { dark ? color(0xADC694) : color(0x107C10) }
+    static func gitDeleted(dark: Bool) -> NSColor { dark ? color(0xC79595) : color(0xC42B1C) }
+    static func gitRenamed(dark: Bool) -> NSColor { dark ? color(0xB4A7D6) : color(0x8E24AA) }
+    static func gitUntracked(dark: Bool) -> NSColor { dark ? color(0x8B9196) : color(0x7D7E7F) }
+
     // File-type dot colors for the sidebar (small fixed palette).
     static func fileTypeColor(forExtension ext: String, dark: Bool) -> NSColor {
         switch ext.lowercased() {

@@ -97,6 +97,20 @@ final class WorkspaceChrome {
                     italic: value["italic"]?.boolValue ?? false)
             }
             statusBar.renderStatusline(segments)
+        case "superlemon.git":
+            // Slim git provider (CONTRACT.md): cwd-relative paths + one-letter
+            // statuses → sidebar badges. Empty list clears the badges.
+            guard let payload = params.first,
+                let fileValues = payload["files"]?.arrayValue
+            else { return }
+            var statuses: [String: String] = [:]
+            for value in fileValues {
+                guard let rel = value["path"]?.stringValue,
+                    let status = value["status"]?.stringValue
+                else { continue }
+                statuses[projectRoot.appendingPathComponent(rel).path] = status
+            }
+            sidebar.setGitStatus(statuses)
         case "superlemon.buffers":
             guard let payload = params.first,
                 let bufferValues = payload["buffers"]?.arrayValue

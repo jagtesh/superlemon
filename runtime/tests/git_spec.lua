@@ -1,0 +1,76 @@
+-- git_spec.lua — the slim git-status provider (CONTRACT.md superlemon.git).
+local H = dofile(vim.fs.dirname(arg[0]) .. "/helpers.lua")
+H.setup_rtp()
+
+if vim.fn.executable("git") == 0 then
+  print("SKIP — git not available")
+  os.exit(0, true)
+end
+
+local calls = H.stub_gui()
+require("superlemon").setup(1)
+
+local git = require("superlemon.git")
+
+-- Porcelain parsing (pure).
+local parsed = git.parse_porcelain(table.concat({
+  " M mod.txt",
+  "A  added.txt",
+  "?? new file.txt",
+  "R  renamed.txt", -- followed by its origin-path field
+  "old.txt",
+  "D  gone.txt",
+}, "\0") .. "\0")
+local by_path = {}
+for _, f in ipairs(parsed) do
+  by_path[f.path] = f.status
+end
+H.eq(by_path["mod.txt"], "M", "worktree-modified parsed")
+H.eq(by_path["added.txt"], "A", "index-added parsed")
+H.eq(by_path["new file.txt"], "?", "untracked (with space) parsed")
+H.eq(by_path["renamed.txt"], "R", "rename parsed")
+H.eq(by_path["old.txt"], nil, "rename origin field consumed, not a file")
+H.eq(by_path["gone.txt"], "D", "deletion parsed")
+
+-- End to end against a real repository.
+local dir = H.tmpdir()
+vim.cmd("cd " .. dir)
+local function sh(cmd)
+  vim.fn.system("cd " .. vim.fn.shellescape(dir) .. " && " .. cmd)
+end
+sh("git init -q && git config user.email t@t && git config user.name t")
+vim.fn.writefile({ "one" }, dir .. "/tracked.txt")
+sh("git add tracked.txt && git commit -qm init")
+vim.fn.writefile({ "one", "two" }, dir .. "/tracked.txt") -- modify
+vim.fn.writefile({ "x" }, dir .. "/untracked.txt")
+
+-- Wait for the push that reflects THIS repo (stale-generation pushes from
+-- earlier cwds are suppressed by git.lua's double generation guard).
+local function repo_push()
+  for _, c in ipairs(calls.notify) do
+    if c.method == "superlemon.git" then
+      for _, f in ipairs(c.args[1].files) do
+        if f.path == "tracked.txt" then
+          return c.args[1].files
+        end
+      end
+    end
+  end
+  return nil
+end
+
+git.refresh()
+vim.wait(3000, function()
+  return repo_push() ~= nil
+end)
+
+local files = repo_push()
+H.ok(files ~= nil, "async refresh pushed this repo's superlemon.git")
+local got = {}
+for _, f in ipairs(files or {}) do
+  got[f.path] = f.status
+end
+H.eq(got["tracked.txt"], "M", "modified tracked file reported")
+H.eq(got["untracked.txt"], "?", "untracked file reported")
+
+H.finish()
