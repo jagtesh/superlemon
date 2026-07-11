@@ -21,6 +21,19 @@ final class CursorLayer: CALayer {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("not supported") }
 
+    /// Make the discrete cursor relocation less conspicuous while grid pixels
+    /// are moving, without making the text itself translucent.
+    func setScrollSoftened(_ softened: Bool) {
+        let target: Float = softened ? 0.22 : 1
+        let animation = CABasicAnimation(keyPath: "opacity")
+        animation.fromValue = presentation()?.opacity ?? opacity
+        animation.toValue = target
+        animation.duration = softened ? 0.025 : 0.050
+        animation.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        opacity = target
+        add(animation, forKey: "superlemon.scroll-cursor")
+    }
+
     /// Reposition/restyle for one flush. `cellOrigin` is the cursor cell's
     /// top-left in view coordinates (multigrid frame already applied).
     func update(

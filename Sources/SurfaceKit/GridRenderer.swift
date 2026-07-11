@@ -68,6 +68,13 @@ final class GridRenderer {
         ctx?.makeImage()
     }
 
+    /// Snapshot immediately before applying a scroll flush. SurfaceKit uses
+    /// this as a short-lived compositor overlay; the backing store remains
+    /// authoritative and is still updated synchronously.
+    func preScrollImage() -> CGImage? {
+        ctx?.makeImage()
+    }
+
     // MARK: - internals
 
     private func renderAll(grid: Grid, highlights: HighlightTable) {

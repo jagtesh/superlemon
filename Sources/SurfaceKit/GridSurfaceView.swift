@@ -1,6 +1,12 @@
 import AppKit
 import GridKit
 
+private final class WorkspaceNotificationToken: @unchecked Sendable {
+    let value: NSObjectProtocol
+    init(_ value: NSObjectProtocol) { self.value = value }
+    deinit { NotificationCenter.default.removeObserver(value) }
+}
+
 /// Font + spacing configuration for the surface. `name == nil` means the
 /// system monospaced font. Mirrors nvim's `guifont`/`linespace` (DESIGN §4).
 public struct FontSpec: Sendable, Equatable {
@@ -51,6 +57,14 @@ public final class GridSurfaceView: NSView {
 
     public private(set) var fontSpec: FontSpec
 
+    /// Visual reconciliation policy for Neovim's discrete grid_scroll frames.
+    public var scrollMotionStyle: ScrollMotionStyle = .tightNative {
+        didSet {
+            guard scrollMotionStyle != oldValue else { return }
+            if scrollMotionStyle == .immediate { settleScrollTransitions() }
+        }
+    }
+
     public init(frame frameRect: NSRect, font: FontSpec) {
         self.fontSpec = font
         self.fonts = FontSet(spec: font)
@@ -60,6 +74,17 @@ public final class GridSurfaceView: NSView {
         layerContentsRedrawPolicy = .never
         layer?.addSublayer(cursorLayer)
         cellSize = fonts.cellSize
+        reducedMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        accessibilityObserver = WorkspaceNotificationToken(NotificationCenter.default.addObserver(
+            forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.reducedMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+                if self.reducedMotion { self.settleScrollTransitions() }
+            }
+        })
     }
 
     @available(*, unavailable)
@@ -91,6 +116,7 @@ public final class GridSurfaceView: NSView {
         rasterizer = TextRasterizer(fonts: fonts)
         cellSize = fonts.cellSize
         renderers.removeAll()
+        settleScrollTransitions()
         if let flush = lastFlush { commit(flush, redrawAll: true) }
     }
 
@@ -147,6 +173,7 @@ public final class GridSurfaceView: NSView {
         super.viewDidChangeBackingProperties()
         let newScale = window?.backingScaleFactor ?? 2
         guard newScale != scale else { return }
+        settleScrollTransitions()
         scale = newScale
         for renderer in renderers.values { renderer.setScale(newScale) }
         if let flush = lastFlush { commit(flush, redrawAll: true) }
@@ -158,10 +185,14 @@ public final class GridSurfaceView: NSView {
     private var rasterizer: TextRasterizer
     private var renderers: [Int: GridRenderer] = [:]
     private var gridLayers: [Int: CALayer] = [:]
+    private var scrollTransitions: [Int: ScrollTransitionCoordinator] = [:]
     private let cursorLayer = CursorLayer()
     private var lastFlush: FlushResult?
     private var lastFrames: [ResolvedGridFrame] = []
     private var scale: CGFloat = 2
+    private var reducedMotion = false
+    private var accessibilityObserver: WorkspaceNotificationToken?
+    private var cursorRestoreGeneration = 0
 
     private func commit(_ flush: FlushResult, redrawAll: Bool) {
         let outer = flush.grids[1]
@@ -176,7 +207,22 @@ public final class GridSurfaceView: NSView {
 
         layer?.backgroundColor = flush.highlights.defaultBackground.cgColor
 
-        // 1. Update backing stores.
+        // 1. Snapshot scroll sources, then update backing stores. The final
+        // image is always installed immediately; old pixels are animation-only.
+        var scrollSources: [Int: CGImage] = [:]
+        if scrollMotionStyle == .tightNative, !reducedMotion, !redrawAll {
+            for damaged in flush.damagedGrids where !damaged.damage.scrolls.isEmpty {
+                if let renderer = renderers[damaged.grid.id],
+                    renderer.rows != damaged.grid.rows || renderer.cols != damaged.grid.cols
+                {
+                    scrollTransitions[damaged.grid.id]?.settle()
+                    continue
+                }
+                if let image = renderers[damaged.grid.id]?.preScrollImage() {
+                    scrollSources[damaged.grid.id] = image
+                }
+            }
+        }
         var updatedContents: Set<Int> = []
         if redrawAll {
             for (id, grid) in flush.grids {
@@ -198,6 +244,7 @@ public final class GridSurfaceView: NSView {
         let cw = cellSize.width
         let ch = cellSize.height
         var visible: Set<Int> = []
+        var scrollDuration: CFTimeInterval = 0
         for frame in frames {
             guard flush.grids[frame.gridID] != nil else { continue }
             visible.insert(frame.gridID)
@@ -212,22 +259,70 @@ public final class GridSurfaceView: NSView {
                 gridLayer.contents = renderers[frame.gridID]?.image()
                 gridLayer.contentsScale = scale
             }
+
+            if let source = scrollSources[frame.gridID],
+                let damaged = flush.damagedGrids.first(where: { $0.grid.id == frame.gridID })
+            {
+                scrollDuration = max(scrollDuration, beginScrollTransition(
+                    gridID: frame.gridID, source: source, damage: damaged.damage,
+                    grid: damaged.grid, host: gridLayer))
+            }
         }
 
         // 3. Drop layers/renderers for grids that no longer exist; hidden
         //    grids keep their renderer but lose their layer.
         for (id, gridLayer) in gridLayers where !visible.contains(id) {
+            scrollTransitions[id]?.settle()
+            scrollTransitions.removeValue(forKey: id)
             gridLayer.removeFromSuperlayer()
             gridLayers.removeValue(forKey: id)
         }
         for id in renderers.keys where flush.grids[id] == nil {
             renderers.removeValue(forKey: id)
+            scrollTransitions[id]?.settle()
+            scrollTransitions.removeValue(forKey: id)
         }
 
         // 4. Cursor.
         cursorLayer.update(
             flush: flush, cellOrigin: cursorOrigin(flush),
             fonts: fonts, cache: rasterizer.cache, scale: scale)
+        if scrollDuration > 0 { softenCursor(for: scrollDuration) }
+    }
+
+    private func beginScrollTransition(
+        gridID: Int, source: CGImage, damage: DamageMap, grid: Grid, host: CALayer
+    ) -> CFTimeInterval {
+        // Multiple deltas can depend on intermediate backing states that are
+        // no longer available. Present those rare compound flushes atomically.
+        guard damage.scrolls.count == 1, let delta = damage.scrolls.first else {
+            scrollTransitions[gridID]?.settle()
+            return 0
+        }
+        let coordinator = scrollTransitions[gridID] ?? ScrollTransitionCoordinator()
+        scrollTransitions[gridID] = coordinator
+        guard let duration = coordinator.transition(
+            oldImage: source, delta: delta, gridRows: grid.rows, gridCols: grid.cols,
+            cellSize: cellSize, scale: scale, in: host), duration > 0
+        else { return 0 }
+        return duration
+    }
+
+    private func softenCursor(for duration: CFTimeInterval) {
+        cursorRestoreGeneration += 1
+        let expected = cursorRestoreGeneration
+        cursorLayer.setScrollSoftened(true)
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration) { [weak self] in
+            guard let self, self.cursorRestoreGeneration == expected else { return }
+            self.cursorLayer.setScrollSoftened(false)
+        }
+    }
+
+    private func settleScrollTransitions() {
+        for coordinator in scrollTransitions.values { coordinator.settle() }
+        scrollTransitions.removeAll()
+        cursorRestoreGeneration += 1
+        cursorLayer.setScrollSoftened(false)
     }
 
     private func renderer(for id: Int) -> GridRenderer {

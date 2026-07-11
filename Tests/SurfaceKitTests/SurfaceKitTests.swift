@@ -26,6 +26,13 @@ private func line(_ row: Int, _ text: String, hl: Int, grid: Int = 1) -> UIEvent
 
 private func rgb(_ v: UInt32) -> NvimKit.RGBColor { .init(rgb: v) }
 
+private func solidImage(width: Int, height: Int) -> CGImage {
+    let ctx = GridRenderer.makeContext(width: width, height: height, scale: 1)!
+    ctx.setFillColor(NSColor.black.cgColor)
+    ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+    return ctx.makeImage()!
+}
+
 /// Sample one pixel (top-left origin) from an RGBA8 image.
 private func pixel(_ image: CGImage, x: Int, y: Int) -> (r: UInt8, g: UInt8, b: UInt8) {
     let data = image.dataProvider!.data! as Data
@@ -298,6 +305,102 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
 }
 
 // MARK: - View geometry
+
+@MainActor
+@Suite struct ScrollTransitionTests {
+    @Test func verticalAndHorizontalGeometryUseExactCellDeltas() {
+        let vertical = ScrollTransitionGeometry.make(
+            delta: ScrollDelta(top: 1, bottom: 8, left: 2, right: 12, rows: 1, cols: 0),
+            rows: 10, cols: 20, cellSize: CGSize(width: 8, height: 16))
+        #expect(vertical?.region == CGRect(x: 16, y: 16, width: 80, height: 112))
+        #expect(vertical?.translation == CGPoint(x: 0, y: -16))
+        #expect(vertical?.duration == 0.070)
+
+        let horizontal = ScrollTransitionGeometry.make(
+            delta: ScrollDelta(top: 0, bottom: 4, left: 1, right: 9, rows: 0, cols: -2),
+            rows: 4, cols: 10, cellSize: CGSize(width: 9, height: 18))
+        #expect(horizontal?.region == CGRect(x: 9, y: 0, width: 72, height: 72))
+        #expect(horizontal?.translation == CGPoint(x: 18, y: 0))
+        #expect(abs((horizontal?.duration ?? 0) - 0.0575) < 0.000_001)
+    }
+
+    @Test func rejectsLargeAndInvalidTransitions() {
+        #expect(ScrollTransitionGeometry.make(
+            delta: ScrollDelta(top: 0, bottom: 8, left: 0, right: 10, rows: 4, cols: 0),
+            rows: 8, cols: 10, cellSize: CGSize(width: 8, height: 16)) == nil)
+        #expect(ScrollTransitionGeometry.make(
+            delta: ScrollDelta(top: -1, bottom: 8, left: 0, right: 10, rows: 1, cols: 0),
+            rows: 8, cols: 10, cellSize: CGSize(width: 8, height: 16)) == nil)
+    }
+
+    @Test func coordinatorCreatesCroppedOverlayAndCanSettle() {
+        let host = CALayer()
+        host.frame = CGRect(x: 0, y: 0, width: 80, height: 96)
+        let coordinator = ScrollTransitionCoordinator()
+        let duration = coordinator.transition(
+            oldImage: solidImage(width: 80, height: 96),
+            delta: ScrollDelta(top: 1, bottom: 5, left: 2, right: 8, rows: 1, cols: 0),
+            gridRows: 6, gridCols: 10, cellSize: CGSize(width: 8, height: 16),
+            scale: 1, in: host)
+        #expect(duration == 0.070)
+        #expect(coordinator.isActive)
+        #expect(host.sublayers?.count == 1)
+        #expect(host.sublayers?.first?.bounds.size == CGSize(width: 48, height: 64))
+        #expect(host.sublayers?.first?.transform.m42 == -16)
+        let overlayImage = host.sublayers!.first!.contents as! CGImage
+        #expect(overlayImage.width == 48)
+        #expect(overlayImage.height == 64)
+
+        coordinator.settle()
+        #expect(!coordinator.isActive)
+        #expect(host.sublayers?.isEmpty != false)
+    }
+
+    @Test func sameDirectionRetargetsWhileReversalReplaces() {
+        let host = CALayer()
+        host.frame = CGRect(x: 0, y: 0, width: 80, height: 96)
+        let image = solidImage(width: 80, height: 96)
+        let coordinator = ScrollTransitionCoordinator()
+        let up = ScrollDelta(top: 0, bottom: 6, left: 0, right: 10, rows: 1, cols: 0)
+        let down = ScrollDelta(top: 0, bottom: 6, left: 0, right: 10, rows: -1, cols: 0)
+
+        _ = coordinator.transition(
+            oldImage: image, delta: up, gridRows: 6, gridCols: 10,
+            cellSize: CGSize(width: 8, height: 16), scale: 1, in: host)
+        let first = host.sublayers!.first!
+        _ = coordinator.transition(
+            oldImage: image, delta: up, gridRows: 6, gridCols: 10,
+            cellSize: CGSize(width: 8, height: 16), scale: 1, in: host)
+        #expect(host.sublayers?.count == 1)
+        #expect(host.sublayers?.first === first)
+        #expect(host.sublayers?.first?.transform.m42 == -32)
+
+        _ = coordinator.transition(
+            oldImage: image, delta: down, gridRows: 6, gridCols: 10,
+            cellSize: CGSize(width: 8, height: 16), scale: 1, in: host)
+        #expect(host.sublayers?.count == 1)
+        #expect(host.sublayers?.first !== first)
+        #expect(host.sublayers?.first?.transform.m42 == 16)
+        coordinator.settle()
+    }
+
+    @Test func immediateStyleNeverCreatesAnOverlay() {
+        let view = GridSurfaceView(
+            frame: NSRect(x: 0, y: 0, width: 300, height: 200), font: menlo)
+        view.scrollMotionStyle = .immediate
+        let store = GridStore()
+        view.present(flush(store, [
+            .gridResize(grid: 1, width: 10, height: 6),
+            line(0, "aaaaaaaaaa", hl: 0), line(1, "bbbbbbbbbb", hl: 0),
+        ]))
+        view.present(flush(store, [
+            .gridScroll(grid: 1, top: 0, bottom: 5, left: 0, right: 10, rows: 1, cols: 0),
+            line(4, "cccccccccc", hl: 0),
+        ]))
+        let gridLayer = view.layer?.sublayers?.first { $0.zPosition != 10_000 }
+        #expect(gridLayer?.sublayers?.isEmpty != false)
+    }
+}
 
 @MainActor
 @Suite struct ViewGeometryTests {
