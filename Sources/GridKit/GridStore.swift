@@ -23,6 +23,47 @@ public struct CursorPosition: Sendable, Equatable {
     }
 }
 
+/// Compact provenance for semantic viewport movement coalesced across one or
+/// more Neovim flushes. `netDelta` remains the authoritative old-to-new
+/// displacement, while `largestStepMagnitude` distinguishes one genuinely
+/// far incoming jump from ordinary small steps whose accumulated debt happens
+/// to cross a screen. Cancellation deliberately remains observable so a
+/// display-linked reversal does not force the active spring to settle.
+public struct ViewportScrollMotion: Sendable, Equatable {
+    public private(set) var netDelta: Int
+    public private(set) var largestStepMagnitude: Int
+    public private(set) var largestStepDelta: Int
+    public private(set) var lastDelta: Int
+    public private(set) var stepCount: Int
+    public private(set) var containsReversal: Bool
+
+    public init(delta: Int) {
+        netDelta = delta
+        largestStepMagnitude = Int(min(UInt(Int.max), delta.magnitude))
+        largestStepDelta = delta
+        lastDelta = delta
+        stepCount = delta == 0 ? 0 : 1
+        containsReversal = false
+    }
+
+    public var hasMovement: Bool { stepCount > 0 }
+
+    package mutating func append(_ delta: Int) {
+        guard delta != 0 else { return }
+        if lastDelta != 0, lastDelta.signum() != delta.signum() {
+            containsReversal = true
+        }
+        netDelta += delta
+        let magnitude = Int(min(UInt(Int.max), delta.magnitude))
+        if magnitude > largestStepMagnitude {
+            largestStepMagnitude = magnitude
+            largestStepDelta = delta
+        }
+        lastDelta = delta
+        stepCount += 1
+    }
+}
+
 /// Everything the renderer needs for one atomic present, produced only at a
 /// Neovim `flush` boundary. Deferred presentation may coalesce several wire
 /// flushes into this single consistent snapshot.
@@ -46,6 +87,15 @@ public struct FlushResult: Sendable {
     /// once at this flush. Unlike `Grid.viewport.scrollDelta`, this cannot be
     /// accidentally replayed by a later unrelated frame.
     public let viewportScrollDeltas: [Int: Int]
+    /// Per-grid provenance for the one-shot deltas above. This preserves the
+    /// difference between one far jump and many coalesced small steps, as well
+    /// as reversals whose net displacement is zero.
+    public let viewportScrollMotions: [Int: ViewportScrollMotion]
+    /// False when any coalesced wire frame required atomic presentation.
+    /// SurfaceKit must settle existing motion and install this frame without
+    /// interpolation, even if it also contains otherwise compatible scroll
+    /// damage accumulated before the immediate event.
+    public let allowsScrollInterpolation: Bool
     public let highlights: HighlightTable
     public let cursor: CursorPosition
     /// Current mode's info (cursor shape, blink, attr id), if known.
@@ -83,8 +133,9 @@ public final class GridStore {
     public private(set) var isMouseEnabled = true
     /// Raw `option_set` values by name (e.g. "guifont"), for upper layers.
     public private(set) var options: [String: Value] = [:]
-    /// Semantic displayed-line movement accumulated until the next flush.
-    private var pendingViewportScrollDeltas: [Int: Int] = [:]
+    /// Semantic displayed-line movement accumulated until the next presented
+    /// frame, including its per-event provenance.
+    private var pendingViewportScrollMotions: [Int: ViewportScrollMotion] = [:]
     /// Deferred mode deliberately leaves model damage unconsumed across wire
     /// flushes. A single immutable FlushResult is produced only when the
     /// display is ready to present it.
@@ -109,11 +160,13 @@ public final class GridStore {
         // Direct callers retain the original one-batch/one-present behavior.
         // Also make the method robust if a caller switches out of deferred
         // mode while a presentation is pending.
+        let allowsScrollInterpolation = !pendingPresentationRequiresImmediate
         hasPendingPresentation = false
         pendingPresentationRequiresImmediate = false
         hasUnflushedDeferredEvents = false
         deferredFrame.reset()
-        return makeFlushResult()
+        return makeFlushResult(
+            allowsScrollInterpolation: allowsScrollInterpolation)
     }
 
     /// Apply decoded redraws without consuming damage at every Neovim flush.
@@ -151,9 +204,11 @@ public final class GridStore {
         // If events arrived after the last flush, wait for their flush and
         // present the newer consistent state instead.
         guard hasPendingPresentation, !hasUnflushedDeferredEvents else { return nil }
+        let allowsScrollInterpolation = !pendingPresentationRequiresImmediate
         hasPendingPresentation = false
         pendingPresentationRequiresImmediate = false
-        return makeFlushResult()
+        return makeFlushResult(
+            allowsScrollInterpolation: allowsScrollInterpolation)
     }
 
     // MARK: - Event application
@@ -204,7 +259,7 @@ public final class GridStore {
             grids[grid]?.clear()
         case .gridDestroy(let grid):
             grids.removeValue(forKey: grid)
-            pendingViewportScrollDeltas.removeValue(forKey: grid)
+            pendingViewportScrollMotions.removeValue(forKey: grid)
         case .gridCursorGoto(let grid, let row, let col):
             grids[cursor.grid]?.hasCursor = false
             cursor = CursorPosition(grid: grid, row: row, col: col)
@@ -254,9 +309,11 @@ public final class GridStore {
                 topline: topline, botline: botline, curline: curline,
                 curcol: curcol, lineCount: lineCount, scrollDelta: scrollDelta)
             if grids[grid] != nil, scrollDelta != 0 {
-                pendingViewportScrollDeltas[grid, default: 0] += scrollDelta
-                if pendingViewportScrollDeltas[grid] == 0 {
-                    pendingViewportScrollDeltas.removeValue(forKey: grid)
+                if pendingViewportScrollMotions[grid] == nil {
+                    pendingViewportScrollMotions[grid] = ViewportScrollMotion(
+                        delta: scrollDelta)
+                } else {
+                    pendingViewportScrollMotions[grid]?.append(scrollDelta)
                 }
             }
         case .winViewportMargins(let grid, _, let top, let bottom, let left, let right):
@@ -272,7 +329,7 @@ public final class GridStore {
 
     // MARK: - Flush
 
-    private func makeFlushResult() -> FlushResult {
+    private func makeFlushResult(allowsScrollInterpolation: Bool) -> FlushResult {
         var damaged: [FlushResult.DamagedGrid] = []
         for id in grids.keys.sorted() {
             guard var grid = grids[id], !grid.damage.isEmpty else { continue }
@@ -280,12 +337,17 @@ public final class GridStore {
             grids[id] = grid
             damaged.append(FlushResult.DamagedGrid(grid: grid, damage: consumed))
         }
-        let viewportScrollDeltas = pendingViewportScrollDeltas
-        pendingViewportScrollDeltas.removeAll(keepingCapacity: true)
+        let viewportScrollMotions = pendingViewportScrollMotions
+        let viewportScrollDeltas = viewportScrollMotions.reduce(into: [Int: Int]()) {
+            if $1.value.netDelta != 0 { $0[$1.key] = $1.value.netDelta }
+        }
+        pendingViewportScrollMotions.removeAll(keepingCapacity: true)
         return FlushResult(
             damagedGrids: damaged,
             grids: grids,
             viewportScrollDeltas: viewportScrollDeltas,
+            viewportScrollMotions: viewportScrollMotions,
+            allowsScrollInterpolation: allowsScrollInterpolation,
             highlights: highlights,
             cursor: cursor,
             mode: currentMode,

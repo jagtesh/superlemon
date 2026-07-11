@@ -123,14 +123,19 @@ struct SmoothViewportGeometry: Equatable {
             height: CGFloat(innerRows) * cellSize.height)
     }
 
-    func accepts(_ scrolls: [ScrollDelta], semanticDelta: Int) -> Bool {
-        guard semanticDelta != 0, innerRows > 0, innerCols > 0 else { return false }
+    func accepts(
+        _ scrolls: [ScrollDelta], semanticDelta: Int,
+        semanticMotion: ViewportScrollMotion? = nil
+    ) -> Bool {
+        let hasMovement = semanticMotion?.hasMovement ?? (semanticDelta != 0)
+        guard hasMovement, innerRows > 0, innerCols > 0 else { return false }
         guard !scrolls.isEmpty else { return true }
         guard !scrolls.contains(where: { delta in
             delta.cols != 0 || delta.rows == 0
                 || delta.top != top || delta.bottom != rows - bottom
                 || delta.left != left || delta.right != cols - right
-                || delta.rows.signum() != semanticDelta.signum()
+                || (semanticMotion == nil
+                    && delta.rows.signum() != semanticDelta.signum())
         }) else { return false }
         return true
     }
@@ -163,6 +168,12 @@ private struct RowLayerBinding: Equatable {
     let contentsRect: CGRect
 }
 
+private struct FilmstripSlot {
+    let layer: CALayer
+    var logicalRow: Int?
+    var binding: RowLayerBinding?
+}
+
 private struct VeilSnapshotSource: @unchecked Sendable {
     let rows: [SharedImageRow]
     let outputWidth: Int
@@ -190,8 +201,7 @@ final class SmoothViewportState {
     private let glowLayer = CAGradientLayer()
     private var baseRowLayers: [CALayer] = []
     private var baseBindings: [RowLayerBinding?] = []
-    private var rowLayers: [CALayer] = []
-    private var rowBindings: [RowLayerBinding?] = []
+    private var rowSlots: [FilmstripSlot] = []
     private var authoritativeRows: [SharedImageRow] = []
     private var cellSize: CGSize = .zero
     private var scale: CGFloat = 1
@@ -204,6 +214,9 @@ final class SmoothViewportState {
     private(set) var isVeilActive = false
     private var veilElapsed: CFTimeInterval = 0
     private var veilDirection = 0
+    private var veilGapResolved = true
+    private var veilFadeStart: CFTimeInterval?
+    private var veilSuppressedUntilGapClears = false
     private var cachedVeilImage: CGImage?
     private var veilSnapshotTask: Task<Void, Never>?
     private var veilSnapshotSerial: UInt64 = 0
@@ -245,7 +258,11 @@ final class SmoothViewportState {
     /// Kept for source compatibility with the previous transient overlay.
     /// It is now the permanent clipped exact-row viewport.
     var overlayLayer: CALayer { clipLayer }
-    var visibleRowLayers: [CALayer] { rowLayers }
+    var visibleRowLayers: [CALayer] {
+        rowSlots.sorted {
+            ($0.logicalRow ?? Int.max) < ($1.logicalRow ?? Int.max)
+        }.map(\.layer)
+    }
     var translatedContainerLayer: CALayer { rowContainerLayer }
 
     /// Production entry point: install cached row-sized renderer revisions.
@@ -253,6 +270,7 @@ final class SmoothViewportState {
     func present(
         rowSnapshots: [RenderedRowSnapshot], rows: Int, cols: Int,
         margins: ViewportMargins?, scrolls: [ScrollDelta], semanticDelta: Int?,
+        semanticMotion: ViewportScrollMotion? = nil,
         cellSize: CGSize, scale: CGFloat, host: CALayer, animate: Bool
     ) -> Bool {
         let sourceRows = rowSnapshots.enumerated().map { row, snapshot in
@@ -265,6 +283,7 @@ final class SmoothViewportState {
         return present(
             authoritativeRows: sourceRows, rows: rows, cols: cols,
             margins: margins, scrolls: scrolls, semanticDelta: semanticDelta,
+            semanticMotion: semanticMotion,
             cellSize: cellSize, scale: scale, host: host, animate: animate)
     }
 
@@ -273,7 +292,8 @@ final class SmoothViewportState {
     @discardableResult
     func present(
         image: CGImage, rows: Int, cols: Int, margins: ViewportMargins?,
-        scrolls: [ScrollDelta], semanticDelta: Int?, cellSize: CGSize,
+        scrolls: [ScrollDelta], semanticDelta: Int?,
+        semanticMotion: ViewportScrollMotion? = nil, cellSize: CGSize,
         scale: CGFloat, host: CALayer, animate: Bool
     ) -> Bool {
         presentationGeneration &+= 1
@@ -293,6 +313,7 @@ final class SmoothViewportState {
         return present(
             authoritativeRows: sourceRows, rows: rows, cols: cols,
             margins: margins, scrolls: scrolls, semanticDelta: semanticDelta,
+            semanticMotion: semanticMotion,
             cellSize: cellSize, scale: scale, host: host, animate: animate)
     }
 
@@ -300,6 +321,7 @@ final class SmoothViewportState {
     private func present(
         authoritativeRows nextRows: [SharedImageRow], rows: Int, cols: Int,
         margins: ViewportMargins?, scrolls: [ScrollDelta], semanticDelta: Int?,
+        semanticMotion: ViewportScrollMotion?,
         cellSize: CGSize, scale: CGFloat, host: CALayer, animate: Bool
     ) -> Bool {
         let nextGeometry = SmoothViewportGeometry(rows: rows, cols: cols, margins: margins)
@@ -325,15 +347,34 @@ final class SmoothViewportState {
         }
 
         let delta = semanticDelta ?? 0
-        var eligible = animate && geometry.accepts(scrolls, semanticDelta: delta)
-        let carriesMovement = !scrolls.isEmpty || (semanticDelta != nil && delta != 0)
-        if !eligible, carriesMovement {
+        var eligible = animate && geometry.accepts(
+            scrolls, semanticDelta: delta, semanticMotion: semanticMotion)
+        let carriesMovement = !scrolls.isEmpty
+            || semanticMotion?.hasMovement == true
+            || (semanticDelta != nil && delta != 0)
+        if !animate, isActive || isVeilActive {
+            // An explicitly atomic/Reduce Motion frame supersedes any visual
+            // tail even when it contains only edits or highlight changes.
+            settle()
+        } else if !eligible, carriesMovement {
             settle()
         }
 
         if eligible, hasAuthoritativeRows {
-            eligible = rotateForNewViewport(delta)
-            if !eligible { settle() }
+            if delta != 0 {
+                let largestStep = semanticMotion?.largestStepMagnitude
+                    ?? Int(min(UInt(Int.max), delta.magnitude))
+                eligible = rotateForNewViewport(
+                    delta, trueFar: largestStep > geometry.innerRows,
+                    farDirection: semanticMotion?.largestStepDelta.signum()
+                        ?? delta.signum())
+                if !eligible { settle() }
+            } else {
+                // Coalesced reversal can return to the same viewport. It is
+                // still compatible motion: preserve an existing trajectory
+                // and velocity, but do not invent motion from rest.
+                eligible = semanticMotion?.hasMovement == true && isActive
+            }
         }
 
         authoritativeRows = nextRows
@@ -341,7 +382,7 @@ final class SmoothViewportState {
         seedCurrentRows()
 
         if eligible, hasAuthoritativeRows {
-            lastSemanticDelta = delta
+            lastSemanticDelta = delta != 0 ? delta : (semanticMotion?.lastDelta ?? 0)
             isActive = true
         }
         render(forceBindings: false)
@@ -361,15 +402,19 @@ final class SmoothViewportState {
         let nominal = max(1.0 / 240.0, nominalDisplayPeriod)
 
         if isActive, bounded >= nominal * 2, lastSemanticDelta != 0 {
-            activateVeil(direction: lastSemanticDelta.signum())
+            // The delayed callback itself is the end of this measured gap;
+            // exact current rows are already installed beneath the veil.
+            activateVeil(direction: lastSemanticDelta.signum(), resolved: true)
         }
         if receivedInputWhileClamped {
             clampedDisplayPeriods += 1
             if clampedDisplayPeriods >= 2, lastSemanticDelta != 0 {
-                activateVeil(direction: lastSemanticDelta.signum())
+                activateVeil(direction: lastSemanticDelta.signum(), resolved: false)
             }
         } else {
             clampedDisplayPeriods = 0
+            veilSuppressedUntilGapClears = false
+            if isVeilActive, !veilGapResolved { resolveVeilGap() }
         }
         receivedInputWhileClamped = false
 
@@ -403,6 +448,7 @@ final class SmoothViewportState {
         lastSemanticDelta = 0
         receivedInputWhileClamped = false
         clampedDisplayPeriods = 0
+        veilSuppressedUntilGapClears = false
         discardNonCurrentHistory()
         deactivateVeil()
         render(forceBindings: false)
@@ -417,7 +463,7 @@ final class SmoothViewportState {
         hostLayer = nil
         history.reset(capacity: 0)
         baseRowLayers.removeAll()
-        rowLayers.removeAll()
+        rowSlots.removeAll()
         authoritativeRows.removeAll()
         hasAuthoritativeRows = false
     }
@@ -451,23 +497,27 @@ final class SmoothViewportState {
     // MARK: - History
 
     @discardableResult
-    private func rotateForNewViewport(_ delta: Int) -> Bool {
+    private func rotateForNewViewport(
+        _ delta: Int, trueFar: Bool, farDirection: Int
+    ) -> Bool {
         let height = geometry.innerRows
         guard height > 0, delta != 0 else { return false }
 
-        let direction = delta.signum()
+        let direction = trueFar ? farDirection : delta.signum()
+        guard direction != 0 else { return false }
         if isVeilActive, veilDirection != direction { deactivateVeil() }
-        let far = abs(delta) > height
-        let animatedDelta = far ? direction : delta
-        if far { discardNonCurrentHistory() }
+        let retainedMagnitude = Int(min(UInt(height), delta.magnitude))
+        let animatedDelta = trueFar ? direction : delta.signum() * retainedMagnitude
+        if trueFar { discardNonCurrentHistory() }
 
         guard copyDisplacedRows(for: animatedDelta) else { return false }
         history.rotate(by: animatedDelta)
+        shiftFilmstripSlots(by: -animatedDelta)
 
-        if far {
+        if trueFar {
             spring.position = -CGFloat(animatedDelta)
             spring.constrainVelocityTowardTarget()
-            activateVeil(direction: direction)
+            activateVeil(direction: direction, resolved: true)
         } else {
             let proposed = spring.position - CGFloat(delta)
             let capacity = CGFloat(height)
@@ -581,11 +631,10 @@ final class SmoothViewportState {
 
     private func rebuildLayers() {
         baseRowLayers.forEach { $0.removeFromSuperlayer() }
-        rowLayers.forEach { $0.removeFromSuperlayer() }
+        rowSlots.forEach { $0.layer.removeFromSuperlayer() }
         baseRowLayers.removeAll()
-        rowLayers.removeAll()
+        rowSlots.removeAll()
         baseBindings.removeAll()
-        rowBindings.removeAll()
         history.reset(capacity: geometry.innerRows * 2)
         hasAuthoritativeRows = false
         lastBoundFirstRow = nil
@@ -609,22 +658,21 @@ final class SmoothViewportState {
             layer.frame = CGRect(
                 x: 0, y: fullHeight - CGFloat(row + 1) * cellSize.height,
                 width: fullWidth, height: cellSize.height)
+            let isInnerRow = row >= geometry.top && row < geometry.rows - geometry.bottom
+            if isInnerRow, geometry.left == 0, geometry.right == 0 {
+                layer.isHidden = true
+            }
             baseLayer.addSublayer(layer)
             baseRowLayers.append(layer)
             baseBindings.append(nil)
         }
 
-        let innerWidth = CGFloat(geometry.innerCols) * cellSize.width
-        let innerHeight = CGFloat(geometry.innerRows) * cellSize.height
         if geometry.innerRows > 0, geometry.innerCols > 0 {
-            for index in 0...geometry.innerRows {
+            for _ in 0...geometry.innerRows {
                 let layer = makeRowLayer()
-                layer.frame = CGRect(
-                    x: 0, y: innerHeight - CGFloat(index + 1) * cellSize.height,
-                    width: innerWidth, height: cellSize.height)
                 rowContainerLayer.addSublayer(layer)
-                rowLayers.append(layer)
-                rowBindings.append(nil)
+                rowSlots.append(FilmstripSlot(
+                    layer: layer, logicalRow: nil, binding: nil))
             }
         }
     }
@@ -641,33 +689,69 @@ final class SmoothViewportState {
     private func bindAuthoritativeRows() {
         guard authoritativeRows.count == baseRowLayers.count else { return }
         for row in authoritativeRows.indices {
+            let isInnerRow = row >= geometry.top && row < geometry.rows - geometry.bottom
+            if isInnerRow, geometry.left == 0, geometry.right == 0 {
+                // Initialized hidden once in rebuildLayers. The permanent
+                // filmstrip is authoritative here, so there is no per-present
+                // duplicate contents/hidden write for the occluded base.
+                continue
+            }
             bind(authoritativeRows[row], to: baseRowLayers[row], binding: &baseBindings[row])
         }
     }
 
     private func render(forceBindings: Bool) {
-        guard hasAuthoritativeRows, !rowLayers.isEmpty else { return }
+        guard hasAuthoritativeRows, !rowSlots.isEmpty else { return }
         let firstRow = Int(floor(spring.position))
         let needsBindings = forceBindings || rowsNeedBinding || firstRow != lastBoundFirstRow
-        if needsBindings, forceBindings || firstRow != lastBoundFirstRow {
-            rowBindings = [RowLayerBinding?](repeating: nil, count: rowLayers.count)
-        }
         if needsBindings {
-            for (index, layer) in rowLayers.enumerated() {
-                guard let slice = history[firstRow + index] else {
-                    layer.contents = nil
-                    layer.isHidden = true
-                    rowBindings[index] = nil
+            let desiredRows = Array(firstRow...(firstRow + geometry.innerRows))
+            let desiredSet = Set(desiredRows)
+            var assigned = Set<Int>()
+            var available: [Int] = []
+
+            for index in rowSlots.indices {
+                if let logicalRow = rowSlots[index].logicalRow,
+                    desiredSet.contains(logicalRow), !assigned.contains(logicalRow)
+                {
+                    assigned.insert(logicalRow)
+                } else {
+                    rowSlots[index].logicalRow = nil
+                    rowSlots[index].binding = nil
+                    available.append(index)
+                }
+            }
+
+            for logicalRow in desiredRows where !assigned.contains(logicalRow) {
+                guard let index = available.popLast() else { break }
+                rowSlots[index].logicalRow = logicalRow
+                let innerHeight = CGFloat(geometry.innerRows) * cellSize.height
+                rowSlots[index].layer.frame = CGRect(
+                    x: 0,
+                    y: innerHeight - CGFloat(logicalRow + 1) * cellSize.height,
+                    width: CGFloat(geometry.innerCols) * cellSize.width,
+                    height: cellSize.height)
+            }
+
+            for index in rowSlots.indices {
+                guard let logicalRow = rowSlots[index].logicalRow,
+                    let slice = history[logicalRow]
+                else {
+                    rowSlots[index].layer.contents = nil
+                    rowSlots[index].layer.isHidden = true
+                    rowSlots[index].binding = nil
                     continue
                 }
-                bind(slice, to: layer, binding: &rowBindings[index])
+                bind(
+                    slice, to: rowSlots[index].layer,
+                    binding: &rowSlots[index].binding)
             }
             rowsNeedBinding = false
         }
         lastBoundFirstRow = firstRow
 
         let translation = pixelSnap(
-            (spring.position - CGFloat(firstRow)) * cellSize.height, scale: scale)
+            spring.position * cellSize.height, scale: scale)
         if translation != lastTranslationY {
             rowContainerLayer.setAffineTransform(
                 CGAffineTransform(translationX: 0, y: translation))
@@ -689,19 +773,60 @@ final class SmoothViewportState {
         binding = next
     }
 
+    /// Move bound slots into the new history coordinate space without
+    /// touching contents. The simultaneous spring retarget cancels this frame
+    /// shift visually; only newly exposed edge slots need a new image.
+    private func shiftFilmstripSlots(by logicalRows: Int) {
+        guard logicalRows != 0 else { return }
+        for index in rowSlots.indices {
+            guard let logicalRow = rowSlots[index].logicalRow else { continue }
+            let shifted = logicalRow + logicalRows
+            rowSlots[index].logicalRow = shifted
+            let innerHeight = CGFloat(geometry.innerRows) * cellSize.height
+            rowSlots[index].layer.frame = CGRect(
+                x: 0,
+                y: innerHeight - CGFloat(shifted + 1) * cellSize.height,
+                width: CGFloat(geometry.innerCols) * cellSize.width,
+                height: cellSize.height)
+        }
+    }
+
+    func visibleLayer(sourceRow: Int) -> CALayer? {
+        let candidates = rowSlots.compactMap { slot -> (Int, CALayer)? in
+            guard let logicalRow = slot.logicalRow, !slot.layer.isHidden,
+                history[logicalRow]?.sourceRow == sourceRow
+            else { return nil }
+            return (logicalRow, slot.layer)
+        }
+        return candidates.first(where: {
+            $0.0 >= 0 && $0.0 < geometry.innerRows
+        })?.1 ?? candidates.first?.1
+    }
+
     private func pixelSnap(_ value: CGFloat, scale: CGFloat) -> CGFloat {
         (value * max(1, scale)).rounded() / max(1, scale)
     }
 
     // MARK: - Adaptive velocity veil
 
-    private func activateVeil(direction: Int) {
+    private func activateVeil(direction: Int, resolved: Bool) {
         guard direction != 0 else { return }
-        if isVeilActive, veilDirection == direction { return }
+        guard resolved || !veilSuppressedUntilGapClears else { return }
+        if isVeilActive, veilDirection == direction {
+            if resolved {
+                if !veilGapResolved { resolveVeilGap() }
+            } else {
+                veilGapResolved = false
+                veilFadeStart = nil
+            }
+            return
+        }
         if isVeilActive { deactivateVeil() }
         isVeilActive = true
         veilDirection = direction
         veilElapsed = 0
+        veilGapResolved = resolved
+        veilFadeStart = resolved ? 1.0 / 60.0 : nil
         clampedDisplayPeriods = 0
         veilLayer.contents = cachedVeilImage
         veilLayer.opacity = 0
@@ -714,22 +839,21 @@ final class SmoothViewportState {
         guard isVeilActive else { return }
         veilElapsed += elapsed
         let fadeIn: CFTimeInterval = 1.0 / 60.0
-        // Exact row revisions are already beneath the veil. Once its first
-        // display-period fade-in is visible, begin the requested 50 ms exit.
-        let fadeOutStart = fadeIn
-        let hardLimit = min(0.150, fadeOutStart + 0.050)
+        let hardLimit: CFTimeInterval = 0.150
         if veilElapsed >= hardLimit {
+            if !veilGapResolved { veilSuppressedUntilGapClears = true }
             deactivateVeil()
             return
         }
 
-        let alpha: CGFloat
-        if veilElapsed < fadeIn {
-            alpha = CGFloat(veilElapsed / fadeIn)
-        } else if veilElapsed <= fadeOutStart {
-            alpha = 1
-        } else {
-            alpha = CGFloat((hardLimit - veilElapsed) / (hardLimit - fadeOutStart))
+        var alpha = min(1, CGFloat(veilElapsed / fadeIn))
+        if veilGapResolved, let veilFadeStart, veilElapsed > veilFadeStart {
+            let fadeProgress = CGFloat((veilElapsed - veilFadeStart) / 0.050)
+            if fadeProgress >= 1 {
+                deactivateVeil()
+                return
+            }
+            alpha *= 1 - fadeProgress
         }
         let progress = CGFloat(min(1, veilElapsed / hardLimit))
         let offset = CGFloat(veilDirection) * cellSize.height * 0.75 * progress
@@ -746,12 +870,19 @@ final class SmoothViewportState {
         isVeilActive = false
         veilElapsed = 0
         veilDirection = 0
+        veilGapResolved = true
+        veilFadeStart = nil
         veilLayer.isHidden = true
         veilLayer.opacity = 0
         veilLayer.setAffineTransform(.identity)
         glowLayer.isHidden = true
         glowLayer.opacity = 0
         glowLayer.setAffineTransform(.identity)
+    }
+
+    private func resolveVeilGap() {
+        veilGapResolved = true
+        veilFadeStart = max(veilElapsed, 1.0 / 60.0)
     }
 
     /// Keep a throttled quarter-resolution exact snapshot ready. Composition

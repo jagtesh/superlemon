@@ -159,6 +159,9 @@ import NvimKit
         ))!
 
         #expect(result.viewportScrollDeltas == [2: 4])
+        #expect(result.viewportScrollMotions[1]?.netDelta == 0)
+        #expect(result.viewportScrollMotions[1]?.containsReversal == true)
+        #expect(result.viewportScrollMotions[1]?.stepCount == 2)
     }
 
     @Test func deferredScrollFlushesCoalesceUntilConsumed() {
@@ -190,8 +193,69 @@ import NvimKit
         #expect(second == .displayLinked)
         let presented = store.consumePendingPresentation()
         #expect(presented?.viewportScrollDeltas == [1: 3])
+        #expect(presented?.allowsScrollInterpolation == true)
+        #expect(presented?.viewportScrollMotions[1]?.netDelta == 3)
+        #expect(presented?.viewportScrollMotions[1]?.largestStepMagnitude == 2)
+        #expect(presented?.viewportScrollMotions[1]?.largestStepDelta == 2)
+        #expect(presented?.viewportScrollMotions[1]?.stepCount == 2)
+        #expect(presented?.viewportScrollMotions[1]?.containsReversal == false)
         #expect(presented?.damagedGrids.first?.damage.scrolls.count == 2)
         #expect(store.consumePendingPresentation() == nil)
+    }
+
+    @Test func deferredMotionKeepsSmallStepAndReversalProvenance() {
+        let store = makeStore(rows: 6, cols: 6)
+
+        for top in 1...8 {
+            #expect(store.applyDeferred(batch(
+                .gridScroll(
+                    grid: 1, top: 0, bottom: 6, left: 0, right: 6,
+                    rows: 1, cols: 0),
+                .winViewport(
+                    grid: 1, win: 10, topline: top, botline: top + 6,
+                    curline: top + 1, curcol: 0, lineCount: 100,
+                    scrollDelta: 1),
+                .flush
+            )) == .displayLinked)
+        }
+        #expect(store.applyDeferred(batch(
+            .gridScroll(
+                grid: 1, top: 0, bottom: 6, left: 0, right: 6,
+                rows: -1, cols: 0),
+            .winViewport(
+                grid: 1, win: 10, topline: 7, botline: 13,
+                curline: 8, curcol: 0, lineCount: 100, scrollDelta: -1),
+            .flush
+        )) == .displayLinked)
+
+        let motion = store.consumePendingPresentation()?.viewportScrollMotions[1]
+        #expect(motion?.netDelta == 7)
+        #expect(motion?.largestStepMagnitude == 1)
+        #expect(motion?.lastDelta == -1)
+        #expect(motion?.stepCount == 9)
+        #expect(motion?.containsReversal == true)
+    }
+
+    @Test func deferredMotionRetainsZeroNetReversal() {
+        let store = makeStore(rows: 6, cols: 6)
+        for delta in [1, -1] {
+            #expect(store.applyDeferred(batch(
+                .gridScroll(
+                    grid: 1, top: 0, bottom: 6, left: 0, right: 6,
+                    rows: delta, cols: 0),
+                .winViewport(
+                    grid: 1, win: 10, topline: delta > 0 ? 1 : 0,
+                    botline: delta > 0 ? 7 : 6, curline: 1, curcol: 0,
+                    lineCount: 100, scrollDelta: delta),
+                .flush
+            )) == .displayLinked)
+        }
+
+        let result = store.consumePendingPresentation()
+        #expect(result?.viewportScrollDeltas.isEmpty == true)
+        #expect(result?.viewportScrollMotions[1]?.netDelta == 0)
+        #expect(result?.viewportScrollMotions[1]?.containsReversal == true)
+        #expect(result?.viewportScrollMotions[1]?.lastDelta == -1)
     }
 
     @Test func deferredPresentationClassifiesUnsafeFramesImmediate() {
@@ -204,14 +268,16 @@ import NvimKit
             .flush
         ))
         #expect(horizontal == .immediate)
-        #expect(store.consumePendingPresentation() != nil)
+        #expect(store.consumePendingPresentation()?.allowsScrollInterpolation == false)
 
         let resize = store.applyDeferred(batch(
             .gridResize(grid: 1, width: 7, height: 7),
             .flush
         ))
         #expect(resize == .immediate)
-        #expect(store.consumePendingPresentation()?.grids[1]?.rows == 7)
+        let resized = store.consumePendingPresentation()
+        #expect(resized?.grids[1]?.rows == 7)
+        #expect(resized?.allowsScrollInterpolation == false)
     }
 
     @Test func deferredScrollRequiresTheExactInnerViewportRegion() {
@@ -322,6 +388,7 @@ import NvimKit
 
         let result = store.consumePendingPresentation()
         #expect(result?.viewportScrollDeltas == [1: 40])
+        #expect(result?.viewportScrollMotions[1]?.largestStepDelta == 40)
         #expect(result?.damagedGrids.first?.damage.scrolls.isEmpty == true)
     }
 
@@ -344,6 +411,7 @@ import NvimKit
 
         let presented = store.consumePendingPresentation()
         #expect(presented?.viewportScrollDeltas == [1: 1])
+        #expect(presented?.allowsScrollInterpolation == false)
         #expect(presented?.damagedGrids.first?.damage.scrolls.count == 1)
         #expect(presented?.damagedGrids.first?.grid.rowText(0) == "typed!")
     }

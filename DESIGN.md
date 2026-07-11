@@ -243,12 +243,16 @@ Per flush, for each damaged grid:
 3. **Present exact row revisions.** Margins remain in stationary row layers;
    the inner viewport uses `height + 1` recyclable layers in a clipped
    container. A critically damped spring translates that one container,
-   pixel-snapped at Retina scale. Row contents rebind only at integer-line
-   crossings or when their authoritative revision changes.
+   pixel-snapped at Retina scale. Filmstrip slots move with the history head,
+   so surviving rows keep their existing `CALayer.contents`; only an exposed
+   edge or genuinely revised row uploads a new image.
 4. **Coalesce to display cadence.** The first idle scroll presents
    immediately. While motion is active, compatible Neovim flushes accumulate
    in GridKit and are consumed once at the next shared display callback. No
-   protocol event or input is dropped; non-scroll frames drain immediately.
+   protocol event or input is dropped; non-scroll frames drain immediately
+   and settle any active tail atomically. Coalesced viewport metadata retains
+   net displacement, largest individual step, and reversal provenance, so
+   many small steps never masquerade as one far jump.
 
 Why this shape and not the alternatives:
 
@@ -436,8 +440,10 @@ vim.keymap.set({ "n", "v" }, "<D-c>", '"+y')  -- etc.
   Neovim wheel notification. Adjacent repeats share one ordered pipe write.
   Neovim stays authoritative while SurfaceKit reconciles its discrete
   viewport rows through retained exact row history and a display-linked
-  spring. A brief low-resolution velocity veil appears only when a true jump
-  exceeds retained history; Reduce Motion presents atomically.
+  spring. A brief low-resolution velocity veil appears only when a true jump,
+  sustained history clamp, or measured display gap cannot be represented
+  exactly; it is latched to avoid pulsing and capped at 150 ms. Reduce Motion
+  presents atomically.
 - **Pinch to zoom** (`magnify(with:)`) adjusts `guifont` size through the same
   `option_set` path — metrics, resize, persist.
 - Force-click on a word → LSP hover/definition via the runtime plugin

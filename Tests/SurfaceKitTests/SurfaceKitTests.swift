@@ -633,6 +633,26 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
         #expect(!state.isActive)
     }
 
+    @Test func coalescedFarJumpKeepsTheFarStepsDirection() {
+        let host = CALayer()
+        let state = SmoothViewportState(gridID: 1)
+        _ = state.present(
+            image: solidImage(width: 80, height: 96),
+            rows: 6, cols: 10, margins: nil, scrolls: [], semanticDelta: nil,
+            cellSize: cellSize, scale: 1, host: host, animate: true)
+        var motion = ViewportScrollMotion(delta: 20)
+        motion.append(-1)
+
+        _ = state.present(
+            image: solidImage(width: 80, height: 96),
+            rows: 6, cols: 10, margins: nil, scrolls: [],
+            semanticDelta: motion.netDelta, semanticMotion: motion,
+            cellSize: cellSize, scale: 1, host: host, animate: true)
+
+        #expect(state.position == -1,
+                "a trailing opposite step must not reverse the far-jump cue")
+    }
+
     @Test func resizeResetsHistoryAndSettlesOnTheExactFilmstrip() {
         let host = CALayer()
         let first = solidImage(width: 80, height: 96)
@@ -711,6 +731,62 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
         }
     }
 
+    @Test func coalescedSmallMotionBeyondAViewportClampsWithoutFarReset() {
+        let host = CALayer()
+        let state = SmoothViewportState(gridID: 1)
+        _ = state.present(
+            image: solidImage(width: 80, height: 96),
+            rows: 6, cols: 10, margins: nil, scrolls: [], semanticDelta: nil,
+            cellSize: cellSize, scale: 1, host: host, animate: true)
+        var motion = ViewportScrollMotion(delta: 1)
+        for _ in 1..<10 { motion.append(1) }
+
+        _ = state.present(
+            image: solidImage(width: 80, height: 96),
+            rows: 6, cols: 10, margins: nil,
+            scrolls: [ScrollDelta(
+                top: 0, bottom: 6, left: 0, right: 10, rows: 6, cols: 0)],
+            semanticDelta: motion.netDelta, semanticMotion: motion,
+            cellSize: cellSize, scale: 1, host: host, animate: true)
+
+        #expect(state.position == -6)
+        #expect(state.historyHead == 6,
+                "retained history rotates a full viewport, not a one-line far cue")
+        #expect(!state.isVeilActive)
+    }
+
+    @Test func zeroNetCoalescedReversalPreservesActiveSpringAndVelocity() {
+        let host = CALayer()
+        let state = SmoothViewportState(gridID: 1)
+        _ = state.present(
+            image: solidImage(width: 80, height: 96),
+            rows: 6, cols: 10, margins: nil, scrolls: [], semanticDelta: nil,
+            cellSize: cellSize, scale: 1, host: host, animate: true)
+        let down = ScrollDelta(
+            top: 0, bottom: 6, left: 0, right: 10, rows: 1, cols: 0)
+        _ = state.present(
+            image: solidImage(width: 80, height: 96),
+            rows: 6, cols: 10, margins: nil, scrolls: [down], semanticDelta: 1,
+            cellSize: cellSize, scale: 1, host: host, animate: true)
+        _ = state.advance(by: 1.0 / 60.0)
+        let oldPosition = state.position
+        let oldVelocity = state.velocity
+        var reversal = ViewportScrollMotion(delta: 1)
+        reversal.append(-1)
+
+        _ = state.present(
+            image: solidImage(width: 80, height: 96),
+            rows: 6, cols: 10, margins: nil,
+            scrolls: [down, ScrollDelta(
+                top: 0, bottom: 6, left: 0, right: 10, rows: -1, cols: 0)],
+            semanticDelta: 0, semanticMotion: reversal,
+            cellSize: cellSize, scale: 1, host: host, animate: true)
+
+        #expect(state.isActive)
+        #expect(state.position == oldPosition)
+        #expect(state.velocity == oldVelocity)
+    }
+
     @Test func fractionalTicksOnlyTranslateTheContainer() {
         let host = CALayer()
         let state = SmoothViewportState(gridID: 1)
@@ -735,6 +811,41 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
             #expect(before[index] === after[index])
         }
         #expect(state.translatedContainerLayer.affineTransform() != transformBefore)
+    }
+
+    @Test func viewportRetargetReusesAllSurvivingLayerContents() {
+        let host = CALayer()
+        let state = SmoothViewportState(gridID: 1)
+        let initial = (0..<6).map { row in
+            RenderedRowSnapshot(
+                image: solidImage(width: 80, height: 16),
+                backingID: UInt64(row + 1), revision: 1)
+        }
+        _ = state.present(
+            rowSnapshots: initial, rows: 6, cols: 10, margins: nil,
+            scrolls: [], semanticDelta: nil, cellSize: cellSize,
+            scale: 1, host: host, animate: true)
+        let before = Dictionary(uniqueKeysWithValues: state.visibleRowLayers.map {
+            (ObjectIdentifier($0), $0.contents as AnyObject?)
+        })
+
+        let exposed = RenderedRowSnapshot(
+            image: solidImage(width: 80, height: 16),
+            backingID: 7, revision: 1)
+        let final = Array(initial.dropFirst()) + [exposed]
+        _ = state.present(
+            rowSnapshots: final, rows: 6, cols: 10, margins: nil,
+            scrolls: [ScrollDelta(
+                top: 0, bottom: 6, left: 0, right: 10, rows: 1, cols: 0)],
+            semanticDelta: 1, cellSize: cellSize,
+            scale: 1, host: host, animate: true)
+
+        let changed = state.visibleRowLayers.filter { layer in
+            let old = before[ObjectIdentifier(layer)] ?? nil
+            return old !== (layer.contents as AnyObject?)
+        }
+        #expect(changed.count <= 1,
+                "only the newly exposed edge slot may upload different contents")
     }
 
     @Test func trueFarJumpUsesABoundedVelocityVeil() {
@@ -765,6 +876,43 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
             semanticDelta: 20, cellSize: cellSize, scale: 1,
             host: host, animate: false)
         #expect(!state.isVeilActive, "Reduce Motion/immediate never installs a veil")
+    }
+
+    @Test func sustainedClampShowsOneBoundedVeilWithoutPulsing() {
+        let host = CALayer()
+        let state = SmoothViewportState(gridID: 1)
+        _ = state.present(
+            image: solidImage(width: 80, height: 96),
+            rows: 6, cols: 10, margins: nil, scrolls: [], semanticDelta: nil,
+            cellSize: cellSize, scale: 1, host: host, animate: true)
+        let scroll = ScrollDelta(
+            top: 0, bottom: 6, left: 0, right: 10, rows: 1, cols: 0)
+        // Fill the retained-history debt without advancing the spring.
+        for _ in 0..<6 {
+            _ = state.present(
+                image: solidImage(width: 80, height: 96),
+                rows: 6, cols: 10, margins: nil,
+                scrolls: [scroll], semanticDelta: 1, cellSize: cellSize,
+                scale: 1, host: host, animate: true)
+        }
+
+        var activations = 0
+        var wasVisible = false
+        for _ in 0..<24 {
+            _ = state.present(
+                image: solidImage(width: 80, height: 96),
+                rows: 6, cols: 10, margins: nil,
+                scrolls: [scroll], semanticDelta: 1, cellSize: cellSize,
+                scale: 1, host: host, animate: true)
+            _ = state.advance(by: 1.0 / 60.0)
+            if state.isVeilActive, !wasVisible { activations += 1 }
+            wasVisible = state.isVeilActive
+        }
+
+        #expect(activations == 1,
+                "a sustained unresolved clamp must not repeatedly pulse the veil")
+        #expect(!state.isVeilActive,
+                "the unresolved veil still obeys its absolute 150 ms cap")
     }
 
     @Test func settlementWaitsUntilTheSnappedResidualIsZero() {
@@ -987,6 +1135,32 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
         #expect(state.currentRowsReference(final))
     }
 
+    @Test func atomicPureEditSettlesAnExistingScrollTail() {
+        let host = CALayer()
+        let state = SmoothViewportState(gridID: 1)
+        _ = state.present(
+            image: solidImage(width: 80, height: 96),
+            rows: 6, cols: 10, margins: nil, scrolls: [], semanticDelta: nil,
+            cellSize: cellSize, scale: 1, host: host, animate: true)
+        _ = state.present(
+            image: solidImage(width: 80, height: 96),
+            rows: 6, cols: 10, margins: nil,
+            scrolls: [ScrollDelta(
+                top: 0, bottom: 6, left: 0, right: 10, rows: 1, cols: 0)],
+            semanticDelta: 1, cellSize: cellSize, scale: 1,
+            host: host, animate: true)
+        #expect(state.isActive)
+
+        _ = state.present(
+            image: solidImage(width: 80, height: 96),
+            rows: 6, cols: 10, margins: nil, scrolls: [], semanticDelta: nil,
+            cellSize: cellSize, scale: 1, host: host, animate: false)
+
+        #expect(!state.isActive)
+        #expect(state.position == 0)
+        #expect(state.velocity == 0)
+    }
+
     @Test func unsupportedScrollSettlesAnActiveViewportTail() {
         let host = CALayer()
         let first = solidImage(width: 80, height: 96)
@@ -1026,6 +1200,65 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
 
 @MainActor
 @Suite struct ViewGeometryTests {
+    @Test func marginOnlyFlushRebuildsThePermanentViewportClip() {
+        let view = GridSurfaceView(
+            frame: NSRect(x: 0, y: 0, width: 600, height: 400), font: menlo)
+        let store = GridStore()
+        view.present(flush(store, [
+            .gridResize(grid: 1, width: 10, height: 6),
+            line(0, "aaaaaaaaaa", hl: 0), line(1, "bbbbbbbbbb", hl: 0),
+            line(2, "cccccccccc", hl: 0), line(3, "dddddddddd", hl: 0),
+            line(4, "eeeeeeeeee", hl: 0), line(5, "ffffffffff", hl: 0),
+        ]))
+        view.present(flush(store, [
+            .winViewportMargins(
+                grid: 1, win: 10, top: 1, bottom: 1, left: 2, right: 1),
+        ]))
+
+        guard let grid = view.layer?.sublayers?.first(where: { $0.zPosition != 10_000 }),
+            let clip = grid.sublayers?.first(where: { $0.masksToBounds })
+        else {
+            Issue.record("permanent viewport clip missing")
+            return
+        }
+        #expect(clip.frame == CGRect(
+            x: 2 * view.cellSize.width, y: view.cellSize.height,
+            width: 7 * view.cellSize.width, height: 4 * view.cellSize.height))
+    }
+
+    @Test func immediateMetadataOnlyFrameSettlesEveryActiveViewport() {
+        let view = GridSurfaceView(
+            frame: NSRect(x: 0, y: 0, width: 600, height: 400), font: menlo)
+        let store = GridStore()
+        view.present(flush(store, [
+            .gridResize(grid: 1, width: 10, height: 6),
+            line(0, "aaaaaaaaaa", hl: 0), line(1, "bbbbbbbbbb", hl: 0),
+            line(2, "cccccccccc", hl: 0), line(3, "dddddddddd", hl: 0),
+            line(4, "eeeeeeeeee", hl: 0), line(5, "ffffffffff", hl: 0),
+        ]))
+        view.present(flush(store, [
+            .gridScroll(
+                grid: 1, top: 0, bottom: 6, left: 0, right: 10,
+                rows: 1, cols: 0),
+            line(5, "zzzzzzzzzz", hl: 0),
+            .winViewport(
+                grid: 1, win: 10, topline: 1, botline: 7,
+                curline: 2, curcol: 0, lineCount: 100, scrollDelta: 1),
+        ]))
+        #expect(!view.animationsAreIdle)
+
+        _ = store.applyDeferred(RedrawBatch(events: [
+            .setTitle("atomic"), .flush,
+        ]))
+        guard let atomic = store.consumePendingPresentation() else {
+            Issue.record("immediate presentation missing")
+            return
+        }
+        #expect(!atomic.allowsScrollInterpolation)
+        view.present(atomic)
+        #expect(view.animationsAreIdle)
+    }
+
     @Test func cursorRectAndHitTestingAgree() {
         let view = GridSurfaceView(
             frame: NSRect(x: 0, y: 0, width: 600, height: 400), font: menlo)
@@ -1232,16 +1465,10 @@ extension CursorRenderTests {
         in view: GridSurfaceView, sourceRow: Int, totalRows: Int
     ) -> (clip: CALayer, row: CALayer)? {
         guard let grid = view.layer?.sublayers?.first(where: { $0.zPosition != 10_000 }),
-            let base = grid.sublayers?.first(where: { $0.zPosition == 0 }),
-            let baseRows = base.sublayers, baseRows.indices.contains(sourceRow),
-            let authoritativeImage = baseRows[sourceRow].contents as AnyObject?,
-            let clip = grid.sublayers?.first(where: { $0.zPosition == 1 && $0.masksToBounds })
+            let clip = grid.sublayers?.first(where: { $0.zPosition == 1 && $0.masksToBounds }),
+            let row = view.visibleRowLayer(gridID: 1, sourceRow: sourceRow)
         else { return nil }
         _ = totalRows
-        guard let container = clip.sublayers?.first(where: { $0.zPosition == 0 }),
-            let row = container.sublayers?.first(where: {
-            !$0.isHidden && ($0.contents as AnyObject?) === authoritativeImage
-        }) else { return nil }
         return (clip, row)
     }
 

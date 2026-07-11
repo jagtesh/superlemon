@@ -296,6 +296,16 @@ public final class GridSurfaceView: NSView {
         }
         defer { if ownsTransaction { CATransaction.commit() } }
 
+        if !redrawAll, !flush.allowsScrollInterpolation {
+            // Atomic disposition applies to the whole presented frame, not
+            // only grids that happened to carry row damage. Layout/title/
+            // highlight events can otherwise leave an older filmstrip tail
+            // moving beneath an already-committed immediate frame.
+            for state in smoothViewports.values { state.settle() }
+            cursorCorrection.settle()
+            cursorCorrectionActive = false
+        }
+
         layer?.backgroundColor = flush.highlights.defaultBackground.cgColor
 
         // 1. Update row backing stores. Compatible vertical motion rotates
@@ -333,8 +343,14 @@ public final class GridSurfaceView: NSView {
                 height: CGFloat(frame.rect.height) * ch)
             gridLayer.zPosition = CGFloat(frame.zIndex)
             gridLayer.backgroundColor = flush.highlights.defaultBackground.cgColor
-            let hasViewportDelta = flush.viewportScrollDeltas[frame.gridID] != nil
-            if updatedContents.contains(frame.gridID) || hasViewportDelta,
+            let viewportMotion = flush.viewportScrollMotions[frame.gridID]
+            let targetGeometry = SmoothViewportGeometry(
+                rows: grid.rows, cols: grid.cols, margins: grid.viewportMargins)
+            let geometryChanged = smoothViewports[frame.gridID].map {
+                $0.geometry != targetGeometry
+            } ?? false
+            if updatedContents.contains(frame.gridID) || viewportMotion != nil
+                || geometryChanged,
                 let rowSnapshots = renderers[frame.gridID]?.rowSnapshots()
             {
                 // The normal compositor never uploads a full-grid image.
@@ -347,8 +363,10 @@ public final class GridSurfaceView: NSView {
                     margins: grid.viewportMargins,
                     scrolls: damageByGrid[frame.gridID]?.presentationScrolls ?? [],
                     semanticDelta: redrawAll ? nil : flush.viewportScrollDeltas[frame.gridID],
+                    semanticMotion: redrawAll ? nil : viewportMotion,
                     cellSize: cellSize, scale: scale, host: gridLayer,
-                    animate: scrollMotionStyle == .tightNative && !reducedMotion && !redrawAll)
+                    animate: scrollMotionStyle == .tightNative && !reducedMotion
+                        && !redrawAll && flush.allowsScrollInterpolation)
                 motionStarted = motionStarted || started
                 assert(state.currentRowsMatch(rowSnapshots),
                        "filmstrip must end on authoritative row revisions")
@@ -529,6 +547,12 @@ public final class GridSurfaceView: NSView {
         !smoothViewports.values.contains(where: { $0.isActive || $0.isVeilActive })
             && !cursorCorrectionActive && scheduledDisplayPresentation == nil
             && (animationDisplayLink?.isPaused ?? true)
+    }
+
+    /// Deterministic test hook that avoids annotating hot-path CALayers with
+    /// names/KVC metadata solely to identify their authoritative source row.
+    func visibleRowLayer(gridID: Int, sourceRow: Int) -> CALayer? {
+        smoothViewports[gridID]?.visibleLayer(sourceRow: sourceRow)
     }
 
     private func resumeDisplayLink() {
