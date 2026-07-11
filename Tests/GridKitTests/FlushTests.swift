@@ -160,4 +160,217 @@ import NvimKit
 
         #expect(result.viewportScrollDeltas == [2: 4])
     }
+
+    @Test func deferredScrollFlushesCoalesceUntilConsumed() {
+        let store = makeStore(rows: 6, cols: 6)
+
+        let first = store.applyDeferred(batch(
+            .gridScroll(
+                grid: 1, top: 0, bottom: 6, left: 0, right: 6,
+                rows: 1, cols: 0),
+            line(1, 5, 0, runs("first ")),
+            .winViewport(
+                grid: 1, win: 10, topline: 1, botline: 7,
+                curline: 2, curcol: 0, lineCount: 100, scrollDelta: 1),
+            .flush
+        ))
+        let second = store.applyDeferred(batch(
+            .gridScroll(
+                grid: 1, top: 0, bottom: 6, left: 0, right: 6,
+                rows: 2, cols: 0),
+            line(1, 4, 0, runs("next  ")),
+            line(1, 5, 0, runs("last  ")),
+            .winViewport(
+                grid: 1, win: 10, topline: 3, botline: 9,
+                curline: 4, curcol: 0, lineCount: 100, scrollDelta: 2),
+            .flush
+        ))
+
+        #expect(first == .displayLinked)
+        #expect(second == .displayLinked)
+        let presented = store.consumePendingPresentation()
+        #expect(presented?.viewportScrollDeltas == [1: 3])
+        #expect(presented?.damagedGrids.first?.damage.scrolls.count == 2)
+        #expect(store.consumePendingPresentation() == nil)
+    }
+
+    @Test func deferredPresentationClassifiesUnsafeFramesImmediate() {
+        let store = makeStore(rows: 6, cols: 6)
+
+        let horizontal = store.applyDeferred(batch(
+            .gridScroll(
+                grid: 1, top: 0, bottom: 6, left: 0, right: 6,
+                rows: 0, cols: 1),
+            .flush
+        ))
+        #expect(horizontal == .immediate)
+        #expect(store.consumePendingPresentation() != nil)
+
+        let resize = store.applyDeferred(batch(
+            .gridResize(grid: 1, width: 7, height: 7),
+            .flush
+        ))
+        #expect(resize == .immediate)
+        #expect(store.consumePendingPresentation()?.grids[1]?.rows == 7)
+    }
+
+    @Test func deferredScrollRequiresTheExactInnerViewportRegion() {
+        let store = makeStore(rows: 8, cols: 6)
+        _ = store.apply(batch(
+            .winViewportMargins(
+                grid: 1, win: 10, top: 1, bottom: 1, left: 1, right: 1),
+            .flush
+        ))
+
+        #expect(store.applyDeferred(batch(
+            .gridScroll(
+                grid: 1, top: 1, bottom: 7, left: 1, right: 5,
+                rows: 1, cols: 0),
+            .winViewport(
+                grid: 1, win: 10, topline: 1, botline: 7,
+                curline: 2, curcol: 0, lineCount: 100, scrollDelta: 1),
+            .flush
+        )) == .displayLinked)
+        #expect(store.consumePendingPresentation() != nil)
+
+        #expect(store.applyDeferred(batch(
+            .gridScroll(
+                grid: 1, top: 0, bottom: 7, left: 0, right: 6,
+                rows: 1, cols: 0),
+            .flush
+        )) == .immediate)
+        #expect(store.consumePendingPresentation() != nil)
+    }
+
+    @Test func deferredScrollRequiresMatchingSemanticDirectionAndTouchedGrids() {
+        let store = makeStore(rows: 6, cols: 6)
+        _ = store.apply(batch(.gridResize(grid: 2, width: 6, height: 6), .flush))
+
+        #expect(store.applyDeferred(batch(
+            .gridScroll(
+                grid: 1, top: 0, bottom: 6, left: 0, right: 6,
+                rows: 1, cols: 0),
+            .winViewport(
+                grid: 1, win: 10, topline: 1, botline: 7,
+                curline: 2, curcol: 0, lineCount: 100, scrollDelta: -1),
+            .flush
+        )) == .immediate)
+        #expect(store.consumePendingPresentation() != nil)
+
+        #expect(store.applyDeferred(batch(
+            .gridScroll(
+                grid: 1, top: 0, bottom: 6, left: 0, right: 6,
+                rows: 1, cols: 0),
+            line(2, 0, 0, runs("other!")),
+            .winViewport(
+                grid: 1, win: 10, topline: 2, botline: 8,
+                curline: 3, curcol: 0, lineCount: 100, scrollDelta: 1),
+            .flush
+        )) == .immediate)
+        #expect(store.consumePendingPresentation() != nil)
+
+        #expect(store.applyDeferred(batch(
+            .gridScroll(
+                grid: 1, top: 0, bottom: 6, left: 0, right: 6,
+                rows: 1, cols: 0),
+            line(1, 2, 0, runs("typed!")),
+            .winViewport(
+                grid: 1, win: 10, topline: 3, botline: 9,
+                curline: 4, curcol: 0, lineCount: 100, scrollDelta: 1),
+            .flush
+        )) == .immediate)
+        #expect(store.consumePendingPresentation() != nil)
+    }
+
+    @Test func deferredScrollSupportsIndependentMovingSplits() {
+        let store = makeStore(rows: 6, cols: 6)
+        _ = store.apply(batch(.gridResize(grid: 2, width: 6, height: 6), .flush))
+
+        #expect(store.applyDeferred(batch(
+            .gridScroll(
+                grid: 1, top: 0, bottom: 6, left: 0, right: 6,
+                rows: 1, cols: 0),
+            line(1, 5, 0, runs("one   ")),
+            .winViewport(
+                grid: 1, win: 10, topline: 1, botline: 7,
+                curline: 2, curcol: 0, lineCount: 100, scrollDelta: 1),
+            .gridScroll(
+                grid: 2, top: 0, bottom: 6, left: 0, right: 6,
+                rows: -2, cols: 0),
+            line(2, 0, 0, runs("two   ")),
+            line(2, 1, 0, runs("split ")),
+            .winViewport(
+                grid: 2, win: 20, topline: 8, botline: 14,
+                curline: 10, curcol: 0, lineCount: 100, scrollDelta: -2),
+            .flush
+        )) == .displayLinked)
+
+        let result = store.consumePendingPresentation()
+        #expect(result?.viewportScrollDeltas == [1: 1, 2: -2])
+        #expect(result?.damagedGrids.map(\.grid.id) == [1, 2])
+    }
+
+    @Test func semanticFarJumpCanAnimateWithoutPixelScrollDamage() {
+        let store = makeStore(rows: 6, cols: 6)
+        #expect(store.applyDeferred(batch(
+            line(1, 0, 0, runs("final ")),
+            .winViewport(
+                grid: 1, win: 10, topline: 40, botline: 46,
+                curline: 42, curcol: 0, lineCount: 100, scrollDelta: 40),
+            .flush
+        )) == .displayLinked)
+
+        let result = store.consumePendingPresentation()
+        #expect(result?.viewportScrollDeltas == [1: 40])
+        #expect(result?.damagedGrids.first?.damage.scrolls.isEmpty == true)
+    }
+
+    @Test func immediateDeferredFrameDrainsEarlierScrollDamage() {
+        let store = makeStore(rows: 6, cols: 6)
+        #expect(store.applyDeferred(batch(
+            .gridScroll(
+                grid: 1, top: 0, bottom: 6, left: 0, right: 6,
+                rows: 1, cols: 0),
+            .winViewport(
+                grid: 1, win: 10, topline: 1, botline: 7,
+                curline: 2, curcol: 0, lineCount: 100, scrollDelta: 1),
+            .flush
+        )) == .displayLinked)
+
+        #expect(store.applyDeferred(batch(
+            line(1, 0, 0, runs("typed!")),
+            .flush
+        )) == .immediate)
+
+        let presented = store.consumePendingPresentation()
+        #expect(presented?.viewportScrollDeltas == [1: 1])
+        #expect(presented?.damagedGrids.first?.damage.scrolls.count == 1)
+        #expect(presented?.damagedGrids.first?.grid.rowText(0) == "typed!")
+    }
+
+    @Test func deferredConsumerNeverExposesAPartialWireFrame() {
+        let store = makeStore(rows: 6, cols: 6)
+        #expect(store.applyDeferred(batch(
+            .gridScroll(
+                grid: 1, top: 0, bottom: 6, left: 0, right: 6,
+                rows: 1, cols: 0),
+            .winViewport(
+                grid: 1, win: 10, topline: 1, botline: 7,
+                curline: 2, curcol: 0, lineCount: 100, scrollDelta: 1),
+            .flush
+        )) == .displayLinked)
+
+        // The next Neovim frame has begun but has not reached its atomic
+        // flush boundary. The older pending presentation is deliberately
+        // superseded rather than exposing this partial state.
+        #expect(store.applyDeferred(batch(
+            line(1, 5, 0, runs("part  "))
+        )) == .none)
+        #expect(store.consumePendingPresentation() == nil)
+
+        #expect(store.applyDeferred(batch(.flush)) == .immediate)
+        let complete = store.consumePendingPresentation()
+        #expect(complete?.damagedGrids.first?.grid.rowText(5) == "part  ")
+        #expect(complete?.viewportScrollDeltas == [1: 1])
+    }
 }

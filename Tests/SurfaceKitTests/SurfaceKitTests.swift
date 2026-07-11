@@ -247,6 +247,114 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
                 "blit path must be pixel-identical to a full repaint")
     }
 
+    @Test func verticalScrollRotatesSurvivingRowImagesWithoutResnapshotting() {
+        let rows = 6, cols = 8
+        let store = GridStore()
+        let fonts = FontSet(spec: menlo)
+        let renderer = GridRenderer(rasterizer: TextRasterizer(fonts: fonts), scale: 1)
+        let first = flush(
+            store, [.gridResize(grid: 1, width: cols, height: rows)]
+                + paint(rows: rows, cols: cols))
+        let d1 = first.damagedGrids.first { $0.grid.id == 1 }!
+        renderer.apply(grid: d1.grid, damage: d1.damage, highlights: first.highlights)
+        let before = renderer.rowSnapshots()!
+
+        let second = flush(store, [
+            .gridScroll(
+                grid: 1, top: 0, bottom: rows, left: 0, right: cols,
+                rows: 2, cols: 0),
+            line(rows - 2, String(repeating: " ", count: cols), hl: 10),
+            line(rows - 1, String(repeating: " ", count: cols), hl: 11),
+        ])
+        let d2 = second.damagedGrids.first { $0.grid.id == 1 }!
+        renderer.apply(grid: d2.grid, damage: d2.damage, highlights: second.highlights)
+        let after = renderer.rowSnapshots()!
+
+        for destination in 0..<(rows - 2) {
+            #expect(after[destination].image === before[destination + 2].image)
+            #expect(after[destination].token == before[destination + 2].token)
+        }
+        #expect(after[rows - 2].backingID == before[0].backingID)
+        #expect(after[rows - 1].backingID == before[1].backingID)
+        #expect(after[rows - 2].revision > before[0].revision)
+        #expect(after[rows - 1].revision > before[1].revision)
+        #expect(after.allSatisfy { $0.image.height == Int(fonts.cellSize.height) })
+    }
+
+    @Test func recycledBackingPoolIsBoundedAndOldSnapshotsStayImmutable() {
+        let rows = 6, cols = 8
+        let store = GridStore()
+        let fonts = FontSet(spec: menlo)
+        let renderer = GridRenderer(rasterizer: TextRasterizer(fonts: fonts), scale: 1)
+        let first = flush(
+            store, [.gridResize(grid: 1, width: cols, height: rows)]
+                + paint(rows: rows, cols: cols))
+        let firstDamage = first.damagedGrids.first { $0.grid.id == 1 }!
+        renderer.apply(
+            grid: firstDamage.grid, damage: firstDamage.damage,
+            highlights: first.highlights)
+        let initial = renderer.rowSnapshots()!
+        let retainedImage = initial[0].image
+        let retainedBytes = retainedImage.dataProvider!.data! as Data
+        var backingIDs = Set(initial.map(\.backingID))
+
+        for iteration in 0..<64 {
+            let next = flush(store, [
+                .gridScroll(
+                    grid: 1, top: 0, bottom: rows, left: 0, right: cols,
+                    rows: 1, cols: 0),
+                line(
+                    rows - 1, String(repeating: " ", count: cols),
+                    hl: 10 + iteration % rows),
+            ])
+            let damage = next.damagedGrids.first { $0.grid.id == 1 }!
+            renderer.apply(
+                grid: damage.grid, damage: damage.damage,
+                highlights: next.highlights)
+            backingIDs.formUnion(renderer.rowSnapshots()!.map(\.backingID))
+        }
+
+        #expect(backingIDs.count == rows,
+                "scrolling recycles a fixed row-context pool")
+        #expect((retainedImage.dataProvider!.data! as Data) == retainedBytes,
+                "history snapshots remain immutable while their contexts recycle")
+    }
+
+    @Test func unsupportedScrollRerasterizesOnlyItsAffectedRows() {
+        let rows = 6, cols = 8
+        let store = GridStore()
+        let fonts = FontSet(spec: menlo)
+        let renderer = GridRenderer(rasterizer: TextRasterizer(fonts: fonts), scale: 1)
+        let first = flush(
+            store, [.gridResize(grid: 1, width: cols, height: rows)]
+                + paint(rows: rows, cols: cols))
+        let firstDamage = first.damagedGrids.first { $0.grid.id == 1 }!
+        renderer.apply(
+            grid: firstDamage.grid, damage: firstDamage.damage,
+            highlights: first.highlights)
+        let before = renderer.rowSnapshots()!
+
+        let second = flush(store, [
+            .gridScroll(
+                grid: 1, top: 1, bottom: 4, left: 1, right: 7,
+                rows: 0, cols: 1),
+        ])
+        let secondDamage = second.damagedGrids.first { $0.grid.id == 1 }!
+        renderer.apply(
+            grid: secondDamage.grid, damage: secondDamage.damage,
+            highlights: second.highlights)
+        let after = renderer.rowSnapshots()!
+
+        for row in 0..<rows {
+            if (1..<4).contains(row) {
+                #expect(after[row].revision > before[row].revision)
+            } else {
+                #expect(after[row].token == before[row].token)
+                #expect(after[row].image === before[row].image)
+            }
+        }
+    }
+
     @Test func scrollDownAndHorizontalAlsoMatch() {
         let rows = 6, cols = 8
         let store = GridStore()
@@ -397,7 +505,8 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
         #expect(state.history[5]?.contentsRect.minY == 0,
                 "CALayer contentsRect is bottom-up even in a flipped host view")
         #expect(state.currentRowsReference(first))
-        #expect(state.overlayLayer.isHidden)
+        #expect(!state.overlayLayer.isHidden,
+                "the exact row filmstrip remains installed while idle")
 
         let scroll = ScrollDelta(
             top: 0, bottom: 6, left: 0, right: 10, rows: 1, cols: 0)
@@ -430,7 +539,7 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
             _ = state.advance(by: 1.0 / 120.0)
         }
         #expect(!state.isActive)
-        #expect(state.overlayLayer.isHidden)
+        #expect(!state.overlayLayer.isHidden)
         #expect(state.currentRowsReference(final),
                 "settling must expose the exact authoritative backing image")
     }
@@ -524,7 +633,7 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
         #expect(!state.isActive)
     }
 
-    @Test func resizeResetsHistoryAndSettlesWithoutAVisibleOverlay() {
+    @Test func resizeResetsHistoryAndSettlesOnTheExactFilmstrip() {
         let host = CALayer()
         let first = solidImage(width: 80, height: 96)
         let scrolling = solidImage(width: 80, height: 96)
@@ -550,7 +659,7 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
         #expect(!state.isActive)
         #expect(state.history.capacity == 16)
         #expect(state.historyHead == 0)
-        #expect(state.overlayLayer.isHidden)
+        #expect(!state.overlayLayer.isHidden)
         #expect(state.currentRowsReference(resized))
     }
 
@@ -575,6 +684,87 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
             let physicalY = layer.frame.minY * 2
             #expect(abs(physicalY - physicalY.rounded()) < 0.000_001)
         }
+        let physicalTranslation = state.translatedContainerLayer.affineTransform().ty * 2
+        #expect(abs(physicalTranslation - physicalTranslation.rounded()) < 0.000_001)
+    }
+
+    @Test func cumulativeSmallDeltasClampWithoutBecomingFarJumps() {
+        let host = CALayer()
+        let state = SmoothViewportState(gridID: 1)
+        _ = state.present(
+            image: solidImage(width: 80, height: 96),
+            rows: 6, cols: 10, margins: nil, scrolls: [], semanticDelta: nil,
+            cellSize: cellSize, scale: 1, host: host, animate: true)
+        let scroll = ScrollDelta(
+            top: 0, bottom: 6, left: 0, right: 10, rows: 1, cols: 0)
+
+        for input in 1...10 {
+            _ = state.present(
+                image: solidImage(width: 80, height: 96),
+                rows: 6, cols: 10, margins: nil, scrolls: [scroll], semanticDelta: 1,
+                cellSize: cellSize, scale: 1, host: host, animate: true)
+            #expect(state.position == -CGFloat(min(input, 6)),
+                    "cumulative debt clamps at retained history instead of resetting")
+            #expect(state.historyHead == input % 12)
+            #expect(!state.isVeilActive,
+                    "clamped small inputs are not a single unbridgeable jump")
+        }
+    }
+
+    @Test func fractionalTicksOnlyTranslateTheContainer() {
+        let host = CALayer()
+        let state = SmoothViewportState(gridID: 1)
+        _ = state.present(
+            image: solidImage(width: 80, height: 96),
+            rows: 6, cols: 10, margins: nil, scrolls: [], semanticDelta: nil,
+            cellSize: cellSize, scale: 2, host: host, animate: true)
+        _ = state.present(
+            image: solidImage(width: 80, height: 96),
+            rows: 6, cols: 10, margins: nil,
+            scrolls: [ScrollDelta(
+                top: 0, bottom: 6, left: 0, right: 10, rows: 1, cols: 0)],
+            semanticDelta: 1, cellSize: cellSize, scale: 2,
+            host: host, animate: true)
+        let before = state.visibleRowLayers.map { $0.contents as AnyObject? }
+        let transformBefore = state.translatedContainerLayer.affineTransform()
+
+        _ = state.advance(by: 1.0 / 60.0)
+
+        let after = state.visibleRowLayers.map { $0.contents as AnyObject? }
+        for index in before.indices {
+            #expect(before[index] === after[index])
+        }
+        #expect(state.translatedContainerLayer.affineTransform() != transformBefore)
+    }
+
+    @Test func trueFarJumpUsesABoundedVelocityVeil() {
+        let host = CALayer()
+        let state = SmoothViewportState(gridID: 1)
+        _ = state.present(
+            image: solidImage(width: 80, height: 96),
+            rows: 6, cols: 10, margins: nil, scrolls: [], semanticDelta: nil,
+            cellSize: cellSize, scale: 1, host: host, animate: true)
+        _ = state.present(
+            image: solidImage(width: 80, height: 96),
+            rows: 6, cols: 10, margins: nil,
+            scrolls: [ScrollDelta(
+                top: 0, bottom: 6, left: 0, right: 10, rows: 20, cols: 0)],
+            semanticDelta: 20, cellSize: cellSize, scale: 1,
+            host: host, animate: true)
+        #expect(state.isVeilActive)
+
+        for _ in 0..<20 { _ = state.advance(by: 1.0 / 120.0) }
+        #expect(!state.isVeilActive, "the velocity veil has a 150 ms hard limit")
+
+        state.settle()
+        _ = state.present(
+            image: solidImage(width: 80, height: 96),
+            rows: 6, cols: 10, margins: nil,
+            scrolls: [ScrollDelta(
+                top: 0, bottom: 6, left: 0, right: 10, rows: 20, cols: 0)],
+            semanticDelta: 20, cellSize: cellSize, scale: 1,
+            host: host, animate: false)
+        #expect(!state.isVeilActive, "Reduce Motion/immediate never installs a veil")
     }
 
     @Test func settlementWaitsUntilTheSnappedResidualIsZero() {
@@ -610,7 +800,7 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
             _ = state.advance(by: 1.0 / 120.0)
         }
         #expect(!state.isActive)
-        #expect(state.overlayLayer.isHidden)
+        #expect(!state.overlayLayer.isHidden)
     }
 
     @Test func historyRetainsOnlyOneFullImageAndDetachedEdgeRows() {
@@ -652,7 +842,7 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
         }
         #expect(settledUnique.count == 1)
         #expect(settledUnique.values.first === image)
-        #expect(state.visibleRowLayers.allSatisfy { $0.contents == nil })
+        #expect(state.visibleRowLayers.prefix(6).allSatisfy { $0.contents != nil })
     }
 
     @Test func detachedEdgeRowKeepsTheCorrectTopDownPixels() {
@@ -689,28 +879,30 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
             == pixel(first, x: 40, y: 8))
     }
 
-    @Test func detachedRowDoesNotRetainItsFullParentImage() {
+    @Test func productionHistoryRetainsOnlyRowSizedImages() {
         let host = CALayer()
         let state = SmoothViewportState(gridID: 1)
-        weak var oldFullImage: CGImage?
-        autoreleasepool {
-            let first = solidImage(width: 80, height: 96)
-            oldFullImage = first
-            _ = state.present(
-                image: first, rows: 6, cols: 10, margins: nil,
-                scrolls: [], semanticDelta: nil, cellSize: cellSize,
-                scale: 1, host: host, animate: true)
-            _ = state.present(
-                image: solidImage(width: 80, height: 96),
-                rows: 6, cols: 10, margins: nil,
-                scrolls: [ScrollDelta(
-                    top: 0, bottom: 6, left: 0, right: 10,
-                    rows: 1, cols: 0)],
-                semanticDelta: 1, cellSize: cellSize,
-                scale: 1, host: host, animate: true)
+        func rows(_ generation: UInt64) -> [RenderedRowSnapshot] {
+            (0..<6).map { row in
+                RenderedRowSnapshot(
+                    image: solidImage(width: 80, height: 16),
+                    backingID: generation * 10 + UInt64(row), revision: generation)
+            }
         }
-        #expect(oldFullImage == nil,
-                "the deep row copy must release its full-grid parent provider")
+        _ = state.present(
+            rowSnapshots: rows(1), rows: 6, cols: 10, margins: nil,
+            scrolls: [], semanticDelta: nil, cellSize: cellSize,
+            scale: 1, host: host, animate: true)
+        _ = state.present(
+            rowSnapshots: rows(2), rows: 6, cols: 10, margins: nil,
+            scrolls: [ScrollDelta(
+                top: 0, bottom: 6, left: 0, right: 10, rows: 1, cols: 0)],
+            semanticDelta: 1, cellSize: cellSize,
+            scale: 1, host: host, animate: true)
+
+        #expect(state.history.storage.compactMap { $0 }.allSatisfy {
+            $0.image.height == 16 && !$0.retainsFullGridImage
+        })
     }
 
     @Test func detachedRowCropRespectsAllViewportMargins() {
@@ -770,10 +962,10 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
 
         #expect(!state.advance(by: 60 * 60))
         #expect(!state.isActive)
-        #expect(state.overlayLayer.isHidden)
+        #expect(!state.overlayLayer.isHidden)
     }
 
-    @Test func atomicOrImmediatePresentationNeverShowsTheOverlay() {
+    @Test func atomicOrImmediatePresentationShowsExactRowsWithoutMotion() {
         let host = CALayer()
         let first = solidImage(width: 80, height: 96)
         let final = solidImage(width: 80, height: 96)
@@ -790,7 +982,8 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
             scale: 1, host: host, animate: false)
         #expect(!started)
         #expect(!state.isActive)
-        #expect(state.overlayLayer.isHidden)
+        #expect(!state.overlayLayer.isHidden)
+        #expect(!state.isVeilActive)
         #expect(state.currentRowsReference(final))
     }
 
@@ -823,7 +1016,8 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
             scale: 1, host: host, animate: true)
         #expect(!started)
         #expect(!state.isActive)
-        #expect(state.overlayLayer.isHidden)
+        #expect(!state.overlayLayer.isHidden)
+        #expect(!state.isVeilActive)
         #expect(state.position == 0)
         #expect(state.velocity == 0)
         #expect(state.currentRowsReference(atomic))
@@ -859,6 +1053,40 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
 
         view.setFont(FontSpec(name: "Menlo", size: 26))
         #expect(view.gridSize.rows < size.rows)
+    }
+
+    @Test func displayLinkedPresentationHookDefersOnlyWhileMotionIsActive() {
+        let view = GridSurfaceView(
+            frame: NSRect(x: 0, y: 0, width: 600, height: 400), font: menlo)
+        let window = NSWindow(
+            contentRect: view.frame, styleMask: .borderless,
+            backing: .buffered, defer: false)
+        window.contentView = view
+
+        var calls = 0
+        #expect(!view.schedulePresentationOnNextDisplay { calls += 1 },
+                "the first idle scroll remains immediate")
+        let store = GridStore()
+        view.present(flush(store, [
+            .gridResize(grid: 1, width: 10, height: 6),
+            .winViewport(
+                grid: 1, win: 10, topline: 0, botline: 6,
+                curline: 3, curcol: 2, lineCount: 100, scrollDelta: 0),
+        ]))
+        view.present(flush(store, [
+            .gridScroll(
+                grid: 1, top: 0, bottom: 6, left: 0, right: 10,
+                rows: 1, cols: 0),
+            .winViewport(
+                grid: 1, win: 10, topline: 1, botline: 7,
+                curline: 3, curcol: 2, lineCount: 100, scrollDelta: 1),
+        ]))
+
+        #expect(view.schedulePresentationOnNextDisplay { calls += 1 })
+        #expect(calls == 0)
+        _ = view.advanceAnimations(by: 1.0 / 60.0)
+        #expect(calls == 1)
+        window.contentView = nil
     }
 }
 
@@ -1004,11 +1232,15 @@ extension CursorRenderTests {
         in view: GridSurfaceView, sourceRow: Int, totalRows: Int
     ) -> (clip: CALayer, row: CALayer)? {
         guard let grid = view.layer?.sublayers?.first(where: { $0.zPosition != 10_000 }),
+            let base = grid.sublayers?.first(where: { $0.zPosition == 0 }),
+            let baseRows = base.sublayers, baseRows.indices.contains(sourceRow),
+            let authoritativeImage = baseRows[sourceRow].contents as AnyObject?,
             let clip = grid.sublayers?.first(where: { $0.zPosition == 1 && $0.masksToBounds })
         else { return nil }
-        let expectedY = 1 - CGFloat(sourceRow + 1) / CGFloat(totalRows)
-        guard let row = clip.sublayers?.first(where: {
-            !$0.isHidden && abs($0.contentsRect.minY - expectedY) < 0.000_001
+        _ = totalRows
+        guard let container = clip.sublayers?.first(where: { $0.zPosition == 0 }),
+            let row = container.sublayers?.first(where: {
+            !$0.isHidden && ($0.contents as AnyObject?) === authoritativeImage
         }) else { return nil }
         return (clip, row)
     }

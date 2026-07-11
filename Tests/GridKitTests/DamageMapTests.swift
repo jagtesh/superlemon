@@ -55,4 +55,39 @@ import Testing
         #expect(!map.isEmpty)
         #expect(map.scrolls.count == 1)
     }
+
+    @Test func presentationScrollsFoldCompatibleVerticalMotion() {
+        var map = DamageMap()
+        map.recordScroll(ScrollDelta(
+            top: 1, bottom: 9, left: 0, right: 20, rows: 2, cols: 0))
+        map.recordScroll(ScrollDelta(
+            top: 1, bottom: 9, left: 0, right: 20, rows: 3, cols: 0))
+
+        #expect(map.scrolls.count == 2)
+        #expect(map.presentationScrolls == [ScrollDelta(
+            top: 1, bottom: 9, left: 0, right: 20, rows: 5, cols: 0)])
+    }
+
+    @Test func presentationScrollsCapAtRegionHeight() {
+        var map = DamageMap()
+        map.recordScroll(ScrollDelta(
+            top: 2, bottom: 7, left: 0, right: 20, rows: -3, cols: 0))
+        map.recordScroll(ScrollDelta(
+            top: 2, bottom: 7, left: 0, right: 20, rows: -4, cols: 0))
+
+        #expect(map.presentationScrolls == [ScrollDelta(
+            top: 2, bottom: 7, left: 0, right: 20, rows: -5, cols: 0)])
+    }
+
+    @Test func presentationScrollsKeepReversalsAndConflictsOrdered() {
+        var map = DamageMap()
+        let deltas = [
+            ScrollDelta(top: 0, bottom: 8, left: 0, right: 20, rows: 2, cols: 0),
+            ScrollDelta(top: 0, bottom: 8, left: 0, right: 20, rows: -1, cols: 0),
+            ScrollDelta(top: 1, bottom: 8, left: 0, right: 20, rows: -1, cols: 0),
+            ScrollDelta(top: 0, bottom: 8, left: 0, right: 20, rows: 0, cols: 1),
+        ]
+        for delta in deltas { map.recordScroll(delta) }
+        #expect(map.presentationScrolls == deltas)
+    }
 }

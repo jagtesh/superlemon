@@ -125,6 +125,7 @@ struct SmoothViewportGeometry: Equatable {
 
     func accepts(_ scrolls: [ScrollDelta], semanticDelta: Int) -> Bool {
         guard semanticDelta != 0, innerRows > 0, innerCols > 0 else { return false }
+        guard !scrolls.isEmpty else { return true }
         guard !scrolls.contains(where: { delta in
             delta.cols != 0 || delta.rows == 0
                 || delta.top != top || delta.bottom != rows - bottom
@@ -135,29 +136,42 @@ struct SmoothViewportGeometry: Equatable {
     }
 }
 
-/// One logical line. Current rows share the authoritative full image through
-/// `contentsRect`; only outgoing history edges are detached into bounded,
-/// row-sized images so old full-grid generations are never retained.
-struct SharedImageRow {
+/// One immutable raster row (or a testing-only slice of a full image).
+/// Production scroll history retains row-sized images only.
+struct SharedImageRow: @unchecked Sendable {
     let image: CGImage
     let contentsRect: CGRect
     let sourceRow: Int
     let generation: UInt64
+    let token: RowImageToken
+    let retainsFullGridImage: Bool
 }
 
-struct ScrollDiagnosticSample: Sendable, Equatable {
-    let timestamp: CFTimeInterval
-    let gridID: Int
-    let delta: Int
-    let historyHead: Int
-    let position: CGFloat
-    let velocity: CGFloat
-    let cursorAuthoritativeY: CGFloat?
-    let cursorVisualY: CGFloat?
+package struct ScrollDiagnosticSample: Sendable, Equatable {
+    package let timestamp: CFTimeInterval
+    package let gridID: Int
+    package let delta: Int
+    package let historyHead: Int
+    package let position: CGFloat
+    package let velocity: CGFloat
+    package let cursorAuthoritativeY: CGFloat?
+    package let cursorVisualY: CGFloat?
 }
 
-/// A persistent, per-grid visual viewport. The normal grid layer always holds
-/// Neovim's final bitmap; this state only supplies continuous inter-frame rows.
+private struct RowLayerBinding: Equatable {
+    let token: RowImageToken
+    let contentsRect: CGRect
+}
+
+private struct VeilSnapshotSource: @unchecked Sendable {
+    let rows: [SharedImageRow]
+    let outputWidth: Int
+    let outputHeight: Int
+}
+
+/// Persistent per-grid row compositor. Exact authoritative row tiles are
+/// always installed; scrolling only rebinds a row when an integer boundary is
+/// crossed and translates one clipped container between those boundaries.
 @MainActor
 final class SmoothViewportState {
     let gridID: Int
@@ -169,36 +183,124 @@ final class SmoothViewportState {
     private(set) var lastSemanticDelta = 0
 
     private weak var hostLayer: CALayer?
+    private let baseLayer = CALayer()
     private let clipLayer = CALayer()
+    private let rowContainerLayer = CALayer()
+    private let veilLayer = CALayer()
+    private let glowLayer = CAGradientLayer()
+    private var baseRowLayers: [CALayer] = []
+    private var baseBindings: [RowLayerBinding?] = []
     private var rowLayers: [CALayer] = []
+    private var rowBindings: [RowLayerBinding?] = []
+    private var authoritativeRows: [SharedImageRow] = []
     private var cellSize: CGSize = .zero
     private var scale: CGFloat = 1
-    private var imageGeneration: UInt64 = 0
+    private var presentationGeneration: UInt64 = 0
     private var lastBoundFirstRow: Int?
-    private var lastBoundGeneration: UInt64 = .max
+    private var lastTranslationY: CGFloat = .nan
+    private var rowsNeedBinding = true
     private var hasAuthoritativeRows = false
+
+    private(set) var isVeilActive = false
+    private var veilElapsed: CFTimeInterval = 0
+    private var veilDirection = 0
+    private var cachedVeilImage: CGImage?
+    private var veilSnapshotTask: Task<Void, Never>?
+    private var veilSnapshotSerial: UInt64 = 0
+    private var lastVeilSnapshotRequest: CFTimeInterval = 0
+    private var receivedInputWhileClamped = false
+    private var clampedDisplayPeriods = 0
 
     init(gridID: Int) {
         self.gridID = gridID
-        disableActions(on: clipLayer)
-        clipLayer.masksToBounds = true
+        for layer in [baseLayer, clipLayer, rowContainerLayer, veilLayer, glowLayer] {
+            disableActions(on: layer)
+        }
+        baseLayer.zPosition = 0
         clipLayer.zPosition = 1
-        clipLayer.isHidden = true
+        clipLayer.masksToBounds = true
+        rowContainerLayer.zPosition = 0
+        veilLayer.zPosition = 2
+        veilLayer.contentsGravity = .resizeAspectFill
+        veilLayer.minificationFilter = .linear
+        veilLayer.magnificationFilter = .linear
+        veilLayer.isHidden = true
+        glowLayer.zPosition = 3
+        glowLayer.isHidden = true
+        let accent = NSColor.controlAccentColor.withAlphaComponent(1).cgColor
+        glowLayer.colors = [
+            NSColor.clear.cgColor, accent, NSColor.clear.cgColor,
+        ]
+        glowLayer.locations = [0, 0.5, 1]
+        glowLayer.startPoint = CGPoint(x: 0.5, y: 0)
+        glowLayer.endPoint = CGPoint(x: 0.5, y: 1)
+        clipLayer.addSublayer(rowContainerLayer)
+        clipLayer.addSublayer(veilLayer)
+        clipLayer.addSublayer(glowLayer)
     }
 
     var position: CGFloat { spring.position }
     var velocity: CGFloat { spring.velocity }
     var historyHead: Int { history.head }
+    /// Kept for source compatibility with the previous transient overlay.
+    /// It is now the permanent clipped exact-row viewport.
     var overlayLayer: CALayer { clipLayer }
     var visibleRowLayers: [CALayer] { rowLayers }
+    var translatedContainerLayer: CALayer { rowContainerLayer }
 
-    /// Install a final renderer image and, when eligible, add its semantic
-    /// viewport movement to the existing spring without resetting velocity.
+    /// Production entry point: install cached row-sized renderer revisions.
+    @discardableResult
+    func present(
+        rowSnapshots: [RenderedRowSnapshot], rows: Int, cols: Int,
+        margins: ViewportMargins?, scrolls: [ScrollDelta], semanticDelta: Int?,
+        cellSize: CGSize, scale: CGFloat, host: CALayer, animate: Bool
+    ) -> Bool {
+        let sourceRows = rowSnapshots.enumerated().map { row, snapshot in
+            SharedImageRow(
+                image: snapshot.image,
+                contentsRect: CGRect(x: 0, y: 0, width: 1, height: 1),
+                sourceRow: row, generation: snapshot.revision,
+                token: snapshot.token, retainsFullGridImage: false)
+        }
+        return present(
+            authoritativeRows: sourceRows, rows: rows, cols: cols,
+            margins: margins, scrolls: scrolls, semanticDelta: semanticDelta,
+            cellSize: cellSize, scale: scale, host: host, animate: animate)
+    }
+
+    /// Testing/snapshot compatibility. The application never takes this
+    /// full-grid path; outgoing slices are detached before entering history.
     @discardableResult
     func present(
         image: CGImage, rows: Int, cols: Int, margins: ViewportMargins?,
         scrolls: [ScrollDelta], semanticDelta: Int?, cellSize: CGSize,
         scale: CGFloat, host: CALayer, animate: Bool
+    ) -> Bool {
+        presentationGeneration &+= 1
+        let rowHeight = 1 / CGFloat(max(1, rows))
+        let sourceRows = (0..<max(0, rows)).map { row in
+            SharedImageRow(
+                image: image,
+                contentsRect: CGRect(
+                    x: 0, y: 1 - CGFloat(row + 1) * rowHeight,
+                    width: 1, height: rowHeight),
+                sourceRow: row, generation: presentationGeneration,
+                token: RowImageToken(
+                    backingID: UInt64.max &- presentationGeneration,
+                    revision: UInt64(row)),
+                retainsFullGridImage: true)
+        }
+        return present(
+            authoritativeRows: sourceRows, rows: rows, cols: cols,
+            margins: margins, scrolls: scrolls, semanticDelta: semanticDelta,
+            cellSize: cellSize, scale: scale, host: host, animate: animate)
+    }
+
+    @discardableResult
+    private func present(
+        authoritativeRows nextRows: [SharedImageRow], rows: Int, cols: Int,
+        margins: ViewportMargins?, scrolls: [ScrollDelta], semanticDelta: Int?,
+        cellSize: CGSize, scale: CGFloat, host: CALayer, animate: Bool
     ) -> Bool {
         let nextGeometry = SmoothViewportGeometry(rows: rows, cols: cols, margins: margins)
         let nextScale = max(1, scale)
@@ -211,19 +313,21 @@ final class SmoothViewportState {
             self.cellSize = cellSize
             self.scale = nextScale
             rebuildLayers()
-            settle()
-            seedCurrentRows(from: image)
-            // A resize or first image has no coherent predecessor to animate.
+            spring.settle()
+            isActive = false
+            deactivateVeil()
+            authoritativeRows = nextRows
+            bindAuthoritativeRows()
+            seedCurrentRows()
+            render(forceBindings: true)
+            scheduleVeilSnapshot()
             return false
         }
 
         let delta = semanticDelta ?? 0
         var eligible = animate && geometry.accepts(scrolls, semanticDelta: delta)
-        // Unsupported scroll shapes are deliberately atomic.  They must also
-        // terminate any older full-viewport tail; otherwise that stale row
-        // history would keep moving over the newly committed partial or
-        // horizontal scroll.
-        if !eligible, !scrolls.isEmpty || (semanticDelta != nil && delta != 0) {
+        let carriesMovement = !scrolls.isEmpty || (semanticDelta != nil && delta != 0)
+        if !eligible, carriesMovement {
             settle()
         }
 
@@ -231,71 +335,106 @@ final class SmoothViewportState {
             eligible = rotateForNewViewport(delta)
             if !eligible { settle() }
         }
-        seedCurrentRows(from: image)
 
-        guard eligible, hasAuthoritativeRows else {
-            if !isActive { hideOverlay() }
-            return false
+        authoritativeRows = nextRows
+        bindAuthoritativeRows()
+        seedCurrentRows()
+
+        if eligible, hasAuthoritativeRows {
+            lastSemanticDelta = delta
+            isActive = true
         }
-
-        lastSemanticDelta = delta
-        isActive = true
-        clipLayer.isHidden = false
-        render()
-        return true
+        render(forceBindings: false)
+        scheduleVeilSnapshot()
+        return eligible && hasAuthoritativeRows
     }
 
-    /// Integrate in bounded steps so a delayed main-thread frame cannot kick
-    /// the animation far past the trajectory sampled at normal refresh rates.
+    /// Integrate in <= 1/120-second steps. Only the latest analytical result
+    /// is rendered, so a delayed callback never causes obsolete layer commits.
     @discardableResult
-    func advance(by elapsed: CFTimeInterval) -> Bool {
-        guard isActive else { return false }
-        // A display link may stop while its view is hidden. One second is far
-        // beyond this spring's visible lifetime and bounds subdivision work
-        // when the window returns after minutes off-screen.
-        var remaining = min(max(0, elapsed), 1.0)
-        let maximumStep: CFTimeInterval = 1.0 / 120.0
-        while remaining > 0 {
-            let step = min(remaining, maximumStep)
-            spring.advance(by: step)
-            remaining -= step
+    func advance(
+        by elapsed: CFTimeInterval,
+        nominalDisplayPeriod: CFTimeInterval = 1.0 / 60.0
+    ) -> Bool {
+        guard isActive || isVeilActive else { return false }
+        let bounded = min(max(0, elapsed), 1.0)
+        let nominal = max(1.0 / 240.0, nominalDisplayPeriod)
+
+        if isActive, bounded >= nominal * 2, lastSemanticDelta != 0 {
+            activateVeil(direction: lastSemanticDelta.signum())
+        }
+        if receivedInputWhileClamped {
+            clampedDisplayPeriods += 1
+            if clampedDisplayPeriods >= 2, lastSemanticDelta != 0 {
+                activateVeil(direction: lastSemanticDelta.signum())
+            }
+        } else {
+            clampedDisplayPeriods = 0
+        }
+        receivedInputWhileClamped = false
+
+        if isActive {
+            var remaining = bounded
+            let maximumStep: CFTimeInterval = 1.0 / 120.0
+            while remaining > 0 {
+                let step = min(remaining, maximumStep)
+                spring.advance(by: step)
+                remaining -= step
+            }
+
+            let hasNoPixelResidual =
+                (spring.position * cellSize.height * scale).rounded() == 0
+            if spring.isSettled, hasNoPixelResidual {
+                spring.settle()
+                isActive = false
+                lastSemanticDelta = 0
+                discardNonCurrentHistory()
+            }
+            render(forceBindings: false)
         }
 
-        // Do not hide the history until its snapped presentation is already
-        // identical to the authoritative layer. A line-relative epsilon can
-        // still be a whole Retina pixel with large fonts.
-        let hasNoPixelResidual = (spring.position * cellSize.height * scale).rounded() == 0
-        if spring.isSettled, hasNoPixelResidual {
-            settle()
-            return false
-        }
-        render()
-        return true
+        advanceVeil(by: bounded)
+        return isActive || isVeilActive
     }
 
     func settle() {
         spring.settle()
         isActive = false
         lastSemanticDelta = 0
+        receivedInputWhileClamped = false
+        clampedDisplayPeriods = 0
         discardNonCurrentHistory()
-        hideOverlay()
+        deactivateVeil()
+        render(forceBindings: false)
     }
 
     func destroy() {
         settle()
+        veilSnapshotTask?.cancel()
+        veilSnapshotTask = nil
+        baseLayer.removeFromSuperlayer()
         clipLayer.removeFromSuperlayer()
         hostLayer = nil
         history.reset(capacity: 0)
+        baseRowLayers.removeAll()
         rowLayers.removeAll()
+        authoritativeRows.removeAll()
         hasAuthoritativeRows = false
     }
 
-    /// The no-snap invariant: when the overlay is hidden, every logical final
-    /// row must still select the exact CGImage installed on the base layer.
+    /// Legacy no-snap assertion used by the full-image compatibility tests.
     func currentRowsReference(_ image: CGImage) -> Bool {
         guard geometry.innerRows > 0 else { return true }
+        return (0..<geometry.innerRows).allSatisfy { history[$0]?.image === image }
+    }
+
+    /// Production no-snap assertion: every final logical row matches the
+    /// renderer's current immutable row revision.
+    func currentRowsMatch(_ snapshots: [RenderedRowSnapshot]) -> Bool {
+        guard snapshots.count == geometry.rows else { return false }
         return (0..<geometry.innerRows).allSatisfy { logicalRow in
-            history[logicalRow]?.image === image
+            let sourceRow = geometry.top + logicalRow
+            return history[logicalRow]?.token == snapshots[sourceRow].token
         }
     }
 
@@ -309,65 +448,65 @@ final class SmoothViewportState {
             cursorVisualY: cursorVisualY)
     }
 
+    // MARK: - History
+
     @discardableResult
     private func rotateForNewViewport(_ delta: Int) -> Bool {
-        let proposed = spring.position - CGFloat(delta)
-        let capacity = CGFloat(geometry.innerRows)
-        let far = abs(delta) > geometry.innerRows || abs(proposed) > capacity
-        let animatedDelta = far ? delta.signum() : delta
-        if far {
-            // Preserve just one old edge line to communicate direction; the
-            // unrelated bulk of a far jump is already authoritative beneath.
-            discardNonCurrentHistory()
-        }
+        let height = geometry.innerRows
+        guard height > 0, delta != 0 else { return false }
 
-        // The current viewport shares one full authoritative image. Before
-        // its edge rows rotate into history, detach only those rows into true
-        // row-sized images. This preserves reversal continuity without
-        // stranding one full-grid raster allocation per wheel tick.
+        let direction = delta.signum()
+        if isVeilActive, veilDirection != direction { deactivateVeil() }
+        let far = abs(delta) > height
+        let animatedDelta = far ? direction : delta
+        if far { discardNonCurrentHistory() }
+
         guard copyDisplacedRows(for: animatedDelta) else { return false }
         history.rotate(by: animatedDelta)
+
         if far {
             spring.position = -CGFloat(animatedDelta)
             spring.constrainVelocityTowardTarget()
+            activateVeil(direction: direction)
         } else {
-            spring.position = proposed
+            let proposed = spring.position - CGFloat(delta)
+            let capacity = CGFloat(height)
+            let bounded = min(capacity, max(-capacity, proposed))
+            receivedInputWhileClamped = receivedInputWhileClamped || bounded != proposed
+            spring.position = bounded
         }
-        // Deliberately preserve spring.velocity, including through reversal.
+        // Velocity is intentionally preserved, including through reversals
+        // and cumulative-debt clamping.
         return true
     }
 
     private func copyDisplacedRows(for delta: Int) -> Bool {
         let height = geometry.innerRows
         guard height > 0, delta != 0 else { return false }
-        let rows: Range<Int>
+        let displaced: Range<Int>
         if delta > 0 {
-            rows = 0..<min(delta, height)
+            displaced = 0..<min(delta, height)
         } else {
-            rows = max(0, height + delta)..<height
+            displaced = max(0, height + delta)..<height
         }
-        for logicalRow in rows {
-            guard let slice = history[logicalRow],
-                let detached = detachedRow(from: slice)
-            else { return false }
-            history[logicalRow] = detached
+        for logicalRow in displaced {
+            guard let slice = history[logicalRow] else { return false }
+            if slice.retainsFullGridImage {
+                guard let detached = detachedRow(from: slice) else { return false }
+                history[logicalRow] = detached
+            }
         }
         return true
     }
 
     private func detachedRow(from slice: SharedImageRow) -> SharedImageRow? {
-        if slice.contentsRect == CGRect(x: 0, y: 0, width: 1, height: 1) {
-            return slice
-        }
-
+        guard slice.retainsFullGridImage else { return slice }
         let imageWidth = CGFloat(slice.image.width)
         let imageHeight = CGFloat(slice.image.height)
         let x0 = max(0, min(slice.image.width,
             Int((slice.contentsRect.minX * imageWidth).rounded())))
         let x1 = max(x0, min(slice.image.width,
             Int((slice.contentsRect.maxX * imageWidth).rounded())))
-        // CALayer contentsRect is bottom-up, while CGImage cropping uses the
-        // renderer snapshot's top-down pixel coordinates.
         let y0 = max(0, min(slice.image.height,
             Int(((1 - slice.contentsRect.maxY) * imageHeight).rounded())))
         let y1 = max(y0, min(slice.image.height,
@@ -386,7 +525,8 @@ final class SmoothViewportState {
         guard let image = context.makeImage() else { return nil }
         return SharedImageRow(
             image: image, contentsRect: CGRect(x: 0, y: 0, width: 1, height: 1),
-            sourceRow: slice.sourceRow, generation: slice.generation)
+            sourceRow: slice.sourceRow, generation: slice.generation,
+            token: slice.token, retainsFullGridImage: false)
     }
 
     private func discardNonCurrentHistory() {
@@ -396,112 +536,293 @@ final class SmoothViewportState {
         }
     }
 
-    private func seedCurrentRows(from image: CGImage) {
-        guard geometry.innerRows > 0, geometry.innerCols > 0 else {
+    private func seedCurrentRows() {
+        guard geometry.innerRows > 0, geometry.innerCols > 0,
+            authoritativeRows.count == geometry.rows
+        else {
             hasAuthoritativeRows = false
             return
         }
-        imageGeneration &+= 1
-        let x = CGFloat(geometry.left) / CGFloat(max(1, geometry.cols))
-        let width = CGFloat(geometry.innerCols) / CGFloat(max(1, geometry.cols))
-        let rowHeight = 1 / CGFloat(max(1, geometry.rows))
         for logicalRow in 0..<geometry.innerRows {
             let sourceRow = geometry.top + logicalRow
-            history[logicalRow] = SharedImageRow(
-                image: image,
-                contentsRect: CGRect(
-                    // CALayer contentsRect uses bottom-up unit coordinates;
-                    // Neovim/GridRenderer rows are numbered from the top.
-                    x: x, y: 1 - CGFloat(sourceRow + 1) * rowHeight,
-                    width: width, height: rowHeight),
-                sourceRow: sourceRow, generation: imageGeneration)
+            history[logicalRow] = horizontalSlice(authoritativeRows[sourceRow])
         }
         hasAuthoritativeRows = true
+        rowsNeedBinding = true
     }
+
+    private func horizontalSlice(_ row: SharedImageRow) -> SharedImageRow {
+        guard geometry.cols > 0 else { return row }
+        let leftRatio = CGFloat(geometry.left) / CGFloat(geometry.cols)
+        let widthRatio = CGFloat(geometry.innerCols) / CGFloat(geometry.cols)
+        var rect = row.contentsRect
+        rect.origin.x += rect.width * leftRatio
+        rect.size.width *= widthRatio
+        return SharedImageRow(
+            image: row.image, contentsRect: rect, sourceRow: row.sourceRow,
+            generation: row.generation, token: row.token,
+            retainsFullGridImage: row.retainsFullGridImage)
+    }
+
+    // MARK: - Layers
 
     private func attach(to host: CALayer) {
         if hostLayer !== host {
+            baseLayer.removeFromSuperlayer()
             clipLayer.removeFromSuperlayer()
+            host.addSublayer(baseLayer)
             host.addSublayer(clipLayer)
             hostLayer = host
-        } else if clipLayer.superlayer == nil {
-            host.addSublayer(clipLayer)
+        } else {
+            if baseLayer.superlayer == nil { host.addSublayer(baseLayer) }
+            if clipLayer.superlayer == nil { host.addSublayer(clipLayer) }
         }
     }
 
     private func rebuildLayers() {
+        baseRowLayers.forEach { $0.removeFromSuperlayer() }
         rowLayers.forEach { $0.removeFromSuperlayer() }
-        rowLayers = []
+        baseRowLayers.removeAll()
+        rowLayers.removeAll()
+        baseBindings.removeAll()
+        rowBindings.removeAll()
         history.reset(capacity: geometry.innerRows * 2)
         hasAuthoritativeRows = false
         lastBoundFirstRow = nil
-        lastBoundGeneration = .max
+        lastTranslationY = .nan
+        rowsNeedBinding = true
+
+        let fullWidth = CGFloat(geometry.cols) * cellSize.width
+        let fullHeight = CGFloat(geometry.rows) * cellSize.height
+        baseLayer.frame = CGRect(x: 0, y: 0, width: fullWidth, height: fullHeight)
         clipLayer.frame = geometry.clipRect(cellSize: cellSize)
-        guard geometry.innerRows > 0, geometry.innerCols > 0 else { return }
-        for _ in 0...geometry.innerRows {
-            let row = CALayer()
-            disableActions(on: row)
-            row.contentsGravity = .resize
-            row.contentsScale = scale
-            row.isOpaque = true
-            clipLayer.addSublayer(row)
-            rowLayers.append(row)
+        clipLayer.isHidden = geometry.innerRows == 0 || geometry.innerCols == 0
+        rowContainerLayer.anchorPoint = .zero
+        rowContainerLayer.position = .zero
+        rowContainerLayer.bounds = CGRect(
+            x: 0, y: 0, width: clipLayer.bounds.width, height: clipLayer.bounds.height)
+        veilLayer.frame = clipLayer.bounds
+        glowLayer.frame = clipLayer.bounds
+
+        for row in 0..<geometry.rows {
+            let layer = makeRowLayer()
+            layer.frame = CGRect(
+                x: 0, y: fullHeight - CGFloat(row + 1) * cellSize.height,
+                width: fullWidth, height: cellSize.height)
+            baseLayer.addSublayer(layer)
+            baseRowLayers.append(layer)
+            baseBindings.append(nil)
+        }
+
+        let innerWidth = CGFloat(geometry.innerCols) * cellSize.width
+        let innerHeight = CGFloat(geometry.innerRows) * cellSize.height
+        if geometry.innerRows > 0, geometry.innerCols > 0 {
+            for index in 0...geometry.innerRows {
+                let layer = makeRowLayer()
+                layer.frame = CGRect(
+                    x: 0, y: innerHeight - CGFloat(index + 1) * cellSize.height,
+                    width: innerWidth, height: cellSize.height)
+                rowContainerLayer.addSublayer(layer)
+                rowLayers.append(layer)
+                rowBindings.append(nil)
+            }
         }
     }
 
-    private func render() {
-        guard isActive, !rowLayers.isEmpty else { return }
+    private func makeRowLayer() -> CALayer {
+        let row = CALayer()
+        disableActions(on: row)
+        row.contentsGravity = .resize
+        row.contentsScale = scale
+        row.isOpaque = true
+        return row
+    }
+
+    private func bindAuthoritativeRows() {
+        guard authoritativeRows.count == baseRowLayers.count else { return }
+        for row in authoritativeRows.indices {
+            bind(authoritativeRows[row], to: baseRowLayers[row], binding: &baseBindings[row])
+        }
+    }
+
+    private func render(forceBindings: Bool) {
+        guard hasAuthoritativeRows, !rowLayers.isEmpty else { return }
         let firstRow = Int(floor(spring.position))
-        if firstRow != lastBoundFirstRow || imageGeneration != lastBoundGeneration {
+        let needsBindings = forceBindings || rowsNeedBinding || firstRow != lastBoundFirstRow
+        if needsBindings, forceBindings || firstRow != lastBoundFirstRow {
+            rowBindings = [RowLayerBinding?](repeating: nil, count: rowLayers.count)
+        }
+        if needsBindings {
             for (index, layer) in rowLayers.enumerated() {
                 guard let slice = history[firstRow + index] else {
                     layer.contents = nil
                     layer.isHidden = true
+                    rowBindings[index] = nil
                     continue
                 }
-                layer.isHidden = false
-                layer.contents = slice.image
-                layer.contentsRect = slice.contentsRect
-                layer.contentsScale = scale
+                bind(slice, to: layer, binding: &rowBindings[index])
             }
-            lastBoundFirstRow = firstRow
-            lastBoundGeneration = imageGeneration
+            rowsNeedBinding = false
         }
+        lastBoundFirstRow = firstRow
 
-        let fractionalOffset = CGFloat(firstRow) - spring.position
-        let width = CGFloat(geometry.innerCols) * cellSize.width
-        let height = CGFloat(geometry.innerRows) * cellSize.height
-        for (index, layer) in rowLayers.enumerated() {
-            // CALayer sublayer coordinates are bottom-up even inside the
-            // flipped NSView hierarchy. Convert the desired top-down line
-            // position explicitly; relying on nested isGeometryFlipped flags
-            // double-flips the row order on a live AppKit-backed layer tree.
-            let y = pixelSnap(
-                height - (CGFloat(index) + fractionalOffset + 1) * cellSize.height,
-                scale: scale)
-            layer.frame = CGRect(x: 0, y: y, width: width, height: cellSize.height)
+        let translation = pixelSnap(
+            (spring.position - CGFloat(firstRow)) * cellSize.height, scale: scale)
+        if translation != lastTranslationY {
+            rowContainerLayer.setAffineTransform(
+                CGAffineTransform(translationX: 0, y: translation))
+            lastTranslationY = translation
         }
+        clipLayer.isHidden = false
     }
 
-    private func hideOverlay() {
-        clipLayer.isHidden = true
-        lastBoundFirstRow = nil
-        lastBoundGeneration = .max
-        for layer in rowLayers {
-            layer.contents = nil
-            layer.isHidden = true
-        }
+    private func bind(
+        _ row: SharedImageRow, to layer: CALayer,
+        binding: inout RowLayerBinding?
+    ) {
+        let next = RowLayerBinding(token: row.token, contentsRect: row.contentsRect)
+        guard binding != next || layer.isHidden else { return }
+        layer.isHidden = false
+        layer.contents = row.image
+        layer.contentsRect = row.contentsRect
+        layer.contentsScale = scale
+        binding = next
     }
 
     private func pixelSnap(_ value: CGFloat, scale: CGFloat) -> CGFloat {
         (value * max(1, scale)).rounded() / max(1, scale)
     }
 
+    // MARK: - Adaptive velocity veil
+
+    private func activateVeil(direction: Int) {
+        guard direction != 0 else { return }
+        if isVeilActive, veilDirection == direction { return }
+        if isVeilActive { deactivateVeil() }
+        isVeilActive = true
+        veilDirection = direction
+        veilElapsed = 0
+        clampedDisplayPeriods = 0
+        veilLayer.contents = cachedVeilImage
+        veilLayer.opacity = 0
+        veilLayer.isHidden = false
+        glowLayer.opacity = 0
+        glowLayer.isHidden = false
+    }
+
+    private func advanceVeil(by elapsed: CFTimeInterval) {
+        guard isVeilActive else { return }
+        veilElapsed += elapsed
+        let fadeIn: CFTimeInterval = 1.0 / 60.0
+        // Exact row revisions are already beneath the veil. Once its first
+        // display-period fade-in is visible, begin the requested 50 ms exit.
+        let fadeOutStart = fadeIn
+        let hardLimit = min(0.150, fadeOutStart + 0.050)
+        if veilElapsed >= hardLimit {
+            deactivateVeil()
+            return
+        }
+
+        let alpha: CGFloat
+        if veilElapsed < fadeIn {
+            alpha = CGFloat(veilElapsed / fadeIn)
+        } else if veilElapsed <= fadeOutStart {
+            alpha = 1
+        } else {
+            alpha = CGFloat((hardLimit - veilElapsed) / (hardLimit - fadeOutStart))
+        }
+        let progress = CGFloat(min(1, veilElapsed / hardLimit))
+        let offset = CGFloat(veilDirection) * cellSize.height * 0.75 * progress
+        veilLayer.opacity = Float(0.68 * alpha)
+        veilLayer.setAffineTransform(
+            CGAffineTransform(translationX: 0, y: offset).scaledBy(x: 1.015, y: 1.015))
+        glowLayer.opacity = Float(0.08 * alpha)
+        glowLayer.setAffineTransform(CGAffineTransform(
+            translationX: 0,
+            y: CGFloat(veilDirection) * clipLayer.bounds.height * (progress - 0.5)))
+    }
+
+    private func deactivateVeil() {
+        isVeilActive = false
+        veilElapsed = 0
+        veilDirection = 0
+        veilLayer.isHidden = true
+        veilLayer.opacity = 0
+        veilLayer.setAffineTransform(.identity)
+        glowLayer.isHidden = true
+        glowLayer.opacity = 0
+        glowLayer.setAffineTransform(.identity)
+    }
+
+    /// Keep a throttled quarter-resolution exact snapshot ready. Composition
+    /// occurs away from the main actor and only immutable CGImages cross the
+    /// boundary; activation itself is a cheap contents/transform update.
+    private func scheduleVeilSnapshot() {
+        guard geometry.innerRows > 0, geometry.innerCols > 0,
+            (0..<geometry.innerRows).allSatisfy({ history[$0] != nil })
+        else { return }
+        let now = CACurrentMediaTime()
+        guard now - lastVeilSnapshotRequest >= 0.080 || cachedVeilImage == nil else { return }
+        lastVeilSnapshotRequest = now
+        veilSnapshotSerial &+= 1
+        let serial = veilSnapshotSerial
+        let rows = (0..<geometry.innerRows).compactMap { history[$0] }
+        let width = max(1, Int(
+            CGFloat(geometry.innerCols) * cellSize.width * scale / 4))
+        let height = max(1, Int(
+            CGFloat(geometry.innerRows) * cellSize.height * scale / 4))
+        let source = VeilSnapshotSource(
+            rows: rows, outputWidth: width, outputHeight: height)
+        veilSnapshotTask?.cancel()
+        veilSnapshotTask = Task.detached(priority: .utility) { [weak self] in
+            let image = Self.makeVeilSnapshot(source)
+            guard !Task.isCancelled else { return }
+            await MainActor.run { [weak self] in
+                guard let self, self.veilSnapshotSerial == serial else { return }
+                self.cachedVeilImage = image
+                // Do not replace the old-frame bridge with a newer exact
+                // snapshot while it is visibly fading out.
+                if self.isVeilActive, self.veilLayer.contents == nil {
+                    self.veilLayer.contents = image
+                }
+            }
+        }
+    }
+
+    nonisolated private static func makeVeilSnapshot(
+        _ source: VeilSnapshotSource
+    ) -> CGImage? {
+        guard let context = GridRenderer.makeContext(
+            width: source.outputWidth, height: source.outputHeight, scale: 1),
+            !source.rows.isEmpty
+        else { return nil }
+        context.setBlendMode(.copy)
+        context.interpolationQuality = .low
+        let rowHeight = CGFloat(source.outputHeight) / CGFloat(source.rows.count)
+        for (index, row) in source.rows.enumerated() {
+            let width = CGFloat(row.image.width)
+            let height = CGFloat(row.image.height)
+            let crop = CGRect(
+                x: row.contentsRect.minX * width,
+                y: (1 - row.contentsRect.maxY) * height,
+                width: row.contentsRect.width * width,
+                height: row.contentsRect.height * height).integral
+            guard crop.width > 0, crop.height > 0,
+                let image = row.image.cropping(to: crop)
+            else { continue }
+            context.draw(image, in: CGRect(
+                x: 0,
+                y: CGFloat(source.rows.count - index - 1) * rowHeight,
+                width: CGFloat(source.outputWidth), height: rowHeight))
+        }
+        return context.makeImage()
+    }
+
     private func disableActions(on layer: CALayer) {
         layer.actions = [
-            "position": NSNull(), "bounds": NSNull(), "contents": NSNull(),
-            "contentsRect": NSNull(), "hidden": NSNull(), "transform": NSNull(),
-            "opacity": NSNull(), "sublayers": NSNull(),
+            "position": NSNull(), "bounds": NSNull(), "frame": NSNull(),
+            "contents": NSNull(), "contentsRect": NSNull(), "hidden": NSNull(),
+            "transform": NSNull(), "opacity": NSNull(), "sublayers": NSNull(),
         ]
     }
 }

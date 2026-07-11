@@ -176,7 +176,7 @@ Events applied (the full `ext_linegrid` + `ext_multigrid` vocabulary):
 | `grid_resize`, `grid_clear`, `grid_destroy` | structure |
 | `hl_attr_define`, `default_colors_set`, `hl_group_set` | highlight table: fg/bg/special color, bold/italic/underline(+curl/dot/dash), strikethrough, reverse, blend |
 | `grid_line` | write cell runs, mark damage |
-| `grid_scroll` | move rows within the grid **and record a scroll delta** so the renderer can blit instead of redraw (§6) |
+| `grid_scroll` | rotate row-COW model storage and record a scroll delta so the row renderer can rotate cached tiles (§6) |
 | `grid_cursor_goto` | cursor grid+position |
 | `win_pos`, `win_float_pos`, `win_hide`, `win_close`, `msg_set_pos` | window geometry & z-order |
 | `win_viewport` | scrollbar model: per-window native overlay scrollers |
@@ -225,23 +225,30 @@ fall out for free:
   never invalidates a pixel of another.
 - **Z-order is `zPosition`.** No painter's-algorithm bookkeeping.
 
-### GridLayer: backing store + blit scrolling
+### GridLayer: row tiles + display-linked scrolling
 
-Each `GridLayer` owns a Retina-scaled bitmap backing store
-(`CGContext`, `contentsScale = backingScaleFactor`) the size of its grid.
+Each `GridLayer` owns Retina-scaled, row-sized bitmap contexts. Immutable
+`CGImage` row revisions are shared by the authoritative layer tree and a
+two-viewport circular history; normal scrolling never snapshots or uploads a
+full-grid image.
 
 Per flush, for each damaged grid:
 
-1. **Scroll deltas first.** `grid_scroll` becomes a self-blit: copy the
-   surviving rectangle within the backing store, shifted by `rows × cellHeight`
-   (double-buffer ping-pong to keep overlapping copies well-defined). This is
-   the terminal-emulator trick that makes scrolling cheap: a memcpy-speed move,
-   then only the newly exposed rows rasterize.
-2. **Rasterize damaged spans** (§6) into the backing store.
-3. **Present**: `layer.contents = context.makeImage()` (copy-on-write CGImage —
-   cheap snapshot), inside a single `CATransaction` with actions disabled,
-   covering *all* grids. One flush → one atomic commit → Core Animation
-   composites on the GPU.
+1. **Rotate row references.** A compatible vertical `grid_scroll` reorders
+   row backings and recycles the rows that left the viewport. Cached outgoing
+   images remain immutable through Core Graphics COW.
+2. **Rasterize only damaged rows/spans** (§6). Horizontal or conflicting
+   partial regions repaint their affected rows atomically from the final Grid
+   model.
+3. **Present exact row revisions.** Margins remain in stationary row layers;
+   the inner viewport uses `height + 1` recyclable layers in a clipped
+   container. A critically damped spring translates that one container,
+   pixel-snapped at Retina scale. Row contents rebind only at integer-line
+   crossings or when their authoritative revision changes.
+4. **Coalesce to display cadence.** The first idle scroll presents
+   immediately. While motion is active, compatible Neovim flushes accumulate
+   in GridKit and are consumed once at the next shared display callback. No
+   protocol event or input is dropped; non-scroll frames drain immediately.
 
 Why this shape and not the alternatives:
 
@@ -249,10 +256,10 @@ Why this shape and not the alternatives:
   on large windows; no per-window compositing. Rejected.
 - **`CATiledLayer`** — asynchronous tile draws cause visible pop-in; built for
   maps, not editors. Rejected.
-- **One CALayer per row** — makes scrolling a pure layer-reposition (zero
-  raster) and is the planned **post-v1 optimization** for the common
-  full-width vertical scroll; the bitmap store remains the correctness
-  fallback for partial-region updates. Not needed to hit budgets in v1.
+- **One full-grid bitmap plus scroll blits** — correct, but fast momentum
+  repeatedly snapshots, blits, and uploads the entire surface on the main
+  thread. Replaced by bounded row tiles; full-image composition remains an
+  on-demand test/screenshot fallback.
 
 ### Resize & metrics
 
@@ -307,8 +314,10 @@ backing store:
   layer* — the grid underneath stays untouched.
 - Blink via `CAKeyframeAnimation` (no timers, no main-thread wakeups); blink
   suppressed while typing.
-- Optional smooth cursor motion (Neovide-style) as an implicit-animation on
-  `position` — off by default, it's a taste setting.
+- During display-linked viewport motion, cursor Y uses the same residual
+  offset and clamps to the nearest inner edge. Authoritative cursor changes
+  preserve its visual position with a short correction spring; scroll-only
+  frames never restart blink.
 - `busy_start`/`busy_stop` hide/show the cursor.
 
 ### Performance budgets
@@ -423,13 +432,12 @@ vim.keymap.set({ "n", "v" }, "<D-c>", '"+y')  -- etc.
   with per-grid coordinates (multigrid gives us the right window for free).
   Double/triple-click counts pass through (`:h mouse` word/line selection).
 - **Trackpad scrolling with momentum:** `scrollWheel` deltas accumulate in
-  fractional cell units per axis; each whole cell crossed emits a wheel event
-  on the grid under the pointer. Momentum phase just keeps feeding the
-  accumulator — nvim scrolls with real inertia, in whole lines. (A
-  pixel-smooth sub-cell prototype — history margins + contentsRect window +
-  a pixel/line control loop — was built and deliberately removed: the
-  latency-absorption feel wasn't acceptable. Whole-line scrolling is the
-  design.)
+  fractional cell units per axis; each whole cell crossed remains an exact
+  Neovim wheel notification. Adjacent repeats share one ordered pipe write.
+  Neovim stays authoritative while SurfaceKit reconciles its discrete
+  viewport rows through retained exact row history and a display-linked
+  spring. A brief low-resolution velocity veil appears only when a true jump
+  exceeds retained history; Reduce Motion presents atomically.
 - **Pinch to zoom** (`magnify(with:)`) adjusts `guifont` size through the same
   `option_set` path — metrics, resize, persist.
 - Force-click on a word → LSP hover/definition via the runtime plugin

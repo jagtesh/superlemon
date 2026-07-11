@@ -33,6 +33,11 @@ private actor ExitBox {
     func set(_ e: NvimSession.LifecycleEvent) { event = e }
 }
 
+private actor NotificationSink {
+    private(set) var notifications: [NvimSession.Notification] = []
+    func add(_ notification: NvimSession.Notification) { notifications.append(notification) }
+}
+
 /// Full text of a gridLine event with repeats expanded.
 private func lineText(_ event: UIEvent) -> String? {
     guard case .gridLine(_, _, _, let cells, _) = event else { return nil }
@@ -105,6 +110,89 @@ private func lineText(_ event: UIEvent) -> String? {
         }
         #expect(code == 3)
         #expect(tail.contains("bye"))
+    }
+
+    @Test func notificationBatchPreservesFrameOrder() async throws {
+        // cat echoes our one contiguous write back to the session decoder. If
+        // the concatenated MessagePack frames are malformed or reordered, the
+        // notification stream will not reproduce this batch exactly.
+        let session = NvimSession(
+            configuration: NvimLaunchConfiguration(
+                binaryURL: URL(fileURLWithPath: "/bin/cat"), arguments: []))
+        let sink = NotificationSink()
+        let watcher = Task {
+            for await notification in session.notifications {
+                await sink.add(notification)
+            }
+        }
+        defer {
+            watcher.cancel()
+            Task { await session.terminate() }
+        }
+
+        try await session.start()
+        await session.notifyBatch([
+            .init(method: "first", params: [.string("a")]),
+            .init(method: "second", params: [.int(2)], repeatCount: 3),
+            .init(method: "third", params: [.bool(true)]),
+        ])
+
+        try await waitUntil { await sink.notifications.count == 5 }
+        let received = await sink.notifications
+        #expect(received.map(\.method) == [
+            "first", "second", "second", "second", "third",
+        ])
+        #expect(received.map(\.params) == [
+            [.string("a")], [.int(2)], [.int(2)], [.int(2)], [.bool(true)],
+        ])
+    }
+
+    @Test func inputCommandsKeepRepeatsSemanticAndFIFOOrdered() {
+        let commands: [NvimInputCommand] = [
+            .keys("i"),
+            .mouse(
+                button: "wheel", action: "down", modifier: "S",
+                grid: 3, row: 7, col: 11, repeatCount: 3),
+            .keys("<Esc>"),
+        ]
+
+        let notifications = commands.flatMap(\.notifications)
+        #expect(notifications.map(\.method) == [
+            "nvim_input", "nvim_input_mouse", "nvim_input",
+        ])
+        #expect(notifications.first?.params == [.string("i")])
+        #expect(notifications.last?.params == [.string("<Esc>")])
+        #expect(notifications[1].repeatCount == 3)
+
+        let expectedMouseParams: [Value] = [
+            .string("wheel"), .string("down"), .string("S"),
+            .int(3), .int(7), .int(11),
+        ]
+        #expect(notifications[1].params == expectedMouseParams)
+
+        let empty = NvimInputCommand.mouse(
+            button: "wheel", action: "up", modifier: "",
+            grid: 1, row: 0, col: 0, repeatCount: 0)
+        #expect(empty.notifications.isEmpty)
+
+        let first = NvimInputCommand.mouse(
+            button: "wheel", action: "down", modifier: "",
+            grid: 1, row: 2, col: 3, repeatCount: 4)
+        let second = NvimInputCommand.mouse(
+            button: "wheel", action: "down", modifier: "",
+            grid: 1, row: 2, col: 3, repeatCount: 5)
+        #expect(first.coalesced(with: second) == .mouse(
+            button: "wheel", action: "down", modifier: "",
+            grid: 1, row: 2, col: 3, repeatCount: 9))
+        #expect(first.coalesced(with: .keys("x")) == nil)
+
+        let resize = NvimInputCommand.resize(cols: 120, rows: 40)
+        #expect(resize.notifications == [
+            .init(method: "nvim_ui_try_resize", params: [.int(120), .int(40)])
+        ])
+        #expect(resize.coalesced(with: .resize(cols: 121, rows: 41))
+            == .resize(cols: 121, rows: 41))
+        #expect(NvimInputCommand.paste("hello").notifications.isEmpty)
     }
 }
 

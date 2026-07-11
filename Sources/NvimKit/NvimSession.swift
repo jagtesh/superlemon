@@ -66,6 +66,21 @@ public actor NvimSession {
         public let params: [Value]
     }
 
+    /// One fire-and-forget notification destined for nvim. Package scope
+    /// keeps the batching surface available to the app without making it part
+    /// of NvimKit's public API.
+    package struct OutgoingNotification: Sendable, Equatable {
+        package let method: String
+        package let params: [Value]
+        package let repeatCount: Int
+
+        package init(method: String, params: [Value], repeatCount: Int = 1) {
+            self.method = method
+            self.params = params
+            self.repeatCount = max(0, repeatCount)
+        }
+    }
+
     /// Decoded `redraw` batches. A batch whose last event is `.flush` is a
     /// complete, presentable frame. Single-consumer.
     public nonisolated let uiEvents: AsyncStream<RedrawBatch>
@@ -200,8 +215,41 @@ public actor NvimSession {
 
     /// Fire-and-forget notification (used for all input).
     public func notify(_ method: String, _ params: [Value]) {
-        guard case .running = state else { return }
-        send(.notification(method: method, params: params))
+        notifyBatch([.init(method: method, params: params)])
+    }
+
+    /// Write an ordered notification batch as one contiguous pipe payload.
+    /// MessagePack-RPC is self-framing, so concatenating complete notification
+    /// values preserves the exact wire sequence while avoiding one dispatch
+    /// and `FileHandle.write` per wheel line.
+    package func notifyBatch(_ notifications: [OutgoingNotification]) {
+        guard case .running = state, !notifications.isEmpty else { return }
+
+        var frames: [(bytes: [UInt8], count: Int)] = []
+        var byteCount = 0
+        for notification in notifications {
+            guard notification.repeatCount > 0 else { continue }
+            let encoded = MsgpackEncoder.encode(
+                RPCMessage.notification(
+                    method: notification.method,
+                    params: notification.params
+                ).encoded)
+            let (frameBytes, overflow) = encoded.count.multipliedReportingOverflow(
+                by: notification.repeatCount)
+            guard !overflow else { return }
+            let (newByteCount, sumOverflow) = byteCount.addingReportingOverflow(frameBytes)
+            guard !sumOverflow else { return }
+            byteCount = newByteCount
+            frames.append((encoded, notification.repeatCount))
+        }
+        guard byteCount > 0 else { return }
+
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(byteCount)
+        for frame in frames {
+            for _ in 0..<frame.count { bytes.append(contentsOf: frame.bytes) }
+        }
+        writer?.write(bytes)
     }
 
     // MARK: Attach & handshake

@@ -59,6 +59,13 @@ final class NvimController {
     private var terminationPending = false
     private var quitRequestInFlight = false
 
+    /// Keyboard, mouse, paste, and resize traffic share one main-actor queue.
+    /// A single drain preserves call order and batches adjacent notifications
+    /// into serialized pipe writes without pacing input.
+    private var pendingInputCommands: [NvimInputCommand] = []
+    private var inputDrainTask: Task<Void, Never>?
+    private var inputReady = false
+
     // MARK: - Startup
 
     /// Spawn nvim, handshake, attach the UI, and start the consumption loops.
@@ -126,6 +133,8 @@ final class NvimController {
                     "rgb": .bool(true),
                 ])
             attached = true
+            inputReady = true
+            scheduleInputDrainIfNeeded()
             // The view may have been laid out while attaching.
             sendResizeIfNeeded()
             await bootstrapRuntimePlugin(session)
@@ -300,6 +309,7 @@ final class NvimController {
 
     private func handleStartupFailure(_ error: Error) {
         sessionExited = true  // lets the quit flow terminate immediately
+        resetInputQueue()
         let message = String(describing: error)
         if let startupFailureHandler {
             startupFailureHandler(message)
@@ -320,14 +330,28 @@ final class NvimController {
         uiTask = Task { [weak self] in
             for await batch in session.uiEvents {
                 guard let self else { return }
-                // Chrome sees the same batch before flush is acted on, so
-                // grid and chrome present one consistent frame (WIRING.md §1).
+                // Chrome consumes every batch in wire order. Compatible grid
+                // scroll frames may coalesce to the next display opportunity,
+                // but the authoritative model never drops an event.
                 self.chrome?.apply(batch)
-                if let flush = self.store.apply(batch) {
-                    self.handleFlush(flush)
+                switch self.store.applyDeferred(batch) {
+                case .none:
+                    break
+                case .immediate:
+                    self.drainPendingPresentation()
+                case .displayLinked:
+                    let scheduled = self.surface?.schedulePresentationOnNextDisplay {
+                        [weak self] in self?.drainPendingPresentation()
+                    } ?? false
+                    if !scheduled { self.drainPendingPresentation() }
                 }
             }
         }
+    }
+
+    private func drainPendingPresentation() {
+        guard let flush = store.consumePendingPresentation() else { return }
+        handleFlush(flush)
     }
 
     /// superlemon.* rpcnotify traffic from the runtime plugin → chrome.
@@ -448,6 +472,7 @@ final class NvimController {
 
     private func handleSessionExit(code: Int32, stderrTail: String) {
         sessionExited = true
+        resetInputQueue()
         if let exitHandler {
             exitHandler(code, stderrTail)
             return
@@ -644,16 +669,12 @@ final class NvimController {
     }
 
     private func sendResizeIfNeeded(force: Bool = false) {
-        guard attached, let session, let surface else { return }
+        guard attached, let surface else { return }
         let size = surface.gridSize
         guard size.rows > 0, size.cols > 0 else { return }
         guard force || size != lastSentGridSize else { return }
         lastSentGridSize = size
-        Task {
-            await session.notify(
-                "nvim_ui_try_resize",
-                [.int(Int64(size.cols)), .int(Int64(size.rows))])
-        }
+        enqueueInput(.resize(cols: size.cols, rows: size.rows))
     }
 
     // MARK: - Input plumbing (used by InputHostView / menu actions)
@@ -662,21 +683,72 @@ final class NvimController {
 
     /// Fire-and-forget `nvim_input` (already in nvim key notation / escaped).
     func sendInput(_ keys: String) {
-        guard let session else { return }
-        Task { await session.notify("nvim_input", [.string(keys)]) }
+        enqueueInput(.keys(keys))
     }
 
     /// Fire-and-forget `nvim_input_mouse`.
-    func sendMouse(button: String, action: String, modifier: String, grid: Int, row: Int, col: Int) {
-        guard let session else { return }
-        Task {
-            await session.notify(
-                "nvim_input_mouse",
-                [
-                    .string(button), .string(action), .string(modifier),
-                    .int(Int64(grid)), .int(Int64(row)), .int(Int64(col)),
-                ])
+    func sendMouse(
+        button: String, action: String, modifier: String,
+        grid: Int, row: Int, col: Int, repeatCount: Int = 1
+    ) {
+        guard repeatCount > 0 else { return }
+        enqueueInput(
+            .mouse(
+                button: button, action: action, modifier: modifier,
+                grid: grid, row: row, col: col, repeatCount: repeatCount))
+    }
+
+    private func enqueueInput(_ command: NvimInputCommand) {
+        guard !sessionExited else { return }
+        if let last = pendingInputCommands.last,
+            let merged = last.coalesced(with: command)
+        {
+            pendingInputCommands[pendingInputCommands.count - 1] = merged
+        } else {
+            pendingInputCommands.append(command)
         }
+        scheduleInputDrainIfNeeded()
+    }
+
+    private func scheduleInputDrainIfNeeded() {
+        guard inputReady, session != nil, !pendingInputCommands.isEmpty,
+            inputDrainTask == nil
+        else { return }
+        inputDrainTask = Task { [weak self] in
+            await self?.drainInputQueue()
+        }
+    }
+
+    private func drainInputQueue() async {
+        defer { inputDrainTask = nil }
+
+        while !Task.isCancelled, inputReady, let session,
+            !pendingInputCommands.isEmpty
+        {
+            let commands = pendingInputCommands
+            pendingInputCommands.removeAll(keepingCapacity: true)
+            var notifications: [NvimSession.OutgoingNotification] = []
+            for command in commands {
+                if case .paste(let text) = command {
+                    if !notifications.isEmpty {
+                        await session.notifyBatch(notifications)
+                        notifications.removeAll(keepingCapacity: true)
+                    }
+                    _ = try? await session.request(
+                        "nvim_paste", [.string(text), .bool(true), .int(-1)])
+                } else {
+                    notifications.append(contentsOf: command.notifications)
+                }
+            }
+            if !notifications.isEmpty { await session.notifyBatch(notifications) }
+        }
+    }
+
+    private func resetInputQueue() {
+        inputReady = false
+        inputDrainTask?.cancel()
+        inputDrainTask = nil
+        pendingInputCommands.removeAll(keepingCapacity: false)
     }
 
     /// ⌘= / ⌘- / ⌘0 via superlemon.font: bump the guifont size or reset.
@@ -807,13 +879,9 @@ final class NvimController {
 
     /// ⌘V: `nvim_paste` of the pasteboard string, single phase (-1).
     func pasteFromPasteboard() {
-        guard let session,
-            let text = NSPasteboard.general.string(forType: .string),
+        guard let text = NSPasteboard.general.string(forType: .string),
             !text.isEmpty
         else { return }
-        Task {
-            _ = try? await session.request(
-                "nvim_paste", [.string(text), .bool(true), .int(-1)])
-        }
+        enqueueInput(.paste(text))
     }
 }

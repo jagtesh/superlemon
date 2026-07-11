@@ -1,6 +1,7 @@
 import AppKit
 import GridKit
 import QuartzCore
+import os.signpost
 
 private final class WorkspaceNotificationToken: @unchecked Sendable {
     let center: NotificationCenter
@@ -10,6 +11,33 @@ private final class WorkspaceNotificationToken: @unchecked Sendable {
         self.value = value
     }
     deinit { center.removeObserver(value) }
+}
+
+private struct ScrollDiagnosticRing {
+    private let capacity: Int
+    private var storage: [ScrollDiagnosticSample] = []
+    private var nextIndex = 0
+
+    init(capacity: Int) { self.capacity = max(1, capacity) }
+
+    mutating func append(_ sample: ScrollDiagnosticSample) {
+        if storage.count < capacity {
+            storage.append(sample)
+        } else {
+            storage[nextIndex] = sample
+            nextIndex = (nextIndex + 1) % capacity
+        }
+    }
+
+    var ordered: [ScrollDiagnosticSample] {
+        guard storage.count == capacity, nextIndex != 0 else { return storage }
+        return Array(storage[nextIndex...]) + Array(storage[..<nextIndex])
+    }
+
+    mutating func removeAll() {
+        storage.removeAll(keepingCapacity: true)
+        nextIndex = 0
+    }
 }
 
 /// Font + spacing configuration for the surface. `name == nil` means the
@@ -115,9 +143,11 @@ public final class GridSurfaceView: NSView {
         )
     }
 
-    /// Present one atomic frame: apply scroll blits in order, repaint damaged
-    /// spans, update layers and cursor — one CATransaction (DESIGN §5).
+    /// Present one atomic frame: rotate/repaint row tiles, update layers and
+    /// cursor, and commit them in one disabled-actions CATransaction.
     public func present(_ flush: FlushResult) {
+        // A direct/immediate present supersedes an older display-linked drain.
+        scheduledDisplayPresentation = nil
         lastFlush = flush
         commit(flush, redrawAll: false)
     }
@@ -189,7 +219,7 @@ public final class GridSurfaceView: NSView {
         guard newScale != scale else { return }
         settleSmoothMotion(destroyHistory: true)
         scale = newScale
-        for renderer in renderers.values { renderer.setScale(newScale) }
+        for renderer in renderers.values { renderer.setScale(newScale, rerender: false) }
         if let flush = lastFlush { commit(flush, redrawAll: true) }
     }
 
@@ -208,6 +238,8 @@ public final class GridSurfaceView: NSView {
     private var accessibilityObserver: WorkspaceNotificationToken?
     private var animationDisplayLink: CADisplayLink?
     private var lastDisplayTimestamp: CFTimeInterval?
+    private var scheduledDisplayPresentation: (@MainActor () -> Void)?
+    private var isInsideDisplayTick = false
 
     private var authoritativeCursorY: CGFloat?
     private var authoritativeCursorRow: Int?
@@ -217,9 +249,38 @@ public final class GridSurfaceView: NSView {
     private var cursorCorrectionActive = false
 
     /// Internal hook used by deterministic tests and opt-in field diagnostics.
-    var scrollDiagnosticHandler: ((ScrollDiagnosticSample) -> Void)?
+    package var scrollDiagnosticHandler: ((ScrollDiagnosticSample) -> Void)?
     private let environmentDiagnosticsEnabled =
         ProcessInfo.processInfo.environment["SUPERLEMON_SCROLL_TRACE"] == "1"
+    private var diagnosticRing = ScrollDiagnosticRing(capacity: 2_048)
+    private static let scrollSignpostLog = OSLog(
+        subsystem: "com.superlemon.editor", category: "Scroll")
+
+    /// Queue one accumulated model presentation for the next shared display
+    /// callback. Returning false preserves immediate first-scroll response and
+    /// lets the caller drain synchronously. Replacing an action is intentional:
+    /// GridStore keeps accumulating authoritative state until it is consumed.
+    package func schedulePresentationOnNextDisplay(
+        _ action: @escaping @MainActor () -> Void
+    ) -> Bool {
+        guard scrollMotionStyle == .tightNative, !reducedMotion,
+            animationDisplayLink != nil,
+            smoothViewports.values.contains(where: { $0.isActive || $0.isVeilActive })
+        else { return false }
+        scheduledDisplayPresentation = action
+        resumeDisplayLink()
+        return true
+    }
+
+    /// Bounded, allocation-stable diagnostic history. Unlike the former
+    /// stderr trace this performs no synchronous I/O during a gesture.
+    package var recordedScrollDiagnostics: [ScrollDiagnosticSample] {
+        diagnosticRing.ordered
+    }
+
+    package func resetScrollDiagnostics() {
+        diagnosticRing.removeAll()
+    }
 
     private func commit(_ flush: FlushResult, redrawAll: Bool) {
         let outer = flush.grids[1]
@@ -228,20 +289,21 @@ public final class GridSurfaceView: NSView {
             grids: flush.grids)
         lastFrames = frames
 
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        defer { CATransaction.commit() }
+        let ownsTransaction = !isInsideDisplayTick
+        if ownsTransaction {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+        }
+        defer { if ownsTransaction { CATransaction.commit() } }
 
         layer?.backgroundColor = flush.highlights.defaultBackground.cgColor
 
-        // 1. Update backing stores. These final Neovim pixels remain installed
-        // throughout motion and are never replaced by an animation snapshot.
+        // 1. Update row backing stores. Compatible vertical motion rotates
+        // immutable row revisions and rasterizes only exposed/damaged rows.
         var updatedContents: Set<Int> = []
         if redrawAll {
             for (id, grid) in flush.grids {
-                renderer(for: id).apply(
-                    grid: grid, damage: DamageMap(), highlights: flush.highlights)
-                renderers[id]?.renderFullFromLastState()
+                renderer(for: id).renderFull(grid: grid, highlights: flush.highlights)
                 updatedContents.insert(id)
             }
         } else {
@@ -270,25 +332,26 @@ public final class GridSurfaceView: NSView {
                 width: CGFloat(frame.rect.width) * cw,
                 height: CGFloat(frame.rect.height) * ch)
             gridLayer.zPosition = CGFloat(frame.zIndex)
+            gridLayer.backgroundColor = flush.highlights.defaultBackground.cgColor
             let hasViewportDelta = flush.viewportScrollDeltas[frame.gridID] != nil
             if updatedContents.contains(frame.gridID) || hasViewportDelta,
-                let image = renderers[frame.gridID]?.image()
+                let rowSnapshots = renderers[frame.gridID]?.rowSnapshots()
             {
-                gridLayer.contents = image
-                gridLayer.contentsScale = scale
+                // The normal compositor never uploads a full-grid image.
+                gridLayer.contents = nil
                 let state = smoothViewports[frame.gridID]
                     ?? SmoothViewportState(gridID: frame.gridID)
                 smoothViewports[frame.gridID] = state
                 let started = state.present(
-                    image: image, rows: grid.rows, cols: grid.cols,
+                    rowSnapshots: rowSnapshots, rows: grid.rows, cols: grid.cols,
                     margins: grid.viewportMargins,
-                    scrolls: damageByGrid[frame.gridID]?.scrolls ?? [],
+                    scrolls: damageByGrid[frame.gridID]?.presentationScrolls ?? [],
                     semanticDelta: redrawAll ? nil : flush.viewportScrollDeltas[frame.gridID],
                     cellSize: cellSize, scale: scale, host: gridLayer,
                     animate: scrollMotionStyle == .tightNative && !reducedMotion && !redrawAll)
                 motionStarted = motionStarted || started
-                assert(state.currentRowsReference(image),
-                       "smooth viewport must end on the authoritative image")
+                assert(state.currentRowsMatch(rowSnapshots),
+                       "filmstrip must end on authoritative row revisions")
             }
         }
 
@@ -338,13 +401,21 @@ public final class GridSurfaceView: NSView {
         authoritativeCursorGrid = flush.cursor.grid
         updateCursorPresentation()
 
-        if motionStarted || cursorCorrectionActive {
+        if motionStarted || cursorCorrectionActive
+            || smoothViewports.values.contains(where: \.isVeilActive)
+        {
             resumeDisplayLink()
         }
         emitDiagnostics(timestamp: CACurrentMediaTime())
     }
 
     private func settleSmoothMotion(destroyHistory: Bool = false) {
+        // A style/accessibility switch must not strand authoritative model
+        // damage that was already scheduled for the next display callback.
+        if let scheduledDisplayPresentation {
+            self.scheduledDisplayPresentation = nil
+            scheduledDisplayPresentation()
+        }
         for state in smoothViewports.values {
             destroyHistory ? state.destroy() : state.settle()
         }
@@ -365,7 +436,9 @@ public final class GridSurfaceView: NSView {
         link.isPaused = true
         link.add(to: .main, forMode: .common)
         animationDisplayLink = link
-        if smoothViewports.values.contains(where: \.isActive) || cursorCorrectionActive {
+        if smoothViewports.values.contains(where: { $0.isActive || $0.isVeilActive })
+            || cursorCorrectionActive || scheduledDisplayPresentation != nil
+        {
             resumeDisplayLink()
         }
     }
@@ -378,7 +451,21 @@ public final class GridSurfaceView: NSView {
             elapsed = link.duration > 0 ? link.duration : 1.0 / 60.0
         }
         lastDisplayTimestamp = link.timestamp
-        if !advanceAnimations(by: elapsed, timestamp: CACurrentMediaTime()) {
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        isInsideDisplayTick = true
+        if let scheduledDisplayPresentation {
+            self.scheduledDisplayPresentation = nil
+            scheduledDisplayPresentation()
+        }
+        let active = advanceAnimationsWithoutTransaction(
+            by: elapsed, nominalDisplayPeriod: link.duration,
+            timestamp: CACurrentMediaTime())
+        isInsideDisplayTick = false
+        CATransaction.commit()
+
+        if !active, scheduledDisplayPresentation == nil {
             pauseDisplayLink()
         }
     }
@@ -389,12 +476,31 @@ public final class GridSurfaceView: NSView {
     func advanceAnimations(
         by elapsed: CFTimeInterval, timestamp: CFTimeInterval = CACurrentMediaTime()
     ) -> Bool {
-        let boundedElapsed = min(max(0, elapsed), 1.0)
         CATransaction.begin()
         CATransaction.setDisableActions(true)
+        isInsideDisplayTick = true
+        if let scheduledDisplayPresentation {
+            self.scheduledDisplayPresentation = nil
+            scheduledDisplayPresentation()
+        }
+        let active = advanceAnimationsWithoutTransaction(
+            by: elapsed, nominalDisplayPeriod: 1.0 / 60.0, timestamp: timestamp)
+        isInsideDisplayTick = false
+        CATransaction.commit()
+        return active
+    }
+
+    private func advanceAnimationsWithoutTransaction(
+        by elapsed: CFTimeInterval, nominalDisplayPeriod: CFTimeInterval,
+        timestamp: CFTimeInterval
+    ) -> Bool {
+        let boundedElapsed = min(max(0, elapsed), 1.0)
         var active = false
-        for state in smoothViewports.values where state.isActive {
-            active = state.advance(by: boundedElapsed) || active
+        for state in smoothViewports.values where state.isActive || state.isVeilActive {
+            active = state.advance(
+                by: boundedElapsed,
+                nominalDisplayPeriod: nominalDisplayPeriod > 0
+                    ? nominalDisplayPeriod : 1.0 / 60.0) || active
         }
 
         if cursorCorrectionActive {
@@ -412,14 +518,16 @@ public final class GridSurfaceView: NSView {
             }
         }
         updateCursorPresentation()
-        CATransaction.commit()
 
         emitDiagnostics(timestamp: timestamp)
-        return active || smoothViewports.values.contains(where: \.isActive)
+        return active
+            || smoothViewports.values.contains(where: { $0.isActive || $0.isVeilActive })
+            || scheduledDisplayPresentation != nil
     }
 
     var animationsAreIdle: Bool {
-        !smoothViewports.values.contains(where: \.isActive) && !cursorCorrectionActive
+        !smoothViewports.values.contains(where: { $0.isActive || $0.isVeilActive })
+            && !cursorCorrectionActive && scheduledDisplayPresentation == nil
             && (animationDisplayLink?.isPaused ?? true)
     }
 
@@ -443,8 +551,12 @@ public final class GridSurfaceView: NSView {
     private func updateCursorPresentation() {
         guard let flush = lastFlush, let authoritativeCursorY,
             let authoritativeCursorGrid
-        else { return }
+        else {
+            cursorLayer.setScrollDimmed(false)
+            return
+        }
         let state = smoothViewports[authoritativeCursorGrid]
+        cursorLayer.setScrollDimmed(state?.isVeilActive == true)
         var y = authoritativeCursorY
             - (state?.position ?? 0) * cellSize.height
             + cursorCorrection.position
@@ -481,19 +593,18 @@ public final class GridSurfaceView: NSView {
     }
 
     private func emitDiagnostics(timestamp: CFTimeInterval) {
-        guard scrollDiagnosticHandler != nil || environmentDiagnosticsEnabled else { return }
-        for state in smoothViewports.values where state.isActive {
+        for state in smoothViewports.values where state.isActive || state.isVeilActive {
             let sample = state.diagnosticSample(
                 timestamp: timestamp, cursorAuthoritativeY: authoritativeCursorY,
                 cursorVisualY: visualCursorY)
-            scrollDiagnosticHandler?(sample)
-            if environmentDiagnosticsEnabled {
-                let line = String(
-                    format: "scroll t=%.6f grid=%d delta=%d head=%d pos=%.5f vel=%.5f cursorAuth=%.2f cursorVisual=%.2f\n",
-                    sample.timestamp, sample.gridID, sample.delta, sample.historyHead,
-                    sample.position, sample.velocity,
-                    sample.cursorAuthoritativeY ?? -1, sample.cursorVisualY ?? -1)
-                FileHandle.standardError.write(Data(line.utf8))
+            os_signpost(
+                .event, log: Self.scrollSignpostLog, name: "ScrollFrame",
+                "grid=%{public}d delta=%{public}d head=%{public}d pos=%{public}.4f vel=%{public}.4f",
+                sample.gridID, sample.delta, sample.historyHead,
+                Double(sample.position), Double(sample.velocity))
+            if scrollDiagnosticHandler != nil || environmentDiagnosticsEnabled {
+                diagnosticRing.append(sample)
+                scrollDiagnosticHandler?(sample)
             }
         }
     }
@@ -518,15 +629,12 @@ public final class GridSurfaceView: NSView {
             "hidden": NSNull(), "zPosition": NSNull(),
         ]
         created.isOpaque = true
-        created.contentsGravity = .topLeft
         created.isGeometryFlipped = true
         created.masksToBounds = true
         gridLayers[id] = created
         layer?.addSublayer(created)
         if !updated.contains(id), let grid = flush.grids[id] {
-            renderer(for: id).apply(
-                grid: grid, damage: DamageMap(), highlights: flush.highlights)
-            renderers[id]?.renderFullFromLastState()
+            renderer(for: id).renderFull(grid: grid, highlights: flush.highlights)
             updated.insert(id)
         }
         return created

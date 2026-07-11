@@ -102,8 +102,19 @@ public struct Grid: Sendable, Equatable {
     public let id: Int
     public private(set) var rows: Int
     public private(set) var cols: Int
-    /// Row-major cell storage, `rows * cols` entries.
-    public private(set) var cells: [Cell]
+    /// Row-backed cell storage. The outer array and every row use independent
+    /// copy-on-write buffers, so a `Grid` snapshot stays cheap while editing a
+    /// line only copies that line. Full-width vertical scrolls can therefore
+    /// move row values without copying their cells.
+    private var cellRows: [[Cell]]
+
+    /// Row-major compatibility view, `rows * cols` entries.
+    ///
+    /// Rendering should prefer `rowCells(_:)` so it can retain the row-level
+    /// copy-on-write behavior without materializing a flattened array.
+    public var cells: [Cell] {
+        cellRows.flatMap { $0 }
+    }
     /// Accumulated damage since last consumed (survives across batches).
     public internal(set) var damage = DamageMap()
 
@@ -130,18 +141,18 @@ public struct Grid: Sendable, Equatable {
         self.id = id
         self.rows = max(0, rows)
         self.cols = max(0, cols)
-        self.cells = [Cell](repeating: .blank, count: self.rows * self.cols)
+        self.cellRows = Self.blankRows(count: self.rows, cols: self.cols)
         self.damage.markAll(rows: self.rows, cols: self.cols)
     }
 
     // MARK: - Access
 
     public subscript(row: Int, col: Int) -> Cell {
-        cells[row * cols + col]
+        cellRows[row][col]
     }
 
     public func rowCells(_ row: Int) -> ArraySlice<Cell> {
-        cells[row * cols ..< (row + 1) * cols]
+        cellRows[row][...]
     }
 
     /// The row's text with blank/trailing cells contributing nothing.
@@ -165,13 +176,32 @@ public struct Grid: Sendable, Equatable {
         let newRows = max(0, newRows)
         let newCols = max(0, newCols)
         if newRows != rows || newCols != cols {
-            var newCells = [Cell](repeating: .blank, count: newRows * newCols)
-            for r in 0..<min(rows, newRows) {
-                for c in 0..<min(cols, newCols) {
-                    newCells[r * newCols + c] = cells[r * cols + c]
+            if newCols == cols {
+                // Row-only resizes retain the existing row buffers.
+                var resizedRows = Array(cellRows.prefix(min(rows, newRows)))
+                if newRows > resizedRows.count {
+                    resizedRows.append(contentsOf: Self.blankRows(
+                        count: newRows - resizedRows.count,
+                        cols: newCols
+                    ))
                 }
+                cellRows = resizedRows
+            } else {
+                // A column resize changes each row's shape, so copy only the
+                // overlapping cells of the rows that survive.
+                var resizedRows = Self.blankRows(count: newRows, cols: newCols)
+                let preservedRows = min(rows, newRows)
+                let preservedCols = min(cols, newCols)
+                if preservedCols > 0 {
+                    for row in 0..<preservedRows {
+                        resizedRows[row].replaceSubrange(
+                            0..<preservedCols,
+                            with: cellRows[row].prefix(preservedCols)
+                        )
+                    }
+                }
+                cellRows = resizedRows
             }
-            cells = newCells
             rows = newRows
             cols = newCols
         }
@@ -181,7 +211,7 @@ public struct Grid: Sendable, Equatable {
 
     /// `grid_clear`: blank everything, damage all, drop pending scroll deltas.
     mutating func clear() {
-        cells = [Cell](repeating: .blank, count: rows * cols)
+        cellRows = Self.blankRows(count: rows, cols: cols)
         damage = DamageMap()
         damage.markAll(rows: rows, cols: cols)
     }
@@ -196,16 +226,18 @@ public struct Grid: Sendable, Equatable {
     /// empty-text runs and are stored as-is.
     mutating func applyLine(row: Int, colStart: Int, runs: [CellRun]) {
         guard row >= 0, row < rows, colStart >= 0, colStart < cols else { return }
+        var rowCells = cellRows[row]
         var col = colStart
         outer: for run in runs {
             guard run.repeatCount > 0 else { continue }
             for _ in 0..<run.repeatCount {
                 guard col < cols else { break outer }
-                cells[row * cols + col] = Cell(text: run.text, hlID: run.hlID)
+                rowCells[col] = Cell(text: run.text, hlID: run.hlID)
                 col += 1
             }
         }
         if col > colStart {
+            cellRows[row] = rowCells
             damage.mark(row: row, cols: colStart..<col)
         }
     }
@@ -228,15 +260,44 @@ public struct Grid: Sendable, Equatable {
             ScrollDelta(top: top, bottom: bottom, left: left, right: right,
                         rows: rowDelta, cols: colDelta))
 
-        let snapshot = cells
+        let snapshot = cellRows
+
+        // The overwhelmingly common viewport-scroll case moves complete rows.
+        // Assigning row arrays rotates their shared COW buffers instead of
+        // copying every Cell in the region. Exposed rows deliberately retain
+        // their previous values until Neovim sends the replacement grid_line.
+        if left == 0, right == cols, colDelta == 0, rowDelta != 0 {
+            for row in top..<bottom {
+                let sourceRow = row + rowDelta
+                guard sourceRow >= top, sourceRow < bottom else { continue }
+                cellRows[row] = snapshot[sourceRow]
+            }
+            return
+        }
+
+        // Partial-width and horizontal scrolls cannot rotate whole rows. Work
+        // from the immutable row snapshot and copy only each destination row
+        // that receives cells.
         for r in top..<bottom {
             let srcRow = r + rowDelta
             guard srcRow >= top, srcRow < bottom else { continue }
+            var destination = cellRows[r]
+            var didCopy = false
             for c in left..<right {
                 let srcCol = c + colDelta
                 guard srcCol >= left, srcCol < right else { continue }
-                cells[r * cols + c] = snapshot[srcRow * cols + srcCol]
+                destination[c] = snapshot[srcRow][srcCol]
+                didCopy = true
+            }
+            if didCopy {
+                cellRows[r] = destination
             }
         }
+    }
+
+    private static func blankRows(count: Int, cols: Int) -> [[Cell]] {
+        guard count > 0 else { return [] }
+        let blankRow = [Cell](repeating: .blank, count: cols)
+        return [[Cell]](repeating: blankRow, count: count)
     }
 }

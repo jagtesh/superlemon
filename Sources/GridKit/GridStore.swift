@@ -1,5 +1,16 @@
 import NvimKit
 
+/// How urgently an accumulated redraw frame must be handed to SurfaceKit.
+///
+/// The app uses `.displayLinked` only for viewport motion that can be safely
+/// coalesced until the next display opportunity. Everything else preserves
+/// the existing atomic/immediate presentation contract.
+package enum PresentationDisposition: Sendable, Equatable {
+    case none
+    case displayLinked
+    case immediate
+}
+
 public struct CursorPosition: Sendable, Equatable {
     public var grid: Int
     public var row: Int
@@ -12,17 +23,18 @@ public struct CursorPosition: Sendable, Equatable {
     }
 }
 
-/// Everything the renderer needs for one atomic present, produced when a
-/// batch contains `flush`. All value types: safely sendable to the render
-/// side, immutable snapshot of one consistent frame.
+/// Everything the renderer needs for one atomic present, produced only at a
+/// Neovim `flush` boundary. Deferred presentation may coalesce several wire
+/// flushes into this single consistent snapshot.
 public struct FlushResult: Sendable {
     /// A damaged grid's post-batch snapshot plus its consumed damage.
     public struct DamagedGrid: Sendable {
         /// Snapshot of the grid after this batch (its own damage already
         /// consumed/cleared; use `damage` alongside).
         public let grid: Grid
-        /// Damage accumulated since last consumed: apply `damage.scrolls` as
-        /// blits in order, then repaint `damage.rowSpans` from `grid`.
+        /// Damage accumulated since last consumed. Renderers rotate compatible
+        /// `damage.presentationScrolls` row tiles, then repaint
+        /// `damage.rowSpans` from the final `grid` model.
         public let damage: DamageMap
     }
 
@@ -73,6 +85,13 @@ public final class GridStore {
     public private(set) var options: [String: Value] = [:]
     /// Semantic displayed-line movement accumulated until the next flush.
     private var pendingViewportScrollDeltas: [Int: Int] = [:]
+    /// Deferred mode deliberately leaves model damage unconsumed across wire
+    /// flushes. A single immutable FlushResult is produced only when the
+    /// display is ready to present it.
+    private var hasPendingPresentation = false
+    private var pendingPresentationRequiresImmediate = false
+    private var hasUnflushedDeferredEvents = false
+    private var deferredFrame = DeferredFrameClassification()
 
     public init() {}
 
@@ -83,19 +102,67 @@ public final class GridStore {
     public func apply(_ batch: RedrawBatch) -> FlushResult? {
         var sawFlush = false
         for event in batch.events {
-            apply(event, sawFlush: &sawFlush)
+            apply(event)
+            if case .flush = event { sawFlush = true }
         }
         guard sawFlush else { return nil }
+        // Direct callers retain the original one-batch/one-present behavior.
+        // Also make the method robust if a caller switches out of deferred
+        // mode while a presentation is pending.
+        hasPendingPresentation = false
+        pendingPresentationRequiresImmediate = false
+        hasUnflushedDeferredEvents = false
+        deferredFrame.reset()
+        return makeFlushResult()
+    }
+
+    /// Apply decoded redraws without consuming damage at every Neovim flush.
+    /// The returned disposition tells the app whether to wait for the shared
+    /// display link or drain the accumulated state immediately.
+    @discardableResult
+    package func applyDeferred(_ batch: RedrawBatch) -> PresentationDisposition {
+        var result: PresentationDisposition = .none
+        for event in batch.events {
+            if case .flush = event {
+                hasPendingPresentation = true
+                hasUnflushedDeferredEvents = false
+                let frameDisposition = deferredFrame.isDisplayLinked
+                    ? PresentationDisposition.displayLinked
+                    : PresentationDisposition.immediate
+                pendingPresentationRequiresImmediate =
+                    pendingPresentationRequiresImmediate || frameDisposition == .immediate
+                result = pendingPresentationRequiresImmediate ? .immediate : .displayLinked
+                deferredFrame.reset()
+            } else {
+                hasUnflushedDeferredEvents = true
+                deferredFrame.observe(event, grids: grids)
+            }
+            apply(event)
+        }
+        return result
+    }
+
+    /// Consume all model damage and semantic viewport movement accumulated by
+    /// `applyDeferred`. Each viewport delta remains one-shot relative to this
+    /// *presented* frame, even when several wire flushes were coalesced.
+    package func consumePendingPresentation() -> FlushResult? {
+        // The model is allowed to advance immediately into the next wire
+        // frame, but SurfaceKit must never observe that frame half-applied.
+        // If events arrived after the last flush, wait for their flush and
+        // present the newer consistent state instead.
+        guard hasPendingPresentation, !hasUnflushedDeferredEvents else { return nil }
+        hasPendingPresentation = false
+        pendingPresentationRequiresImmediate = false
         return makeFlushResult()
     }
 
     // MARK: - Event application
 
-    private func apply(_ event: UIEvent, sawFlush: inout Bool) {
+    private func apply(_ event: UIEvent) {
         switch event {
         // -- global ----------------------------------------------------------
         case .flush:
-            sawFlush = true
+            break
         case .setTitle(let t):
             title = t
         case .busyStart:
@@ -226,5 +293,124 @@ public final class GridStore {
             isBusy: isBusy,
             isMouseEnabled: isMouseEnabled
         )
+    }
+}
+
+/// Classification is intentionally conservative. Only row updates, cursor
+/// movement and viewport metadata may accompany display-linked vertical
+/// motion. Resize, chrome/layout, highlight, horizontal, and conflicting
+/// partial-region changes retain immediate atomic presentation.
+private struct DeferredFrameClassification {
+    private struct Region: Equatable {
+        var top: Int
+        var bottom: Int
+        var left: Int
+        var right: Int
+    }
+
+    private var sawMotion = false
+    private var requiresImmediate = false
+    private var regions: [Int: Region] = [:]
+    private var scrollDirections: [Int: Int] = [:]
+    private var scrollDistances: [Int: Int] = [:]
+    private var semanticDeltas: [Int: Int] = [:]
+    private var lineGrids: Set<Int> = []
+    private var lineRows: [Int: Set<Int>] = [:]
+    private var cursorGrids: Set<Int> = []
+
+    var isDisplayLinked: Bool {
+        guard sawMotion, !requiresImmediate else { return false }
+        let semanticGrids = Set(
+            semanticDeltas.compactMap { grid, delta in delta == 0 ? nil : grid })
+        let motionGrids = Set(regions.keys).union(semanticGrids)
+        guard !motionGrids.isEmpty,
+            lineGrids.isSubset(of: motionGrids),
+            cursorGrids.isSubset(of: motionGrids)
+        else { return false }
+
+        // A grid_scroll without semantic viewport movement is not safe to
+        // interpolate. SurfaceKit uses the semantic direction to select and
+        // clamp retained history.
+        for (grid, direction) in scrollDirections {
+            guard let semantic = semanticDeltas[grid], semantic != 0,
+                semantic.signum() == direction
+            else { return false }
+
+            if let region = regions[grid], let rows = lineRows[grid] {
+                let distance = min(
+                    region.bottom - region.top,
+                    max(0, scrollDistances[grid] ?? 0))
+                let exposed = direction > 0
+                    ? (region.bottom - distance)..<region.bottom
+                    : region.top..<(region.top + distance)
+                guard rows.allSatisfy(exposed.contains) else { return false }
+            }
+        }
+        return true
+    }
+
+    mutating func reset() {
+        sawMotion = false
+        requiresImmediate = false
+        regions.removeAll(keepingCapacity: true)
+        scrollDirections.removeAll(keepingCapacity: true)
+        scrollDistances.removeAll(keepingCapacity: true)
+        semanticDeltas.removeAll(keepingCapacity: true)
+        lineGrids.removeAll(keepingCapacity: true)
+        lineRows.removeAll(keepingCapacity: true)
+        cursorGrids.removeAll(keepingCapacity: true)
+    }
+
+    mutating func observe(_ event: UIEvent, grids: [Int: Grid]) {
+        switch event {
+        case .gridLine(let grid, let row, _, _, _):
+            lineGrids.insert(grid)
+            lineRows[grid, default: []].insert(row)
+
+        case .gridCursorGoto(let grid, _, _):
+            cursorGrids.insert(grid)
+
+        case .winViewport(let grid, _, _, _, _, _, _, let scrollDelta):
+            sawMotion = sawMotion || scrollDelta != 0
+            semanticDeltas[grid, default: 0] += scrollDelta
+            if semanticDeltas[grid] == 0 { semanticDeltas.removeValue(forKey: grid) }
+
+        case .gridScroll(
+            let gridID, let top, let bottom, let left, let right,
+            let rows, let cols):
+            let margins = grids[gridID]?.viewportMargins
+            let marginTop = margins?.top ?? 0
+            let marginBottom = margins?.bottom ?? 0
+            let marginLeft = margins?.left ?? 0
+            let marginRight = margins?.right ?? 0
+            guard let grid = grids[gridID], rows != 0, cols == 0,
+                top == marginTop, bottom == grid.rows - marginBottom, top < bottom,
+                left == marginLeft, right == grid.cols - marginRight, left < right
+            else {
+                requiresImmediate = true
+                return
+            }
+            sawMotion = true
+            let direction = rows.signum()
+            if let existing = scrollDirections[gridID], existing != direction {
+                requiresImmediate = true
+            } else {
+                scrollDirections[gridID] = direction
+                let regionHeight = bottom - top
+                let oldDistance = scrollDistances[gridID] ?? 0
+                let added = min(regionHeight, Int(min(UInt(regionHeight), rows.magnitude)))
+                scrollDistances[gridID] =
+                    oldDistance + min(regionHeight - oldDistance, added)
+            }
+            let region = Region(top: top, bottom: bottom, left: left, right: right)
+            if let existing = regions[gridID], existing != region {
+                requiresImmediate = true
+            } else {
+                regions[gridID] = region
+            }
+
+        default:
+            requiresImmediate = true
+        }
     }
 }

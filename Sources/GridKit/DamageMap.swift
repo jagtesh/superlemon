@@ -1,5 +1,6 @@
 /// One `grid_scroll`, recorded before the cell moves were applied to the
-/// model, so the renderer can replay it as a backing-store blit.
+/// model, so the renderer can rotate compatible row tiles or choose an atomic
+/// final-model repaint for unsupported geometry.
 /// Region is rows [top, bottom) x cols [left, right); positive `rows` moves
 /// content up (destination row r receives source row r+rows), positive `cols`
 /// moves content left, mirroring the wire semantics.
@@ -24,8 +25,9 @@ public struct ScrollDelta: Sendable, Equatable {
 /// Per-grid damage: per-row dirty column spans (coalesced, sorted) plus the
 /// ordered scroll deltas since the damage was last consumed.
 ///
-/// Renderer contract (DESIGN.md §5): apply `scrolls` as blits in order, then
-/// repaint `rowSpans` from the final model state. To keep that sound when a
+/// Renderer contract (DESIGN.md §5): apply `presentationScrolls` as row-cache
+/// rotations where supported, then repaint `rowSpans` from the final model.
+/// To keep that sound when a
 /// scroll arrives while unconsumed damage exists, recording a scroll
 /// *translates* existing spans inside the scrolled region along with the
 /// content (stale pixels move with the blit) and marks the exposed strip dirty.
@@ -38,6 +40,36 @@ public struct DamageMap: Sendable, Equatable {
     public init() {}
 
     public var isEmpty: Bool { rowSpans.isEmpty && scrolls.isEmpty }
+
+    /// Ordered scroll operations with only adjacent, same-region,
+    /// same-direction vertical moves folded together. Reversals, horizontal
+    /// motion and conflicting regions remain explicit so renderers can fall
+    /// back atomically. A folded displacement is capped at the region height;
+    /// reaching that cap means no cached survivor row can be reused.
+    package var presentationScrolls: [ScrollDelta] {
+        var result: [ScrollDelta] = []
+        for delta in scrolls {
+            guard delta.cols == 0, delta.rows != 0, delta.bottom > delta.top,
+                var previous = result.last,
+                previous.cols == 0, previous.rows != 0,
+                previous.top == delta.top, previous.bottom == delta.bottom,
+                previous.left == delta.left, previous.right == delta.right,
+                previous.rows.signum() == delta.rows.signum()
+            else {
+                result.append(delta)
+                continue
+            }
+
+            let height = max(0, delta.bottom - delta.top)
+            let limit = UInt(height)
+            let magnitude = Int(min(
+                limit,
+                min(limit, previous.rows.magnitude) + min(limit, delta.rows.magnitude)))
+            previous.rows = previous.rows.signum() * magnitude
+            result[result.count - 1] = previous
+        }
+        return result
+    }
 
     /// Mark columns of one row dirty, coalescing with existing spans.
     public mutating func mark(row: Int, cols: Range<Int>) {

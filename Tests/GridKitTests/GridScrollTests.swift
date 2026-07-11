@@ -70,6 +70,83 @@ import NvimKit
         #expect(grid.rowText(0) == "ababcd")
     }
 
+    @Test func partialWidthVerticalScrollCopiesOnlyRegionColumns() {
+        let store = makeStore(rows: 4, cols: 6)
+        _ = store.apply(batch(
+            line(1, 0, 0, runs("abcdef")),
+            line(1, 1, 0, runs("ghijkl")),
+            line(1, 2, 0, runs("mnopqr")),
+            line(1, 3, 0, runs("stuvwx")),
+            .flush
+        ))
+
+        store.apply(batch(.gridScroll(
+            grid: 1, top: 0, bottom: 4, left: 1, right: 5, rows: 1, cols: 0
+        )))
+
+        let grid = store.grids[1]!
+        #expect(grid.rowText(0) == "ahijkf")
+        #expect(grid.rowText(1) == "gnopql")
+        #expect(grid.rowText(2) == "mtuvwr")
+        #expect(grid.rowText(3) == "stuvwx")
+    }
+
+    @Test func combinedVerticalAndHorizontalScrollUsesOriginalRows() {
+        let store = makeStore(rows: 3, cols: 5)
+        _ = store.apply(batch(
+            line(1, 0, 0, runs("abcde")),
+            line(1, 1, 0, runs("fghij")),
+            line(1, 2, 0, runs("klmno")),
+            .flush
+        ))
+
+        store.apply(batch(.gridScroll(
+            grid: 1, top: 0, bottom: 3, left: 0, right: 5, rows: 1, cols: 1
+        )))
+
+        let grid = store.grids[1]!
+        #expect(grid.rowText(0) == "ghije")
+        #expect(grid.rowText(1) == "lmnoj")
+        #expect(grid.rowText(2) == "klmno")
+    }
+
+    @Test func sharedRowsRemainValueIndependentAfterScrollAndLineUpdate() {
+        var grid = Grid(id: 1, rows: 4, cols: 4)
+        for (row, character) in "abcd".enumerated() {
+            grid.applyLine(row: row, colStart: 0, runs: [
+                run(String(character), hl: row, rep: 4)
+            ])
+        }
+        let snapshot = grid
+
+        grid.applyScroll(
+            top: 0, bottom: 4, left: 0, right: 4, rowDelta: 1, colDelta: 0
+        )
+        // Rows 2 and 3 now reference the same pre-scroll row buffer. Updating
+        // the exposed row must COW that row without changing the moved row or
+        // the earlier Grid snapshot.
+        grid.applyLine(row: 3, colStart: 0, runs: [run("x", rep: 4)])
+
+        #expect(grid.rowText(2) == "dddd")
+        #expect(grid.rowText(3) == "xxxx")
+        #expect(snapshot.rowText(0) == "aaaa")
+        #expect(snapshot.rowText(3) == "dddd")
+        #expect(grid.cells.count == 16)
+        #expect(grid.cells.map(\.text).joined() == "bbbbccccddddxxxx")
+    }
+
+    @Test func scrollLargerThanRegionPreservesCellsForReplacementLines() {
+        let store = makeLetterStore()
+        store.apply(batch(.gridScroll(
+            grid: 1, top: 1, bottom: 4, left: 0, right: 6, rows: -4, cols: 0
+        )))
+
+        let grid = store.grids[1]!
+        #expect((0..<6).map(grid.rowText) == [
+            "aaaaaa", "bbbbbb", "cccccc", "dddddd", "eeeeee", "ffffff",
+        ])
+    }
+
     @Test func scrollDeltaRecordedInOrderWithExposedDamage() {
         let store = makeLetterStore()
         store.apply(batch(

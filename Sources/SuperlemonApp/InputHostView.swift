@@ -281,12 +281,11 @@ final class InputHostView: NSView, @preconcurrency NSTextInputClient {
         let arguments = mouseTranslator.translateWheel(
             direction: direction, modifiers: modifiers,
             grid: cell.grid, row: cell.row, col: cell.col)
-        for _ in 0..<count {
-            controller.sendMouse(
-                button: arguments.button, action: arguments.action,
-                modifier: arguments.modifier,
-                grid: arguments.grid, row: arguments.row, col: arguments.col)
-        }
+        controller.sendMouse(
+            button: arguments.button, action: arguments.action,
+            modifier: arguments.modifier,
+            grid: arguments.grid, row: arguments.row, col: arguments.col,
+            repeatCount: count)
     }
 
     private func cellUnderPointer(_ event: NSEvent) -> (grid: Int, row: Int, col: Int)? {

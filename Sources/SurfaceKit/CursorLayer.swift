@@ -35,7 +35,8 @@ final class CursorLayer: CALayer {
         super.init()
         zPosition = 10_000
         actions = ["position": NSNull(), "bounds": NSNull(), "contents": NSNull(),
-                   "hidden": NSNull(), "backgroundColor": NSNull()]
+                   "hidden": NSNull(), "backgroundColor": NSNull(),
+                   "opacity": NSNull()]
     }
 
     override init(layer: Any) { super.init(layer: layer) }
@@ -137,6 +138,12 @@ final class CursorLayer: CALayer {
         frame = next
     }
 
+    /// A velocity veil may de-emphasize the cursor without rebuilding its
+    /// bitmap or touching the independent blink animation/timeline.
+    func setScrollDimmed(_ dimmed: Bool) {
+        opacity = dimmed ? 0.25 : 1
+    }
+
     /// Draw the underlying cell's glyph in swapped colors into this layer.
     private func renderBlockGlyph(
         flush: FlushResult, glyphColor: NvimKit.RGBColor, fill: NvimKit.RGBColor,
@@ -184,7 +191,11 @@ final class CursorLayer: CALayer {
         let wait = Double(mode.blinkWait) / 1000
         let period = on + off
         let anim = CAKeyframeAnimation(keyPath: "opacity")
-        anim.values = [1, 1, 0, 0]
+        // Additive values preserve the exact on/off waveform while allowing
+        // the model opacity to dim the cursor during a velocity veil. The
+        // existing animation object and beginTime are never rebuilt by scroll.
+        anim.values = [0, 0, -1, -1]
+        anim.isAdditive = true
         anim.keyTimes = [0, NSNumber(value: on / period), NSNumber(value: on / period), 1]
         anim.duration = period
         anim.beginTime = CACurrentMediaTime() + wait
