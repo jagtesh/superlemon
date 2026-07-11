@@ -55,7 +55,7 @@ public struct ViewportScrollMotion: Sendable, Equatable {
         }
         netDelta += delta
         let magnitude = Int(min(UInt(Int.max), delta.magnitude))
-        if magnitude > largestStepMagnitude {
+        if magnitude >= largestStepMagnitude {
             largestStepMagnitude = magnitude
             largestStepDelta = delta
         }
@@ -152,15 +152,28 @@ public final class GridStore {
     @discardableResult
     public func apply(_ batch: RedrawBatch) -> FlushResult? {
         var sawFlush = false
+        var frameHasEvents = false
+        var frame = DeferredFrameClassification()
+        var allowsScrollInterpolation = !pendingPresentationRequiresImmediate
         for event in batch.events {
+            if case .flush = event {
+                sawFlush = true
+                if frameHasEvents {
+                    allowsScrollInterpolation =
+                        allowsScrollInterpolation && frame.isDisplayLinked
+                }
+                frameHasEvents = false
+                frame.reset()
+            } else {
+                frameHasEvents = true
+                frame.observe(event, grids: grids)
+            }
             apply(event)
-            if case .flush = event { sawFlush = true }
         }
         guard sawFlush else { return nil }
         // Direct callers retain the original one-batch/one-present behavior.
         // Also make the method robust if a caller switches out of deferred
         // mode while a presentation is pending.
-        let allowsScrollInterpolation = !pendingPresentationRequiresImmediate
         hasPendingPresentation = false
         pendingPresentationRequiresImmediate = false
         hasUnflushedDeferredEvents = false

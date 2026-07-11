@@ -162,6 +162,7 @@ import NvimKit
         #expect(result.viewportScrollMotions[1]?.netDelta == 0)
         #expect(result.viewportScrollMotions[1]?.containsReversal == true)
         #expect(result.viewportScrollMotions[1]?.stepCount == 2)
+        #expect(result.viewportScrollMotions[1]?.largestStepDelta == -2)
     }
 
     @Test func deferredScrollFlushesCoalesceUntilConsumed() {
@@ -278,6 +279,25 @@ import NvimKit
         let resized = store.consumePendingPresentation()
         #expect(resized?.grids[1]?.rows == 7)
         #expect(resized?.allowsScrollInterpolation == false)
+    }
+
+    @Test func directApplyCarriesTheSameInterpolationSafety() {
+        let store = makeStore(rows: 6, cols: 6)
+        let compatible = store.apply(batch(
+            .gridScroll(
+                grid: 1, top: 0, bottom: 6, left: 0, right: 6,
+                rows: 1, cols: 0),
+            .winViewport(
+                grid: 1, win: 10, topline: 1, botline: 7,
+                curline: 2, curcol: 0, lineCount: 100, scrollDelta: 1),
+            .flush
+        ))
+        #expect(compatible?.allowsScrollInterpolation == true)
+
+        let mixedEdit = store.apply(batch(
+            line(1, 2, 0, runs("typed!")), .flush
+        ))
+        #expect(mixedEdit?.allowsScrollInterpolation == false)
     }
 
     @Test func deferredScrollRequiresTheExactInnerViewportRegion() {
