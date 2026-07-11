@@ -227,10 +227,14 @@ fall out for free:
 
 ### GridLayer: row tiles + display-linked scrolling
 
-Each `GridLayer` owns Retina-scaled, row-sized bitmap contexts. Immutable
-`CGImage` row revisions are shared by the authoritative layer tree and a
-two-viewport circular history; normal scrolling never snapshots or uploads a
-full-grid image.
+Each `GridLayer` owns Retina-scaled, row-sized bitmap contexts backed by sRGB
+`IOSurface` allocations. Immutable row revisions are shared by the
+authoritative layer tree and a two-viewport circular history; Core Animation
+imports those surfaces directly instead of synchronously converting and
+copying a `CGImage` at transaction commit. The pool is bounded to four grid
+heights and recycles a surface only after its revision lease and compositor
+use count are clear. A plain immutable `CGImage` is the saturation fallback,
+and full-grid composition remains on demand for tests and screenshots.
 
 Per flush, for each damaged grid:
 
@@ -245,7 +249,7 @@ Per flush, for each damaged grid:
    container. A critically damped spring translates that one container,
    pixel-snapped at Retina scale. Filmstrip slots move with the history head,
    so surviving rows keep their existing `CALayer.contents`; only an exposed
-   edge or genuinely revised row uploads a new image.
+   edge or genuinely revised row binds new surface contents.
 4. **Coalesce to display cadence.** The first idle scroll presents
    immediately. While motion is active, compatible Neovim flushes accumulate
    in GridKit and are consumed once at the next shared display callback. No
@@ -264,6 +268,10 @@ Why this shape and not the alternatives:
   repeatedly snapshots, blits, and uploads the entire surface on the main
   thread. Replaced by bounded row tiles; full-image composition remains an
   on-demand test/screenshot fallback.
+- **A bespoke `CAMetalLayer` renderer** — offers explicit texture ownership and
+  a glyph atlas, but duplicates Core Animation's already-GPU-backed translation
+  path and greatly expands renderer scope. Direct `IOSurface` row contents
+  remove the measured upload/copy bottleneck while retaining AppKit/Core Text.
 
 ### Resize & metrics
 
