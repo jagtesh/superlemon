@@ -283,6 +283,8 @@ public final class GridSurfaceView: NSView {
     }
 
     private func commit(_ flush: FlushResult, redrawAll: Bool) {
+        let previousFrames = Dictionary(
+            uniqueKeysWithValues: lastFrames.map { ($0.gridID, $0) })
         let outer = flush.grids[1]
         let frames = GridLayout.resolve(
             outerRows: outer?.rows ?? 0, outerCols: outer?.cols ?? 0,
@@ -295,16 +297,6 @@ public final class GridSurfaceView: NSView {
             CATransaction.setDisableActions(true)
         }
         defer { if ownsTransaction { CATransaction.commit() } }
-
-        if !redrawAll, !flush.allowsScrollInterpolation {
-            // Atomic disposition applies to the whole presented frame, not
-            // only grids that happened to carry row damage. Layout/title/
-            // highlight events can otherwise leave an older filmstrip tail
-            // moving beneath an already-committed immediate frame.
-            for state in smoothViewports.values { state.settle() }
-            cursorCorrection.settle()
-            cursorCorrectionActive = false
-        }
 
         layer?.backgroundColor = flush.highlights.defaultBackground.cgColor
 
@@ -332,10 +324,21 @@ public final class GridSurfaceView: NSView {
         let damageByGrid = Dictionary(
             uniqueKeysWithValues: flush.damagedGrids.map { ($0.grid.id, $0.damage) })
         var motionStarted = false
+        var atomicallySettledGrids: Set<Int> = []
         for frame in frames {
             guard let grid = flush.grids[frame.gridID] else { continue }
             visible.insert(frame.gridID)
             let gridLayer = layerFor(frame.gridID, flush: flush, updated: &updatedContents)
+            if !redrawAll, !flush.allowsScrollInterpolation,
+                previousFrames[frame.gridID] != frame,
+                let state = smoothViewports[frame.gridID]
+            {
+                // Layout changes affect this grid's pixels even when Neovim
+                // sends no grid damage. Settle only that filmstrip; unrelated
+                // splits and metadata-only cursor/style frames keep moving.
+                state.settle()
+                atomicallySettledGrids.insert(frame.gridID)
+            }
             gridLayer.frame = CGRect(
                 x: CGFloat(frame.rect.col) * cw,
                 y: CGFloat(frame.rect.row) * ch,
@@ -358,6 +361,9 @@ public final class GridSurfaceView: NSView {
                 let state = smoothViewports[frame.gridID]
                     ?? SmoothViewportState(gridID: frame.gridID)
                 smoothViewports[frame.gridID] = state
+                let animate = scrollMotionStyle == .tightNative && !reducedMotion
+                    && !redrawAll && flush.allowsScrollInterpolation
+                if !animate { atomicallySettledGrids.insert(frame.gridID) }
                 let started = state.present(
                     rowSnapshots: rowSnapshots, rows: grid.rows, cols: grid.cols,
                     margins: grid.viewportMargins,
@@ -365,8 +371,7 @@ public final class GridSurfaceView: NSView {
                     semanticDelta: redrawAll ? nil : flush.viewportScrollDeltas[frame.gridID],
                     semanticMotion: redrawAll ? nil : viewportMotion,
                     cellSize: cellSize, scale: scale, host: gridLayer,
-                    animate: scrollMotionStyle == .tightNative && !reducedMotion
-                        && !redrawAll && flush.allowsScrollInterpolation)
+                    animate: animate)
                 motionStarted = motionStarted || started
                 assert(state.currentRowsMatch(rowSnapshots),
                        "filmstrip must end on authoritative row revisions")
@@ -388,6 +393,12 @@ public final class GridSurfaceView: NSView {
         }
 
         // 4. Cursor.
+        if atomicallySettledGrids.contains(flush.cursor.grid)
+            || authoritativeCursorGrid.map(atomicallySettledGrids.contains) == true
+        {
+            cursorCorrection.settle()
+            cursorCorrectionActive = false
+        }
         let previousVisualY = visualCursorY
         let previousAuthoritativeRow = authoritativeCursorRow
         let previousCursorGrid = authoritativeCursorGrid

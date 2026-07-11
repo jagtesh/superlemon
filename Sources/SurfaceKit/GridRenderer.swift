@@ -289,8 +289,13 @@ final class GridRenderer {
             let ctx = CGContext(
                 data: nil, width: width, height: height,
                 bitsPerComponent: 8, bytesPerRow: 0, space: space,
-                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-                    | CGBitmapInfo.byteOrder32Big.rawValue)
+                // Core Animation's native 8-bit texture layout on macOS is
+                // BGRA. Keeping row tiles in that physical byte order avoids
+                // a channel-swizzle/copy when a newly exposed CGImage is
+                // prepared for the compositor. The image remains tagged sRGB,
+                // so Neovim's 8-bit colors retain their managed appearance.
+                bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                    | CGBitmapInfo.byteOrder32Little.rawValue)
         else { return nil }
         ctx.scaleBy(x: scale, y: scale)
         ctx.setAllowsAntialiasing(true)

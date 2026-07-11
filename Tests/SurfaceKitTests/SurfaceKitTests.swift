@@ -33,11 +33,12 @@ private func solidImage(width: Int, height: Int) -> CGImage {
     return ctx.makeImage()!
 }
 
-/// Sample one pixel (top-left origin) from an RGBA8 image.
+/// Sample one logical RGB pixel (top-left origin) from the renderer's native
+/// BGRA8 storage.
 private func pixel(_ image: CGImage, x: Int, y: Int) -> (r: UInt8, g: UInt8, b: UInt8) {
     let data = image.dataProvider!.data! as Data
     let offset = y * image.bytesPerRow + x * 4
-    return (data[offset], data[offset + 1], data[offset + 2])
+    return (data[offset + 2], data[offset + 1], data[offset])
 }
 
 /// Whole-image byte comparison.
@@ -126,6 +127,26 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
         let damaged = result.damagedGrids.first { $0.grid.id == 1 }!
         renderer.apply(grid: damaged.grid, damage: damaged.damage, highlights: result.highlights)
         return (renderer.image()!, fonts)
+    }
+
+    @Test func bitmapIsNativeBGRA8AndPreservesSRGBComponents() {
+        let context = GridRenderer.makeContext(width: 1, height: 1, scale: 1)!
+        context.setBlendMode(.copy)
+        context.setFillColor(rgb(0x123456).cgColor)
+        context.fill(CGRect(x: 0, y: 0, width: 1, height: 1))
+        let image = context.makeImage()!
+
+        #expect(image.bitsPerComponent == 8)
+        #expect(image.bitsPerPixel == 32)
+        #expect(image.alphaInfo == .premultipliedFirst)
+        #expect(image.bitmapInfo.contains(.byteOrder32Little))
+        #expect(image.colorSpace?.name == CGColorSpace.sRGB)
+
+        let bytes = image.dataProvider!.data! as Data
+        #expect(Array(bytes.prefix(4)) == [0x56, 0x34, 0x12, 0xFF],
+                "native memory order must be BGRA")
+        #expect(pixel(image, x: 0, y: 0) == (0x12, 0x34, 0x56),
+                "the storage optimization must not change managed sRGB color")
     }
 
     @Test func backgroundFillIsExact() {
@@ -1226,7 +1247,7 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
             width: 7 * view.cellSize.width, height: 4 * view.cellSize.height))
     }
 
-    @Test func immediateMetadataOnlyFrameSettlesEveryActiveViewport() {
+    @Test func immediateMetadataOnlyFramePreservesUnrelatedViewportMotion() {
         let view = GridSurfaceView(
             frame: NSRect(x: 0, y: 0, width: 600, height: 400), font: menlo)
         let store = GridStore()
@@ -1256,7 +1277,8 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
         }
         #expect(!atomic.allowsScrollInterpolation)
         view.present(atomic)
-        #expect(view.animationsAreIdle)
+        #expect(!view.animationsAreIdle,
+                "metadata-only presentation must not snap an unrelated filmstrip")
     }
 
     @Test func cursorRectAndHitTestingAgree() {
