@@ -1,5 +1,7 @@
 import AppKit
+import CoreVideo
 import GridKit
+import IOSurface
 import NvimKit
 import Testing
 
@@ -295,10 +297,14 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
             #expect(after[destination].image === before[destination + 2].image)
             #expect(after[destination].token == before[destination + 2].token)
         }
-        #expect(after[rows - 2].backingID == before[0].backingID)
-        #expect(after[rows - 1].backingID == before[1].backingID)
-        #expect(after[rows - 2].revision > before[0].revision)
-        #expect(after[rows - 1].revision > before[1].revision)
+        #expect(after[rows - 2].token != before[0].token)
+        #expect(after[rows - 1].token != before[1].token)
+        if case .surface = after[rows - 2].layerContents {} else {
+            Issue.record("exposed production row should use IOSurface contents")
+        }
+        if case .surface = after[rows - 1].layerContents {} else {
+            Issue.record("exposed production row should use IOSurface contents")
+        }
         #expect(after.allSatisfy { $0.image.height == Int(fonts.cellSize.height) })
     }
 
@@ -317,9 +323,21 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
         let initial = renderer.rowSnapshots()!
         let retainedImage = initial[0].image
         let retainedBytes = retainedImage.dataProvider!.data! as Data
+        guard case .surface(let retainedSurface) = initial[0].layerContents else {
+            Issue.record("production snapshot did not expose IOSurface contents")
+            return
+        }
+        #expect(retainedSurface.pixelFormat == kCVPixelFormatType_32BGRA)
+        #expect(IOSurfaceCopyValue(retainedSurface, kIOSurfaceColorSpace) != nil)
+        #expect(IOSurfaceGetUseCount(retainedSurface) > 0)
+        _ = retainedSurface.lock(options: [.readOnly], seed: nil)
+        let retainedSurfaceBytes = Data(
+            bytes: retainedSurface.baseAddress,
+            count: retainedSurface.allocationSize)
+        _ = retainedSurface.unlock(options: [.readOnly], seed: nil)
         var backingIDs = Set(initial.map(\.backingID))
 
-        for iteration in 0..<64 {
+        for iteration in 0..<100 {
             let next = flush(store, [
                 .gridScroll(
                     grid: 1, top: 0, bottom: rows, left: 0, right: cols,
@@ -335,10 +353,19 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
             backingIDs.formUnion(renderer.rowSnapshots()!.map(\.backingID))
         }
 
-        #expect(backingIDs.count == rows,
-                "scrolling recycles a fixed row-context pool")
+        #expect(backingIDs.count <= rows * 2 + 1,
+                "retained old rows plus current rows use a bounded surface set")
+        #expect(renderer.rowSurfacePoolCount <= renderer.rowSurfacePoolCapacity)
+        #expect(renderer.rowSurfacePoolCapacity == rows * 4)
         #expect((retainedImage.dataProvider!.data! as Data) == retainedBytes,
                 "history snapshots remain immutable while their contexts recycle")
+        _ = retainedSurface.lock(options: [.readOnly], seed: nil)
+        let finalSurfaceBytes = Data(
+            bytes: retainedSurface.baseAddress,
+            count: retainedSurface.allocationSize)
+        _ = retainedSurface.unlock(options: [.readOnly], seed: nil)
+        #expect(finalSurfaceBytes == retainedSurfaceBytes,
+                "a published IOSurface revision must never be mutated")
     }
 
     @Test func unsupportedScrollRerasterizesOnlyItsAffectedRows() {
@@ -368,7 +395,7 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
 
         for row in 0..<rows {
             if (1..<4).contains(row) {
-                #expect(after[row].revision > before[row].revision)
+                #expect(after[row].token != before[row].token)
             } else {
                 #expect(after[row].token == before[row].token)
                 #expect(after[row].image === before[row].image)

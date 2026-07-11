@@ -145,6 +145,10 @@ struct SmoothViewportGeometry: Equatable {
 /// Production scroll history retains row-sized images only.
 struct SharedImageRow: @unchecked Sendable {
     let image: CGImage
+    let layerContents: RowLayerContents
+    /// Holds the renderer's IOSurface use-count lease while this revision is
+    /// addressable through authoritative rows, history, or a layer slot.
+    let layerContentsRetention: AnyObject?
     let contentsRect: CGRect
     let sourceRow: Int
     let generation: UInt64
@@ -276,6 +280,8 @@ final class SmoothViewportState {
         let sourceRows = rowSnapshots.enumerated().map { row, snapshot in
             SharedImageRow(
                 image: snapshot.image,
+                layerContents: snapshot.layerContents,
+                layerContentsRetention: snapshot.layerContentsRetention,
                 contentsRect: CGRect(x: 0, y: 0, width: 1, height: 1),
                 sourceRow: row, generation: snapshot.revision,
                 token: snapshot.token, retainsFullGridImage: false)
@@ -301,6 +307,8 @@ final class SmoothViewportState {
         let sourceRows = (0..<max(0, rows)).map { row in
             SharedImageRow(
                 image: image,
+                layerContents: .image(image),
+                layerContentsRetention: nil,
                 contentsRect: CGRect(
                     x: 0, y: 1 - CGFloat(row + 1) * rowHeight,
                     width: 1, height: rowHeight),
@@ -574,7 +582,9 @@ final class SmoothViewportState {
             x: 0, y: 0, width: cropped.width, height: cropped.height))
         guard let image = context.makeImage() else { return nil }
         return SharedImageRow(
-            image: image, contentsRect: CGRect(x: 0, y: 0, width: 1, height: 1),
+            image: image, layerContents: .image(image),
+            layerContentsRetention: nil,
+            contentsRect: CGRect(x: 0, y: 0, width: 1, height: 1),
             sourceRow: slice.sourceRow, generation: slice.generation,
             token: slice.token, retainsFullGridImage: false)
     }
@@ -609,7 +619,9 @@ final class SmoothViewportState {
         rect.origin.x += rect.width * leftRatio
         rect.size.width *= widthRatio
         return SharedImageRow(
-            image: row.image, contentsRect: rect, sourceRow: row.sourceRow,
+            image: row.image, layerContents: row.layerContents,
+            layerContentsRetention: row.layerContentsRetention,
+            contentsRect: rect, sourceRow: row.sourceRow,
             generation: row.generation, token: row.token,
             retainsFullGridImage: row.retainsFullGridImage)
     }
@@ -767,7 +779,7 @@ final class SmoothViewportState {
         let next = RowLayerBinding(token: row.token, contentsRect: row.contentsRect)
         guard binding != next || layer.isHidden else { return }
         layer.isHidden = false
-        layer.contents = row.image
+        layer.contents = row.layerContents.object
         layer.contentsRect = row.contentsRect
         layer.contentsScale = scale
         binding = next
