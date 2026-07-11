@@ -173,7 +173,9 @@ public final class MessageToastController {
             context.duration = fadeDuration
             toast.animator().alphaValue = 0
         }) {
-            toast.removeFromSuperview()
+            Task { @MainActor in
+                toast.removeFromSuperview()
+            }
         }
     }
 
