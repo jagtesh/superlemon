@@ -16,6 +16,10 @@ vim.opt.smartcase = true
 vim.opt.splitright = true
 vim.opt.splitbelow = true
 vim.opt.updatetime = 250
+-- Native trackpads already provide acceleration and momentum. One logical
+-- wheel step should therefore advance one grid cell; Neovim's terminal-first
+-- default of three rows makes precise input visibly jump in chunks.
+vim.opt.mousescroll = "ver:1,hor:1"
 
 -- Native chrome (see runtime/CONTRACT.md `superlemon.chrome`):
 -- buffer tabs in the titlebar band, powerline bar + command input at the

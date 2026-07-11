@@ -164,6 +164,12 @@ public enum RedrawDecoder {
                 grid: ints[0], win: ints[1], topline: ints[2], botline: ints[3],
                 curline: ints[4], curcol: ints[5], lineCount: ints[6], scrollDelta: ints[7])
         },
+        "win_viewport_margins": { args in
+            guard let ints = ints(args, 6) else { return nil }
+            return .winViewportMargins(
+                grid: ints[0], win: ints[1], top: ints[2], bottom: ints[3],
+                left: ints[4], right: ints[5])
+        },
 
         // -- ext_cmdline ---------------------------------------------------------
         "cmdline_show": { args in

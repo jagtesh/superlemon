@@ -115,6 +115,8 @@ public enum UIEvent: Sendable {
     case winViewport(
         grid: Int, win: Int, topline: Int, botline: Int,
         curline: Int, curcol: Int, lineCount: Int, scrollDelta: Int)
+    case winViewportMargins(
+        grid: Int, win: Int, top: Int, bottom: Int, left: Int, right: Int)
 
     // -- ext_cmdline ---------------------------------------------------------
     case cmdlineShow(content: [StyledChunk], pos: Int, firstc: String, prompt: String, indent: Int, level: Int)

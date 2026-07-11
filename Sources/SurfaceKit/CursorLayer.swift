@@ -8,6 +8,28 @@ import NvimKit
 @MainActor
 final class CursorLayer: CALayer {
     private var blinkKey: String { "superlemon.blink" }
+    private var lastStyleSignature: StyleSignature?
+    private var lastBlinkSignature: BlinkSignature?
+
+    private struct StyleSignature: Equatable {
+        var mode: ModeInfo?
+        var text: String
+        var cellAttrs: ResolvedAttrs
+        var modeAttrs: ResolvedAttrs?
+        var cellSize: CGSize
+        var fontName: String
+        var fontSize: CGFloat
+        var scale: CGFloat
+    }
+
+    private struct BlinkSignature: Equatable {
+        var grid: Int
+        var bufferLine: Int
+        var bufferColumn: Int
+        var blinkWait: Int
+        var blinkOn: Int
+        var blinkOff: Int
+    }
 
     override init() {
         super.init()
@@ -21,19 +43,6 @@ final class CursorLayer: CALayer {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("not supported") }
 
-    /// Make the discrete cursor relocation less conspicuous while grid pixels
-    /// are moving, without making the text itself translucent.
-    func setScrollSoftened(_ softened: Bool) {
-        let target: Float = softened ? 0.22 : 1
-        let animation = CABasicAnimation(keyPath: "opacity")
-        animation.fromValue = presentation()?.opacity ?? opacity
-        animation.toValue = target
-        animation.duration = softened ? 0.025 : 0.050
-        animation.timingFunction = CAMediaTimingFunction(name: .easeOut)
-        opacity = target
-        add(animation, forKey: "superlemon.scroll-cursor")
-    }
-
     /// Reposition/restyle for one flush. `cellOrigin` is the cursor cell's
     /// top-left in view coordinates (multigrid frame already applied).
     func update(
@@ -41,7 +50,10 @@ final class CursorLayer: CALayer {
         fonts: FontSet, cache: GlyphCache, scale: CGFloat
     ) {
         isHidden = flush.isBusy
-        guard !flush.isBusy else { return }
+        guard !flush.isBusy else {
+            lastBlinkSignature = nil
+            return
+        }
 
         let cw = fonts.cellSize.width
         let ch = fonts.cellSize.height
@@ -50,28 +62,40 @@ final class CursorLayer: CALayer {
 
         // Colors: mode attr 0 means "reverse the cell underneath"; a concrete
         // attr id supplies its own colors (already reverse-folded by resolve).
+        let cell = flush.grids[flush.cursor.grid].flatMap { grid -> Cell? in
+            guard flush.cursor.row >= 0, flush.cursor.row < grid.rows,
+                flush.cursor.col >= 0, flush.cursor.col < grid.cols
+            else { return nil }
+            return grid[flush.cursor.row, flush.cursor.col]
+        }
         let cellAttrs: ResolvedAttrs = {
-            guard let grid = flush.grids[flush.cursor.grid],
-                flush.cursor.row < grid.rows, flush.cursor.col < grid.cols
-            else { return flush.highlights.resolved(id: 0) }
-            return flush.highlights.resolved(
-                id: grid[flush.cursor.row, flush.cursor.col].hlID)
+            guard let cell else { return flush.highlights.resolved(id: 0) }
+            return flush.highlights.resolved(id: cell.hlID)
         }()
         let attrID = mode?.attrID ?? 0
+        let modeAttrs = attrID == 0 ? nil : flush.highlights.resolved(id: attrID)
         let fill: NvimKit.RGBColor
         let glyphColor: NvimKit.RGBColor
         if attrID == 0 {
             fill = cellAttrs.foreground
             glyphColor = cellAttrs.background
         } else {
-            let a = flush.highlights.resolved(id: attrID)
+            let a = modeAttrs!
             fill = a.background
             glyphColor = a.foreground
         }
 
-        contents = nil
-        backgroundColor = fill.cgColor
-        contentsScale = scale
+        let styleSignature = StyleSignature(
+            mode: mode, text: cell?.text ?? "", cellAttrs: cellAttrs,
+            modeAttrs: modeAttrs, cellSize: fonts.cellSize,
+            fontName: CTFontCopyPostScriptName(fonts.regular) as String,
+            fontSize: CTFontGetSize(fonts.regular), scale: scale)
+        let styleChanged = styleSignature != lastStyleSignature
+        if styleChanged {
+            contents = nil
+            backgroundColor = fill.cgColor
+            contentsScale = scale
+        }
 
         switch mode?.cursorShape ?? .block {
         case .vertical:
@@ -83,12 +107,34 @@ final class CursorLayer: CALayer {
                            width: cw, height: h)
         case .block:
             frame = CGRect(x: cellOrigin.x, y: cellOrigin.y, width: cw, height: ch)
-            renderBlockGlyph(
-                flush: flush, glyphColor: glyphColor, fill: fill,
-                fonts: fonts, cache: cache, scale: scale)
+            if styleChanged {
+                renderBlockGlyph(
+                    flush: flush, glyphColor: glyphColor, fill: fill,
+                    fonts: fonts, cache: cache, scale: scale)
+            }
         }
+        lastStyleSignature = styleSignature
 
-        updateBlink(mode)
+        let viewport = flush.grids[flush.cursor.grid]?.viewport
+        let blinkSignature = BlinkSignature(
+            grid: flush.cursor.grid,
+            bufferLine: viewport?.curline ?? flush.cursor.row,
+            bufferColumn: viewport?.curcol ?? flush.cursor.col,
+            blinkWait: mode?.blinkWait ?? 0,
+            blinkOn: mode?.blinkOn ?? 0,
+            blinkOff: mode?.blinkOff ?? 0)
+        if blinkSignature != lastBlinkSignature {
+            updateBlink(mode)
+            lastBlinkSignature = blinkSignature
+        }
+    }
+
+    /// Display-link cursor motion only changes position. It never recreates
+    /// glyph contents and never touches the independent blink animation.
+    func setVisualY(_ y: CGFloat) {
+        var next = frame
+        next.origin.y = y
+        frame = next
     }
 
     /// Draw the underlying cell's glyph in swapped colors into this layer.
@@ -126,8 +172,9 @@ final class CursorLayer: CALayer {
         contents = ctx.makeImage()
     }
 
-    /// Blink via CAKeyframeAnimation — no timers (DESIGN §6). Re-added on
-    /// every update, which restarts the cycle: typing suppresses blink.
+    /// Blink via CAKeyframeAnimation — no timers (DESIGN §6). The caller only
+    /// invokes this when the semantic cursor or blink style changes, so a
+    /// scroll-only flush leaves the current blink phase intact.
     private func updateBlink(_ mode: ModeInfo?) {
         removeAnimation(forKey: blinkKey)
         opacity = 1

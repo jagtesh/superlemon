@@ -39,6 +39,7 @@ import NvimKit
             .winPos(grid: 2, win: 1000, startRow: 0, startCol: 0, width: 12, height: 4),
             .gridResize(grid: 3, width: 12, height: 4),
             .winPos(grid: 3, win: 1001, startRow: 5, startCol: 0, width: 12, height: 4),
+            .winViewportMargins(grid: 3, win: 1001, top: 1, bottom: 0, left: 2, right: 1),
         ]
         // Window 1 content: four numbered lines.
         events.append(line(2, 0, 0, runs("fn main() {")))
@@ -93,6 +94,8 @@ import NvimKit
         #expect(store.grids[3]!.rowText(3) == "epsilon")
         #expect(store.grids[3]!.viewport == Viewport(
             topline: 1, botline: 5, curline: 4, curcol: 0, lineCount: 20, scrollDelta: 1))
+        #expect(store.grids[3]!.viewportMargins == ViewportMargins(
+            top: 1, bottom: 0, left: 2, right: 1))
         #expect(frame2.cursor == CursorPosition(grid: 3, row: 3, col: 0))
         #expect(store.grids[3]!.hasCursor)
         #expect(!store.grids[2]!.hasCursor)

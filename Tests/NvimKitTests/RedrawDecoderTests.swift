@@ -345,6 +345,18 @@ private func extHandle(_ id: Int, type: Int8 = 1) -> Value {
                     ])
         else { Issue.record("expected winViewport"); return }
     }
+
+    @Test func winViewportMargins() {
+        guard
+            case .winViewportMargins(
+                grid: 2, win: 1000, top: 1, bottom: 2, left: 3, right: 4)? =
+                decodeOne(
+                    "win_viewport_margins",
+                    [
+                        .uint(2), extHandle(1000), .uint(1), .uint(2), .uint(3), .uint(4),
+                    ])
+        else { Issue.record("expected winViewportMargins"); return }
+    }
 }
 
 // MARK: - ext_cmdline events

@@ -120,4 +120,44 @@ import NvimKit
         #expect(damage.rowSpans[5] == [0..<6])
         #expect(store.grids[1]!.damage.isEmpty)
     }
+
+    @Test func viewportScrollDeltaIsDeliveredOncePerFlush() {
+        let store = makeStore(rows: 6, cols: 6)
+        #expect(store.apply(batch(
+            .winViewport(
+                grid: 1, win: 10, topline: 1, botline: 7,
+                curline: 2, curcol: 0, lineCount: 100, scrollDelta: 1)
+        )) == nil)
+        let first = store.apply(batch(
+            .winViewport(
+                grid: 1, win: 10, topline: 3, botline: 9,
+                curline: 4, curcol: 0, lineCount: 100, scrollDelta: 2),
+            .flush
+        ))!
+        #expect(first.viewportScrollDeltas == [1: 3])
+        #expect(store.grids[1]?.viewport?.scrollDelta == 2)
+
+        let unrelated = store.apply(batch(.setTitle("later"), .flush))!
+        #expect(unrelated.viewportScrollDeltas.isEmpty)
+    }
+
+    @Test func viewportScrollDeltasAreIndependentAndCancellationIsOmitted() {
+        let store = makeStore(rows: 6, cols: 6)
+        _ = store.apply(batch(.gridResize(grid: 2, width: 6, height: 6), .flush))
+
+        let result = store.apply(batch(
+            .winViewport(
+                grid: 1, win: 10, topline: 2, botline: 8,
+                curline: 3, curcol: 0, lineCount: 100, scrollDelta: 2),
+            .winViewport(
+                grid: 1, win: 10, topline: 0, botline: 6,
+                curline: 1, curcol: 0, lineCount: 100, scrollDelta: -2),
+            .winViewport(
+                grid: 2, win: 20, topline: 4, botline: 10,
+                curline: 5, curcol: 0, lineCount: 100, scrollDelta: 4),
+            .flush
+        ))!
+
+        #expect(result.viewportScrollDeltas == [2: 4])
+    }
 }

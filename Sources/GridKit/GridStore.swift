@@ -30,6 +30,10 @@ public struct FlushResult: Sendable {
     public let damagedGrids: [DamagedGrid]
     /// All live grids (damaged or not) — window frames/anchors for layout.
     public let grids: [Int: Grid]
+    /// Per-grid displayed-line movement from `win_viewport`, consumed exactly
+    /// once at this flush. Unlike `Grid.viewport.scrollDelta`, this cannot be
+    /// accidentally replayed by a later unrelated frame.
+    public let viewportScrollDeltas: [Int: Int]
     public let highlights: HighlightTable
     public let cursor: CursorPosition
     /// Current mode's info (cursor shape, blink, attr id), if known.
@@ -67,6 +71,8 @@ public final class GridStore {
     public private(set) var isMouseEnabled = true
     /// Raw `option_set` values by name (e.g. "guifont"), for upper layers.
     public private(set) var options: [String: Value] = [:]
+    /// Semantic displayed-line movement accumulated until the next flush.
+    private var pendingViewportScrollDeltas: [Int: Int] = [:]
 
     public init() {}
 
@@ -131,6 +137,7 @@ public final class GridStore {
             grids[grid]?.clear()
         case .gridDestroy(let grid):
             grids.removeValue(forKey: grid)
+            pendingViewportScrollDeltas.removeValue(forKey: grid)
         case .gridCursorGoto(let grid, let row, let col):
             grids[cursor.grid]?.hasCursor = false
             cursor = CursorPosition(grid: grid, row: row, col: col)
@@ -179,6 +186,15 @@ public final class GridStore {
             grids[grid]?.viewport = Viewport(
                 topline: topline, botline: botline, curline: curline,
                 curcol: curcol, lineCount: lineCount, scrollDelta: scrollDelta)
+            if grids[grid] != nil, scrollDelta != 0 {
+                pendingViewportScrollDeltas[grid, default: 0] += scrollDelta
+                if pendingViewportScrollDeltas[grid] == 0 {
+                    pendingViewportScrollDeltas.removeValue(forKey: grid)
+                }
+            }
+        case .winViewportMargins(let grid, _, let top, let bottom, let left, let right):
+            grids[grid]?.viewportMargins = ViewportMargins(
+                top: top, bottom: bottom, left: left, right: right)
 
         // -- chrome events (ChromeKit's domain) and shell events with no model
         // -- effect: ignored here, never a crash.
@@ -197,9 +213,12 @@ public final class GridStore {
             grids[id] = grid
             damaged.append(FlushResult.DamagedGrid(grid: grid, damage: consumed))
         }
+        let viewportScrollDeltas = pendingViewportScrollDeltas
+        pendingViewportScrollDeltas.removeAll(keepingCapacity: true)
         return FlushResult(
             damagedGrids: damaged,
             grids: grids,
+            viewportScrollDeltas: viewportScrollDeltas,
             highlights: highlights,
             cursor: cursor,
             mode: currentMode,

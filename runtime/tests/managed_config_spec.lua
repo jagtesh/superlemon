@@ -12,6 +12,7 @@ require("superlemon").setup(1)
 H.ok(vim.o.statusline ~= "", "managed config defines a statusline")
 H.eq(vim.g.superlemon_native_tabs, 1, "native tabs on by default")
 H.eq(vim.o.laststatus, 0, "in-grid statusline released")
+H.eq(vim.o.mousescroll, "ver:1,hor:1", "native scrolling advances one cell per wheel step")
 
 local segments = require("superlemon.statusline").eval()
 H.ok(segments ~= nil and #segments >= 4, "statusline evaluates into segments")

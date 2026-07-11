@@ -308,97 +308,525 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
 
 @MainActor
 @Suite struct ScrollTransitionTests {
-    @Test func verticalAndHorizontalGeometryUseExactCellDeltas() {
-        let vertical = ScrollTransitionGeometry.make(
-            delta: ScrollDelta(top: 1, bottom: 8, left: 2, right: 12, rows: 1, cols: 0),
-            rows: 10, cols: 20, cellSize: CGSize(width: 8, height: 16))
-        #expect(vertical?.region == CGRect(x: 16, y: 16, width: 80, height: 112))
-        #expect(vertical?.translation == CGPoint(x: 0, y: -16))
-        #expect(vertical?.duration == 0.070)
+    private let cellSize = CGSize(width: 8, height: 16)
 
-        let horizontal = ScrollTransitionGeometry.make(
-            delta: ScrollDelta(top: 0, bottom: 4, left: 1, right: 9, rows: 0, cols: -2),
-            rows: 4, cols: 10, cellSize: CGSize(width: 9, height: 18))
-        #expect(horizontal?.region == CGRect(x: 9, y: 0, width: 72, height: 72))
-        #expect(horizontal?.translation == CGPoint(x: 18, y: 0))
-        #expect(abs((horizontal?.duration ?? 0) - 0.0575) < 0.000_001)
+    @Test func circularHistoryRotatesWithoutCopyingAndWrapsNegativeIndices() {
+        var history = CircularRowHistory<Int>(capacity: 6)
+        for row in 0..<6 { history[row] = row }
+
+        history.rotate(by: 2)
+        #expect(history.head == 2)
+        #expect(history[-2] == 0)
+        #expect(history[-1] == 1)
+        #expect(history[0] == 2)
+        #expect(history[3] == 5)
+        #expect(history[4] == 0)
+
+        // A reversal moves only the logical head; all retained rows remain
+        // addressable on either side of the viewport.
+        history.rotate(by: -3)
+        #expect(history.head == 5)
+        #expect(history[-1] == 4)
+        #expect(history[0] == 5)
+        #expect(history[1] == 0)
+        #expect(history[-6] == 5)
     }
 
-    @Test func rejectsLargeAndInvalidTransitions() {
-        #expect(ScrollTransitionGeometry.make(
-            delta: ScrollDelta(top: 0, bottom: 8, left: 0, right: 10, rows: 4, cols: 0),
-            rows: 8, cols: 10, cellSize: CGSize(width: 8, height: 16)) == nil)
-        #expect(ScrollTransitionGeometry.make(
-            delta: ScrollDelta(top: -1, bottom: 8, left: 0, right: 10, rows: 1, cols: 0),
-            rows: 8, cols: 10, cellSize: CGSize(width: 8, height: 16)) == nil)
+    @Test func viewportGeometryExcludesMarginsAndRejectsAtomicScrollShapes() {
+        let geometry = SmoothViewportGeometry(
+            rows: 10, cols: 20,
+            margins: ViewportMargins(top: 1, bottom: 2, left: 3, right: 4))
+        #expect(geometry.innerRows == 7)
+        #expect(geometry.innerCols == 13)
+        #expect(geometry.clipRect(cellSize: cellSize)
+            == CGRect(x: 24, y: 16, width: 104, height: 112))
+
+        let matching = ScrollDelta(
+            top: 1, bottom: 8, left: 3, right: 16, rows: 1, cols: 0)
+        let reverse = ScrollDelta(
+            top: 1, bottom: 8, left: 3, right: 16, rows: -1, cols: 0)
+        let partial = ScrollDelta(
+            top: 2, bottom: 8, left: 3, right: 16, rows: 1, cols: 0)
+        let horizontal = ScrollDelta(
+            top: 1, bottom: 8, left: 3, right: 16, rows: 0, cols: 1)
+        #expect(geometry.accepts([matching], semanticDelta: 1))
+        #expect(geometry.accepts([reverse], semanticDelta: -1))
+        #expect(!geometry.accepts([matching], semanticDelta: -1))
+        #expect(!geometry.accepts([matching, partial], semanticDelta: 1))
+        #expect(!geometry.accepts([horizontal], semanticDelta: 1))
+        #expect(!geometry.accepts([matching], semanticDelta: 0))
     }
 
-    @Test func coordinatorCreatesCroppedOverlayAndCanSettle() {
+    @Test func criticalSpringIsRefreshRateIndependentAndSettlesMonotonically() {
+        var at60 = CriticalDampedSpring(position: -3, velocity: 1.25)
+        var at120 = at60
+        for _ in 0..<18 { at60.advance(by: 1.0 / 60.0) }
+        for _ in 0..<36 { at120.advance(by: 1.0 / 120.0) }
+        #expect(abs(at60.position - at120.position) < 0.000_001)
+        #expect(abs(at60.velocity - at120.velocity) < 0.000_001)
+
+        var monotonic = CriticalDampedSpring(position: -2, velocity: 0)
+        var previous = monotonic.position
+        for _ in 0..<120 {
+            monotonic.advance(by: 1.0 / 120.0)
+            #expect(monotonic.position >= previous)
+            #expect(monotonic.position <= 0)
+            previous = monotonic.position
+        }
+        #expect(abs(monotonic.position) < 0.000_1)
+    }
+
+    @Test func stateSeedsTwoViewportHistoryAndAnimatesSharedImageRows() {
         let host = CALayer()
         host.frame = CGRect(x: 0, y: 0, width: 80, height: 96)
-        let coordinator = ScrollTransitionCoordinator()
-        let duration = coordinator.transition(
-            oldImage: solidImage(width: 80, height: 96),
-            delta: ScrollDelta(top: 1, bottom: 5, left: 2, right: 8, rows: 1, cols: 0),
-            gridRows: 6, gridCols: 10, cellSize: CGSize(width: 8, height: 16),
-            scale: 1, in: host)
-        #expect(duration == 0.070)
-        #expect(coordinator.isActive)
-        #expect(host.sublayers?.count == 1)
-        #expect(host.sublayers?.first?.bounds.size == CGSize(width: 48, height: 64))
-        #expect(host.sublayers?.first?.transform.m42 == -16)
-        let overlayImage = host.sublayers!.first!.contents as! CGImage
-        #expect(overlayImage.width == 48)
-        #expect(overlayImage.height == 64)
+        let first = solidImage(width: 80, height: 96)
+        let final = solidImage(width: 80, height: 96)
+        let state = SmoothViewportState(gridID: 7)
 
-        coordinator.settle()
-        #expect(!coordinator.isActive)
-        #expect(host.sublayers?.isEmpty != false)
+        let seeded = state.present(
+            image: first, rows: 6, cols: 10, margins: nil,
+            scrolls: [], semanticDelta: nil, cellSize: cellSize,
+            scale: 1, host: host, animate: true)
+        #expect(!seeded)
+        #expect(state.history.capacity == 12)
+        #expect(state.historyHead == 0)
+        #expect(state.history[0]?.sourceRow == 0)
+        #expect(state.history[5]?.sourceRow == 5)
+        #expect(abs((state.history[0]?.contentsRect.minY ?? -1) - 5.0 / 6.0)
+            < 0.000_001)
+        #expect(state.history[5]?.contentsRect.minY == 0,
+                "CALayer contentsRect is bottom-up even in a flipped host view")
+        #expect(state.currentRowsReference(first))
+        #expect(state.overlayLayer.isHidden)
+
+        let scroll = ScrollDelta(
+            top: 0, bottom: 6, left: 0, right: 10, rows: 1, cols: 0)
+        let started = state.present(
+            image: final, rows: 6, cols: 10, margins: nil,
+            scrolls: [scroll], semanticDelta: 1, cellSize: cellSize,
+            scale: 1, host: host, animate: true)
+        #expect(started)
+        #expect(state.isActive)
+        #expect(state.historyHead == 1)
+        #expect(state.position == -1)
+        #expect(!state.overlayLayer.isHidden)
+        #expect(state.visibleRowLayers.count == 7)
+        #expect(state.visibleRowLayers[0].frame.minY > state.visibleRowLayers[1].frame.minY,
+                "top-down logical rows must descend in CALayer's bottom-up coordinates")
+        let oldEdgeRow = state.visibleRowLayers[0].contents as! CGImage
+        let authoritativeRow = state.visibleRowLayers[1].contents as! CGImage
+        #expect(oldEdgeRow !== first,
+                "the outgoing edge must not retain its full-grid parent image")
+        #expect(oldEdgeRow.width == 80 && oldEdgeRow.height == 16)
+        #expect(pixel(oldEdgeRow, x: 40, y: 8) == pixel(first, x: 40, y: 8))
+        #expect(authoritativeRow === final)
+        #expect(state.currentRowsReference(final))
+        for row in 0..<6 {
+            #expect(state.history[row]?.image === final)
+            #expect(state.history[row]?.sourceRow == row)
+        }
+
+        for _ in 0..<240 where state.isActive {
+            _ = state.advance(by: 1.0 / 120.0)
+        }
+        #expect(!state.isActive)
+        #expect(state.overlayLayer.isHidden)
+        #expect(state.currentRowsReference(final),
+                "settling must expose the exact authoritative backing image")
     }
 
-    @Test func sameDirectionRetargetsWhileReversalReplaces() {
+    @Test func newInputPreservesVelocityThroughImmediateReversal() {
         let host = CALayer()
-        host.frame = CGRect(x: 0, y: 0, width: 80, height: 96)
-        let image = solidImage(width: 80, height: 96)
-        let coordinator = ScrollTransitionCoordinator()
-        let up = ScrollDelta(top: 0, bottom: 6, left: 0, right: 10, rows: 1, cols: 0)
-        let down = ScrollDelta(top: 0, bottom: 6, left: 0, right: 10, rows: -1, cols: 0)
+        let first = solidImage(width: 80, height: 96)
+        let second = solidImage(width: 80, height: 96)
+        let third = solidImage(width: 80, height: 96)
+        let state = SmoothViewportState(gridID: 1)
+        _ = state.present(
+            image: first, rows: 6, cols: 10, margins: nil,
+            scrolls: [], semanticDelta: nil, cellSize: cellSize,
+            scale: 1, host: host, animate: true)
+        _ = state.present(
+            image: second, rows: 6, cols: 10, margins: nil,
+            scrolls: [ScrollDelta(
+                top: 0, bottom: 6, left: 0, right: 10, rows: 1, cols: 0)],
+            semanticDelta: 1, cellSize: cellSize,
+            scale: 1, host: host, animate: true)
+        _ = state.advance(by: 1.0 / 60.0)
+        let velocityBeforeReversal = state.velocity
+        let positionBeforeReversal = state.position
 
-        _ = coordinator.transition(
-            oldImage: image, delta: up, gridRows: 6, gridCols: 10,
-            cellSize: CGSize(width: 8, height: 16), scale: 1, in: host)
-        let first = host.sublayers!.first!
-        _ = coordinator.transition(
-            oldImage: image, delta: up, gridRows: 6, gridCols: 10,
-            cellSize: CGSize(width: 8, height: 16), scale: 1, in: host)
-        #expect(host.sublayers?.count == 1)
-        #expect(host.sublayers?.first === first)
-        #expect(host.sublayers?.first?.transform.m42 == -32)
-
-        _ = coordinator.transition(
-            oldImage: image, delta: down, gridRows: 6, gridCols: 10,
-            cellSize: CGSize(width: 8, height: 16), scale: 1, in: host)
-        #expect(host.sublayers?.count == 1)
-        #expect(host.sublayers?.first !== first)
-        #expect(host.sublayers?.first?.transform.m42 == 16)
-        coordinator.settle()
+        _ = state.present(
+            image: third, rows: 6, cols: 10, margins: nil,
+            scrolls: [ScrollDelta(
+                top: 0, bottom: 6, left: 0, right: 10, rows: -1, cols: 0)],
+            semanticDelta: -1, cellSize: cellSize,
+            scale: 1, host: host, animate: true)
+        #expect(state.velocity == velocityBeforeReversal)
+        #expect(state.position == positionBeforeReversal + 1)
+        #expect(state.historyHead == 0)
+        #expect(state.currentRowsReference(third))
     }
 
-    @Test func immediateStyleNeverCreatesAnOverlay() {
-        let view = GridSurfaceView(
-            frame: NSRect(x: 0, y: 0, width: 300, height: 200), font: menlo)
-        view.scrollMotionStyle = .immediate
-        let store = GridStore()
-        view.present(flush(store, [
-            .gridResize(grid: 1, width: 10, height: 6),
-            line(0, "aaaaaaaaaa", hl: 0), line(1, "bbbbbbbbbb", hl: 0),
-        ]))
-        view.present(flush(store, [
-            .gridScroll(grid: 1, top: 0, bottom: 5, left: 0, right: 10, rows: 1, cols: 0),
-            line(4, "cccccccccc", hl: 0),
-        ]))
-        let gridLayer = view.layer?.sublayers?.first { $0.zPosition != 10_000 }
-        #expect(gridLayer?.sublayers?.isEmpty != false)
+    @Test func farJumpRetainsOnlyItsFinalLineOfMotion() {
+        let host = CALayer()
+        let first = solidImage(width: 80, height: 96)
+        let final = solidImage(width: 80, height: 96)
+        let state = SmoothViewportState(gridID: 1)
+        _ = state.present(
+            image: first, rows: 6, cols: 10, margins: nil,
+            scrolls: [], semanticDelta: nil, cellSize: cellSize,
+            scale: 1, host: host, animate: true)
+
+        let started = state.present(
+            image: final, rows: 6, cols: 10, margins: nil,
+            scrolls: [ScrollDelta(
+                top: 0, bottom: 6, left: 0, right: 10, rows: 20, cols: 0)],
+            semanticDelta: 20, cellSize: cellSize,
+            scale: 1, host: host, animate: true)
+        #expect(started)
+        #expect(state.historyHead == 1)
+        #expect(state.position == -1)
+        #expect(state.currentRowsReference(final))
+    }
+
+    @Test func farJumpCannotOvershootItsSingleLineCue() {
+        let host = CALayer()
+        let state = SmoothViewportState(gridID: 1)
+        _ = state.present(
+            image: solidImage(width: 80, height: 96),
+            rows: 6, cols: 10, margins: nil, scrolls: [], semanticDelta: nil,
+            cellSize: cellSize, scale: 1, host: host, animate: true)
+        _ = state.present(
+            image: solidImage(width: 80, height: 96),
+            rows: 6, cols: 10, margins: nil,
+            scrolls: [ScrollDelta(
+                top: 0, bottom: 6, left: 0, right: 10, rows: 6, cols: 0)],
+            semanticDelta: 6, cellSize: cellSize,
+            scale: 1, host: host, animate: true)
+        _ = state.advance(by: 1.0 / 60.0)
+        #expect(state.velocity > 0)
+
+        _ = state.present(
+            image: solidImage(width: 80, height: 96),
+            rows: 6, cols: 10, margins: nil,
+            scrolls: [ScrollDelta(
+                top: 0, bottom: 6, left: 0, right: 10, rows: 20, cols: 0)],
+            semanticDelta: 20, cellSize: cellSize,
+            scale: 1, host: host, animate: true)
+        #expect(state.position == -1)
+        var previous = state.position
+        for _ in 0..<240 where state.isActive {
+            _ = state.advance(by: 1.0 / 120.0)
+            #expect(state.position >= previous)
+            #expect(state.position <= 0)
+            previous = state.position
+        }
+        #expect(!state.isActive)
+    }
+
+    @Test func resizeResetsHistoryAndSettlesWithoutAVisibleOverlay() {
+        let host = CALayer()
+        let first = solidImage(width: 80, height: 96)
+        let scrolling = solidImage(width: 80, height: 96)
+        let resized = solidImage(width: 80, height: 128)
+        let state = SmoothViewportState(gridID: 1)
+        _ = state.present(
+            image: first, rows: 6, cols: 10, margins: nil,
+            scrolls: [], semanticDelta: nil, cellSize: cellSize,
+            scale: 1, host: host, animate: true)
+        _ = state.present(
+            image: scrolling, rows: 6, cols: 10, margins: nil,
+            scrolls: [ScrollDelta(
+                top: 0, bottom: 6, left: 0, right: 10, rows: 1, cols: 0)],
+            semanticDelta: 1, cellSize: cellSize,
+            scale: 1, host: host, animate: true)
+        #expect(state.isActive)
+
+        let animated = state.present(
+            image: resized, rows: 8, cols: 10, margins: nil,
+            scrolls: [], semanticDelta: nil, cellSize: cellSize,
+            scale: 1, host: host, animate: true)
+        #expect(!animated)
+        #expect(!state.isActive)
+        #expect(state.history.capacity == 16)
+        #expect(state.historyHead == 0)
+        #expect(state.overlayLayer.isHidden)
+        #expect(state.currentRowsReference(resized))
+    }
+
+    @Test func displayTranslationIsSnappedToPhysicalPixels() {
+        let host = CALayer()
+        let first = solidImage(width: 160, height: 192)
+        let final = solidImage(width: 160, height: 192)
+        let state = SmoothViewportState(gridID: 1)
+        _ = state.present(
+            image: first, rows: 6, cols: 10, margins: nil,
+            scrolls: [], semanticDelta: nil, cellSize: cellSize,
+            scale: 2, host: host, animate: true)
+        _ = state.present(
+            image: final, rows: 6, cols: 10, margins: nil,
+            scrolls: [ScrollDelta(
+                top: 0, bottom: 6, left: 0, right: 10, rows: 1, cols: 0)],
+            semanticDelta: 1, cellSize: cellSize,
+            scale: 2, host: host, animate: true)
+        _ = state.advance(by: 1.0 / 60.0)
+
+        for layer in state.visibleRowLayers where !layer.isHidden {
+            let physicalY = layer.frame.minY * 2
+            #expect(abs(physicalY - physicalY.rounded()) < 0.000_001)
+        }
+    }
+
+    @Test func settlementWaitsUntilTheSnappedResidualIsZero() {
+        let largeCell = CGSize(width: 12, height: 64)
+        let host = CALayer()
+        let first = solidImage(width: 120, height: 384)
+        let final = solidImage(width: 120, height: 384)
+        let state = SmoothViewportState(gridID: 1)
+        _ = state.present(
+            image: first, rows: 6, cols: 10, margins: nil,
+            scrolls: [], semanticDelta: nil, cellSize: largeCell,
+            scale: 2, host: host, animate: true)
+        _ = state.present(
+            image: final, rows: 6, cols: 10, margins: nil,
+            scrolls: [ScrollDelta(
+                top: 0, bottom: 6, left: 0, right: 10, rows: 1, cols: 0)],
+            semanticDelta: 1, cellSize: largeCell,
+            scale: 2, host: host, animate: true)
+
+        var reference = CriticalDampedSpring(position: -1)
+        var steps = 0
+        repeat {
+            reference.advance(by: 1.0 / 120.0)
+            steps += 1
+        } while !reference.isSettled
+        #expect((reference.position * largeCell.height * 2).rounded() != 0,
+                "the line-relative threshold still has a visible Retina pixel")
+        for _ in 0..<steps { _ = state.advance(by: 1.0 / 120.0) }
+        #expect(state.isActive,
+                "the history must remain until its snapped translation is zero")
+
+        for _ in 0..<240 where state.isActive {
+            _ = state.advance(by: 1.0 / 120.0)
+        }
+        #expect(!state.isActive)
+        #expect(state.overlayLayer.isHidden)
+    }
+
+    @Test func historyRetainsOnlyOneFullImageAndDetachedEdgeRows() {
+        let host = CALayer()
+        let state = SmoothViewportState(gridID: 1)
+        var image = solidImage(width: 80, height: 96)
+        _ = state.present(
+            image: image, rows: 6, cols: 10, margins: nil,
+            scrolls: [], semanticDelta: nil, cellSize: cellSize,
+            scale: 1, host: host, animate: true)
+
+        for _ in 0..<24 {
+            image = solidImage(width: 80, height: 96)
+            _ = state.present(
+                image: image, rows: 6, cols: 10, margins: nil,
+                scrolls: [ScrollDelta(
+                    top: 0, bottom: 6, left: 0, right: 10,
+                    rows: 1, cols: 0)],
+                semanticDelta: 1, cellSize: cellSize,
+                scale: 1, host: host, animate: true)
+            _ = state.advance(by: 1.0 / 120.0)
+
+            var unique: [ObjectIdentifier: CGImage] = [:]
+            for row in state.history.storage.compactMap({ $0 }) {
+                unique[ObjectIdentifier(row.image)] = row.image
+            }
+            let fullImages = unique.values.filter { $0.height > Int(cellSize.height) }
+            #expect(fullImages.count == 1,
+                    "history may share only the newest full authoritative image")
+            #expect(unique.values.allSatisfy {
+                $0.height == Int(cellSize.height) || $0 === image
+            })
+        }
+
+        state.settle()
+        var settledUnique: [ObjectIdentifier: CGImage] = [:]
+        for row in state.history.storage.compactMap({ $0 }) {
+            settledUnique[ObjectIdentifier(row.image)] = row.image
+        }
+        #expect(settledUnique.count == 1)
+        #expect(settledUnique.values.first === image)
+        #expect(state.visibleRowLayers.allSatisfy { $0.contents == nil })
+    }
+
+    @Test func detachedEdgeRowKeepsTheCorrectTopDownPixels() {
+        let context = GridRenderer.makeContext(width: 80, height: 96, scale: 1)!
+        for row in 0..<6 {
+            let color = NSColor(
+                calibratedRed: CGFloat(row + 1) / 7, green: 0, blue: 0, alpha: 1)
+            context.setFillColor(color.cgColor)
+            context.fill(CGRect(x: 0, y: CGFloat(5 - row) * 16, width: 80, height: 16))
+        }
+        let first = context.makeImage()!
+        let final = solidImage(width: 80, height: 96)
+        let host = CALayer()
+        let state = SmoothViewportState(gridID: 1)
+        _ = state.present(
+            image: first, rows: 6, cols: 10, margins: nil,
+            scrolls: [], semanticDelta: nil, cellSize: cellSize,
+            scale: 1, host: host, animate: true)
+        _ = state.present(
+            image: final, rows: 6, cols: 10, margins: nil,
+            scrolls: [ScrollDelta(
+                top: 0, bottom: 6, left: 0, right: 10, rows: 1, cols: 0)],
+            semanticDelta: 1, cellSize: cellSize,
+            scale: 1, host: host, animate: true)
+
+        guard let detached = state.history[-1] else {
+            Issue.record("outgoing top row missing from history")
+            return
+        }
+        #expect(detached.image.width == 80)
+        #expect(detached.image.height == 16)
+        #expect(detached.contentsRect == CGRect(x: 0, y: 0, width: 1, height: 1))
+        #expect(pixel(detached.image, x: 40, y: 8)
+            == pixel(first, x: 40, y: 8))
+    }
+
+    @Test func detachedRowDoesNotRetainItsFullParentImage() {
+        let host = CALayer()
+        let state = SmoothViewportState(gridID: 1)
+        weak var oldFullImage: CGImage?
+        autoreleasepool {
+            let first = solidImage(width: 80, height: 96)
+            oldFullImage = first
+            _ = state.present(
+                image: first, rows: 6, cols: 10, margins: nil,
+                scrolls: [], semanticDelta: nil, cellSize: cellSize,
+                scale: 1, host: host, animate: true)
+            _ = state.present(
+                image: solidImage(width: 80, height: 96),
+                rows: 6, cols: 10, margins: nil,
+                scrolls: [ScrollDelta(
+                    top: 0, bottom: 6, left: 0, right: 10,
+                    rows: 1, cols: 0)],
+                semanticDelta: 1, cellSize: cellSize,
+                scale: 1, host: host, animate: true)
+        }
+        #expect(oldFullImage == nil,
+                "the deep row copy must release its full-grid parent provider")
+    }
+
+    @Test func detachedRowCropRespectsAllViewportMargins() {
+        let context = GridRenderer.makeContext(width: 80, height: 96, scale: 1)!
+        for row in 0..<6 {
+            for col in 0..<10 {
+                context.setFillColor(NSColor(
+                    calibratedRed: CGFloat(row + 1) / 7,
+                    green: CGFloat(col + 1) / 11, blue: 0, alpha: 1).cgColor)
+                context.fill(CGRect(
+                    x: CGFloat(col * 8), y: CGFloat(5 - row) * 16,
+                    width: 8, height: 16))
+            }
+        }
+        let first = context.makeImage()!
+        let final = solidImage(width: 80, height: 96)
+        let margins = ViewportMargins(top: 1, bottom: 1, left: 2, right: 1)
+        let host = CALayer()
+        let state = SmoothViewportState(gridID: 1)
+        _ = state.present(
+            image: first, rows: 6, cols: 10, margins: margins,
+            scrolls: [], semanticDelta: nil, cellSize: cellSize,
+            scale: 1, host: host, animate: true)
+        _ = state.present(
+            image: final, rows: 6, cols: 10, margins: margins,
+            scrolls: [ScrollDelta(
+                top: 1, bottom: 5, left: 2, right: 9, rows: 1, cols: 0)],
+            semanticDelta: 1, cellSize: cellSize,
+            scale: 1, host: host, animate: true)
+
+        guard let detached = state.history[-1] else {
+            Issue.record("margin-scoped outgoing row missing")
+            return
+        }
+        #expect(detached.image.width == 56)
+        #expect(detached.image.height == 16)
+        #expect(pixel(detached.image, x: 4, y: 8)
+            == pixel(first, x: 20, y: 24))
+        #expect(pixel(detached.image, x: 52, y: 8)
+            == pixel(first, x: 68, y: 24))
+    }
+
+    @Test func staleDisplayGapSettlesWithBoundedIntegrationWork() {
+        let host = CALayer()
+        let state = SmoothViewportState(gridID: 1)
+        _ = state.present(
+            image: solidImage(width: 80, height: 96),
+            rows: 6, cols: 10, margins: nil, scrolls: [], semanticDelta: nil,
+            cellSize: cellSize, scale: 1, host: host, animate: true)
+        _ = state.present(
+            image: solidImage(width: 80, height: 96),
+            rows: 6, cols: 10, margins: nil,
+            scrolls: [ScrollDelta(
+                top: 0, bottom: 6, left: 0, right: 10, rows: 1, cols: 0)],
+            semanticDelta: 1, cellSize: cellSize,
+            scale: 1, host: host, animate: true)
+
+        #expect(!state.advance(by: 60 * 60))
+        #expect(!state.isActive)
+        #expect(state.overlayLayer.isHidden)
+    }
+
+    @Test func atomicOrImmediatePresentationNeverShowsTheOverlay() {
+        let host = CALayer()
+        let first = solidImage(width: 80, height: 96)
+        let final = solidImage(width: 80, height: 96)
+        let state = SmoothViewportState(gridID: 1)
+        _ = state.present(
+            image: first, rows: 6, cols: 10, margins: nil,
+            scrolls: [], semanticDelta: nil, cellSize: cellSize,
+            scale: 1, host: host, animate: false)
+        let started = state.present(
+            image: final, rows: 6, cols: 10, margins: nil,
+            scrolls: [ScrollDelta(
+                top: 0, bottom: 6, left: 0, right: 10, rows: 1, cols: 0)],
+            semanticDelta: 1, cellSize: cellSize,
+            scale: 1, host: host, animate: false)
+        #expect(!started)
+        #expect(!state.isActive)
+        #expect(state.overlayLayer.isHidden)
+        #expect(state.currentRowsReference(final))
+    }
+
+    @Test func unsupportedScrollSettlesAnActiveViewportTail() {
+        let host = CALayer()
+        let first = solidImage(width: 80, height: 96)
+        let scrolling = solidImage(width: 80, height: 96)
+        let atomic = solidImage(width: 80, height: 96)
+        let state = SmoothViewportState(gridID: 1)
+        _ = state.present(
+            image: first, rows: 6, cols: 10, margins: nil,
+            scrolls: [], semanticDelta: nil, cellSize: cellSize,
+            scale: 1, host: host, animate: true)
+        _ = state.present(
+            image: scrolling, rows: 6, cols: 10, margins: nil,
+            scrolls: [ScrollDelta(
+                top: 0, bottom: 6, left: 0, right: 10, rows: 1, cols: 0)],
+            semanticDelta: 1, cellSize: cellSize,
+            scale: 1, host: host, animate: true)
+        _ = state.advance(by: 1.0 / 120.0)
+        #expect(state.isActive)
+
+        // Horizontal scrolls have no semantic row delta. They remain atomic,
+        // and must not leave the previous vertical history moving above them.
+        let started = state.present(
+            image: atomic, rows: 6, cols: 10, margins: nil,
+            scrolls: [ScrollDelta(
+                top: 0, bottom: 6, left: 0, right: 10, rows: 0, cols: 1)],
+            semanticDelta: nil, cellSize: cellSize,
+            scale: 1, host: host, animate: true)
+        #expect(!started)
+        #expect(!state.isActive)
+        #expect(state.overlayLayer.isHidden)
+        #expect(state.position == 0)
+        #expect(state.velocity == 0)
+        #expect(state.currentRowsReference(atomic))
     }
 }
 
@@ -555,6 +983,307 @@ extension CursorRenderTests {
                 "cursor over italic text must draw the italic glyph")
         #expect(!identical(image, variantReference(.regular)),
                 "upright glyph over italic text is the reported bug")
+    }
+}
+
+extension CursorRenderTests {
+    private func blinkingBlockMode() -> ModeInfo {
+        var mode = ModeInfo()
+        mode.cursorShape = .block
+        mode.blinkWait = 700
+        mode.blinkOn = 400
+        mode.blinkOff = 250
+        return mode
+    }
+
+    private func cursorLayer(in view: GridSurfaceView) -> CALayer? {
+        view.layer?.sublayers?.first { $0.zPosition == 10_000 }
+    }
+
+    private func movingRowLayer(
+        in view: GridSurfaceView, sourceRow: Int, totalRows: Int
+    ) -> (clip: CALayer, row: CALayer)? {
+        guard let grid = view.layer?.sublayers?.first(where: { $0.zPosition != 10_000 }),
+            let clip = grid.sublayers?.first(where: { $0.zPosition == 1 && $0.masksToBounds })
+        else { return nil }
+        let expectedY = 1 - CGFloat(sourceRow + 1) / CGFloat(totalRows)
+        guard let row = clip.sublayers?.first(where: {
+            !$0.isHidden && abs($0.contentsRect.minY - expectedY) < 0.000_001
+        }) else { return nil }
+        return (clip, row)
+    }
+
+    @Test func scrollOnlyFlushKeepsCursorBitmapAndBlinkPhase() {
+        let view = GridSurfaceView(
+            frame: NSRect(x: 0, y: 0, width: 600, height: 400), font: menlo)
+        let store = GridStore()
+        let mode = blinkingBlockMode()
+        view.present(flush(store, [
+            .gridResize(grid: 1, width: 10, height: 6),
+            .defaultColorsSet(
+                fg: rgb(0xFFFFFF), bg: rgb(0x000000), special: rgb(0xFF0000)),
+            .modeInfoSet(cursorStyleEnabled: true, modes: [mode]),
+            .modeChange(mode: "normal", modeIndex: 0),
+            line(0, "aaaaaaaaaa", hl: 0), line(1, "bbbbbbbbbb", hl: 0),
+            line(2, "cccccccccc", hl: 0), line(3, "dddddddddd", hl: 0),
+            line(4, "eeeeeeeeee", hl: 0), line(5, "ffffffffff", hl: 0),
+            .gridCursorGoto(grid: 1, row: 3, col: 2),
+            .winViewport(
+                grid: 1, win: 10, topline: 0, botline: 6,
+                curline: 3, curcol: 2, lineCount: 100, scrollDelta: 0),
+        ]))
+
+        guard let cursor = cursorLayer(in: view),
+            let firstBlink = cursor.animation(forKey: "superlemon.blink"),
+            let firstContents = cursor.contents
+        else {
+            Issue.record("expected a blinking block cursor with rasterized contents")
+            return
+        }
+        let firstBitmap = firstContents as! CGImage
+
+        // The viewport moved, but the buffer cursor still names line 3,
+        // column 2. Its grid row and the backing image both changed.
+        view.present(flush(store, [
+            .gridScroll(
+                grid: 1, top: 0, bottom: 6, left: 0, right: 10, rows: 1, cols: 0),
+            line(5, "zzzzzzzzzz", hl: 0),
+            .gridCursorGoto(grid: 1, row: 2, col: 2),
+            .winViewport(
+                grid: 1, win: 10, topline: 1, botline: 7,
+                curline: 3, curcol: 2, lineCount: 100, scrollDelta: 1),
+        ]))
+
+        guard let secondBlink = cursor.animation(forKey: "superlemon.blink"),
+            let secondContents = cursor.contents
+        else {
+            Issue.record("cursor blink or bitmap disappeared after scrolling")
+            return
+        }
+        let secondBitmap = secondContents as! CGImage
+        #expect(secondBlink.beginTime == firstBlink.beginTime,
+                "scrolling the viewport must not restart the blink cycle")
+        #expect(secondBitmap === firstBitmap,
+                "the unchanged cursor cell must not be rasterized again")
+    }
+
+    @Test func cursorTracksItsMovingRowWithinOnePhysicalPixel() {
+        let view = GridSurfaceView(
+            frame: NSRect(x: 0, y: 0, width: 600, height: 400), font: menlo)
+        let store = GridStore()
+        let mode = blinkingBlockMode()
+        view.present(flush(store, [
+            .gridResize(grid: 1, width: 10, height: 6),
+            .modeInfoSet(cursorStyleEnabled: true, modes: [mode]),
+            .modeChange(mode: "normal", modeIndex: 0),
+            line(0, "aaaaaaaaaa", hl: 0), line(1, "bbbbbbbbbb", hl: 0),
+            line(2, "cccccccccc", hl: 0), line(3, "dddddddddd", hl: 0),
+            line(4, "eeeeeeeeee", hl: 0), line(5, "ffffffffff", hl: 0),
+            .gridCursorGoto(grid: 1, row: 3, col: 2),
+            .winViewport(
+                grid: 1, win: 10, topline: 0, botline: 6,
+                curline: 3, curcol: 2, lineCount: 100, scrollDelta: 0),
+        ]))
+        view.present(flush(store, [
+            .gridScroll(
+                grid: 1, top: 0, bottom: 6, left: 0, right: 10, rows: 1, cols: 0),
+            line(5, "zzzzzzzzzz", hl: 0),
+            .gridCursorGoto(grid: 1, row: 2, col: 2),
+            .winViewport(
+                grid: 1, win: 10, topline: 1, botline: 7,
+                curline: 3, curcol: 2, lineCount: 100, scrollDelta: 1),
+        ]))
+
+        guard let cursor = cursorLayer(in: view) else {
+            Issue.record("cursor layer missing")
+            return
+        }
+        let tolerance: CGFloat = 0.5  // one physical pixel at the test view's 2x scale
+        for _ in 0..<36 {
+            guard let moving = movingRowLayer(in: view, sourceRow: 2, totalRows: 6)
+            else {
+                Issue.record("authoritative cursor row missing from animated history")
+                return
+            }
+            let rowY = moving.row.convert(moving.row.bounds, to: view.layer).minY
+            #expect(abs(cursor.frame.minY - rowY) <= tolerance,
+                    "cursor y=\(cursor.frame.minY), row y=\(rowY), rect=\(moving.row.contentsRect) must share the display-linked trajectory")
+            _ = view.advanceAnimations(by: 1.0 / 120.0)
+        }
+
+        for _ in 0..<240 where !view.animationsAreIdle {
+            _ = view.advanceAnimations(by: 1.0 / 120.0)
+        }
+        #expect(view.animationsAreIdle)
+        #expect(abs(cursor.frame.minY - 2 * view.cellSize.height) <= tolerance)
+    }
+
+    @Test func cursorAtBottomMarginRemainsClampedDuringScroll() {
+        let view = GridSurfaceView(
+            frame: NSRect(x: 0, y: 0, width: 600, height: 400), font: menlo)
+        let store = GridStore()
+        view.present(flush(store, [
+            .gridResize(grid: 1, width: 10, height: 6),
+            .winViewportMargins(grid: 1, win: 10, top: 1, bottom: 1, left: 0, right: 0),
+            .gridCursorGoto(grid: 1, row: 4, col: 2),
+            .winViewport(
+                grid: 1, win: 10, topline: 0, botline: 4,
+                curline: 4, curcol: 2, lineCount: 100, scrollDelta: 0),
+        ]))
+        view.present(flush(store, [
+            .gridScroll(
+                grid: 1, top: 1, bottom: 5, left: 0, right: 10, rows: 1, cols: 0),
+            line(4, "zzzzzzzzzz", hl: 0),
+            .gridCursorGoto(grid: 1, row: 4, col: 2),
+            .winViewport(
+                grid: 1, win: 10, topline: 1, botline: 5,
+                curline: 5, curcol: 2, lineCount: 100, scrollDelta: 1),
+        ]))
+
+        guard let cursor = cursorLayer(in: view) else {
+            Issue.record("cursor layer missing")
+            return
+        }
+        let edgeY = 4 * view.cellSize.height
+        for _ in 0..<72 {
+            #expect(abs(cursor.frame.minY - edgeY) <= 0.5,
+                    "cursor must not travel into the stationary bottom margin")
+            _ = view.advanceAnimations(by: 1.0 / 120.0)
+        }
+    }
+
+    @Test func cursorAtTopEdgeDoesNotKickIntoViewportOnRepeatedScrolls() {
+        let view = GridSurfaceView(
+            frame: NSRect(x: 0, y: 0, width: 600, height: 400), font: menlo)
+        let store = GridStore()
+        view.present(flush(store, [
+            .gridResize(grid: 1, width: 10, height: 6),
+            .gridCursorGoto(grid: 1, row: 0, col: 2),
+            .winViewport(
+                grid: 1, win: 10, topline: 20, botline: 26,
+                curline: 20, curcol: 2, lineCount: 100, scrollDelta: 0),
+        ]))
+
+        for topLine in 21...23 {
+            view.present(flush(store, [
+                .gridScroll(
+                    grid: 1, top: 0, bottom: 6, left: 0, right: 10,
+                    rows: 1, cols: 0),
+                line(5, "zzzzzzzzzz", hl: 0),
+                .gridCursorGoto(grid: 1, row: 0, col: 2),
+                .winViewport(
+                    grid: 1, win: 10, topline: topLine, botline: topLine + 6,
+                    curline: topLine, curcol: 2, lineCount: 100, scrollDelta: 1),
+            ]))
+            guard let cursor = cursorLayer(in: view) else {
+                Issue.record("cursor layer missing")
+                return
+            }
+            for _ in 0..<8 {
+                #expect(abs(cursor.frame.minY) <= 0.5,
+                        "top-edge cursor must stay pinned instead of kicking down")
+                _ = view.advanceAnimations(by: 1.0 / 120.0)
+            }
+        }
+    }
+
+    @Test func cursorCorrectionNeverLeaksBetweenScrollingSplits() {
+        let view = GridSurfaceView(
+            frame: NSRect(x: 0, y: 0, width: 600, height: 400), font: menlo)
+        let store = GridStore()
+        view.present(flush(store, [
+            .gridResize(grid: 1, width: 20, height: 12),
+            .gridResize(grid: 2, width: 10, height: 6),
+            .winPos(
+                grid: 2, win: 20, startRow: 0, startCol: 0,
+                width: 10, height: 6),
+            .gridResize(grid: 3, width: 10, height: 6),
+            .winPos(
+                grid: 3, win: 30, startRow: 6, startCol: 0,
+                width: 10, height: 6),
+            .gridCursorGoto(grid: 2, row: 3, col: 2),
+            .winViewport(
+                grid: 2, win: 20, topline: 0, botline: 6,
+                curline: 3, curcol: 2, lineCount: 100, scrollDelta: 0),
+            .winViewport(
+                grid: 3, win: 30, topline: 20, botline: 26,
+                curline: 22, curcol: 2, lineCount: 100, scrollDelta: 0),
+        ]))
+
+        // Both histories move. Split 2 also moves its authoritative cursor by
+        // an extra row, creating a non-zero short cursor correction there.
+        view.present(flush(store, [
+            .gridScroll(
+                grid: 2, top: 0, bottom: 6, left: 0, right: 10,
+                rows: 1, cols: 0),
+            .gridScroll(
+                grid: 3, top: 0, bottom: 6, left: 0, right: 10,
+                rows: 1, cols: 0),
+            .gridCursorGoto(grid: 2, row: 1, col: 2),
+            .winViewport(
+                grid: 2, win: 20, topline: 1, botline: 7,
+                curline: 2, curcol: 2, lineCount: 100, scrollDelta: 1),
+            .winViewport(
+                grid: 3, win: 30, topline: 21, botline: 27,
+                curline: 23, curcol: 2, lineCount: 100, scrollDelta: 1),
+        ]))
+
+        view.present(flush(store, [
+            .gridCursorGoto(grid: 3, row: 2, col: 2),
+        ]))
+
+        guard let cursor = cursorLayer(in: view) else {
+            Issue.record("cursor layer missing")
+            return
+        }
+        // Grid 3 begins at outer row 6, its cursor is row 2, and its active
+        // one-line residual starts one row below the authoritative cell.
+        let expectedY = 9 * view.cellSize.height
+        #expect(abs(cursor.frame.minY - expectedY) <= 0.5,
+                "a correction created in split 2 must not offset split 3")
+    }
+
+    @Test func cursorShapeChangeDoesNotCreateARowCorrection() {
+        let view = GridSurfaceView(
+            frame: NSRect(x: 0, y: 0, width: 600, height: 400), font: menlo)
+        let store = GridStore()
+        var block = ModeInfo()
+        block.cursorShape = .block
+        view.present(flush(store, [
+            .gridResize(grid: 1, width: 10, height: 6),
+            .modeInfoSet(cursorStyleEnabled: true, modes: [block]),
+            .modeChange(mode: "normal", modeIndex: 0),
+            .gridCursorGoto(grid: 1, row: 3, col: 2),
+            .winViewport(
+                grid: 1, win: 10, topline: 0, botline: 6,
+                curline: 3, curcol: 2, lineCount: 100, scrollDelta: 0),
+        ]))
+        view.present(flush(store, [
+            .gridScroll(
+                grid: 1, top: 0, bottom: 6, left: 0, right: 10,
+                rows: 1, cols: 0),
+            .gridCursorGoto(grid: 1, row: 2, col: 2),
+            .winViewport(
+                grid: 1, win: 10, topline: 1, botline: 7,
+                curline: 3, curcol: 2, lineCount: 100, scrollDelta: 1),
+        ]))
+
+        var horizontal = ModeInfo()
+        horizontal.cursorShape = .horizontal
+        horizontal.cellPercentage = 20
+        view.present(flush(store, [
+            .modeInfoSet(cursorStyleEnabled: true, modes: [horizontal]),
+            .modeChange(mode: "normal", modeIndex: 0),
+        ]))
+
+        guard let cursor = cursorLayer(in: view) else {
+            Issue.record("cursor layer missing")
+            return
+        }
+        let shapeOffset = view.cellSize.height * 0.8
+        let expectedY = 3 * view.cellSize.height + shapeOffset
+        #expect(abs(cursor.frame.minY - expectedY) <= 0.5,
+                "changing cursor shape must not be mistaken for a cursor-row move")
     }
 }
 

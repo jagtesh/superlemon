@@ -77,6 +77,25 @@ public struct Viewport: Sendable, Equatable {
     }
 }
 
+/// Grid-cell margins excluded from a window's scrollable viewport.
+///
+/// Neovim reports these independently from `win_viewport`; for example, a
+/// winbar contributes to `top`, while status columns contribute to `left` or
+/// `right`.
+public struct ViewportMargins: Sendable, Equatable {
+    public var top: Int
+    public var bottom: Int
+    public var left: Int
+    public var right: Int
+
+    public init(top: Int, bottom: Int, left: Int, right: Int) {
+        self.top = top
+        self.bottom = bottom
+        self.left = left
+        self.right = right
+    }
+}
+
 /// One nvim grid (with ext_multigrid, one per window). Value type: `FlushResult`
 /// snapshots are cheap COW copies, safely sendable across actors.
 public struct Grid: Sendable, Equatable {
@@ -104,6 +123,8 @@ public struct Grid: Sendable, Equatable {
     public internal(set) var isExternal = false
     /// Latest `win_viewport` payload.
     public internal(set) var viewport: Viewport?
+    /// Latest `win_viewport_margins` payload.
+    public internal(set) var viewportMargins: ViewportMargins?
 
     public init(id: Int, rows: Int, cols: Int) {
         self.id = id
