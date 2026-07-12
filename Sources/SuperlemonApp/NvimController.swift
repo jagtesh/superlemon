@@ -312,7 +312,10 @@ final class NvimController {
             let bundled = [
                 executable.deletingLastPathComponent()
                     .deletingLastPathComponent()
-                    .appendingPathComponent("Helpers/nvim"),  // .app layout
+                    .appendingPathComponent("Helpers/nvim/bin/nvim"),  // packaged distribution
+                executable.deletingLastPathComponent()
+                    .deletingLastPathComponent()
+                    .appendingPathComponent("Helpers/nvim"),  // legacy packaged layout
                 executable.deletingLastPathComponent()
                     .appendingPathComponent("nvim"),  // dev layout
             ]

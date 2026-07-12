@@ -276,15 +276,19 @@ public actor NvimSession {
         else { throw NvimError.handshakeFailed("unexpected nvim_get_api_info reply") }
 
         let versionInfo = metadata["version"]
+        let apiLevel = versionInfo?["api_level"]?.intValue ?? 0
+        let apiCompatible = versionInfo?["api_compatible"]?.intValue ?? 0
+        let major = versionInfo?["major"]?.intValue ?? 0
+        let minor = versionInfo?["minor"]?.intValue ?? 0
+        let patch = versionInfo?["patch"]?.intValue ?? 0
+        let nvimVersion = [major, minor, patch]
+            .map { String($0) }
+            .joined(separator: ".")
         let info = APIInfo(
             channelID: channelID,
-            apiLevel: versionInfo?["api_level"]?.intValue ?? 0,
-            apiCompatible: versionInfo?["api_compatible"]?.intValue ?? 0,
-            version: [
-                versionInfo?["major"]?.intValue ?? 0,
-                versionInfo?["minor"]?.intValue ?? 0,
-                versionInfo?["patch"]?.intValue ?? 0,
-            ].map(String.init).joined(separator: "."))
+            apiLevel: apiLevel,
+            apiCompatible: apiCompatible,
+            version: nvimVersion)
 
         _ = try await request(
             "nvim_set_client_info",

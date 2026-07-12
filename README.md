@@ -27,10 +27,11 @@ adds native Mac surfaces where they improve the experience.
 
 - macOS 14+
 - Swift 6
-- Neovim 0.12+
 
-If Neovim is not on your login-shell `PATH`, set `SUPERLEMON_NVIM` to its full
-path.
+Packaged builds include Neovim, so users do not need to install it separately.
+Running the bare executable during development uses Neovim 0.12+ from the
+login-shell `PATH`; set `SUPERLEMON_NVIM` to an explicit executable path when
+needed.
 
 ## Run
 

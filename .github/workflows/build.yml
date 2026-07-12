@@ -20,8 +20,10 @@ jobs:
       - name: Show toolchain
         run: swift --version
 
-      - name: Install Neovim
-        run: brew install neovim
+      - name: Prepare bundled Neovim
+        run: |
+          nvim_distribution=$(scripts/fetch-neovim.sh)
+          echo "$nvim_distribution/bin" >> "$GITHUB_PATH"
 
       - name: Build
         run: swift build
