@@ -4,7 +4,7 @@ cask "superlemon" do
 
   url "https://github.com/jagtesh/superlemon/releases/download/v#{version}/Superlemon-#{version}-macOS.zip"
   name "Superlemon"
-  desc "Native macOS interface built around Neovim"
+  desc "Native graphical interface built around Neovim"
   homepage "https://github.com/jagtesh/superlemon"
 
   depends_on macos: :sonoma
