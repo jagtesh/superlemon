@@ -233,6 +233,7 @@ package struct GridAccessoryDebugSnapshot {
     package var cursorFrame: CGRect?
     package var scrollerIsVisible: Bool
     package var minimapLayerSuperviewIsGridLayer: Bool
+    package var minimapUsesTopOrigin: Bool
 }
 
 // MARK: - Geometry policy
@@ -675,6 +676,11 @@ private final class GridEditorAccessoryState {
         }
         minimapLayer.isOpaque = true
         minimapLayer.masksToBounds = true
+        // The parent grid is geometry-flipped, but Core Animation does not
+        // make each descendant's local child geometry top-origin for us.
+        // Explicitly flip the gutter so y=0 is its visual top for content,
+        // viewport, and cursor marker sublayers.
+        minimapLayer.isGeometryFlipped = true
         minimapLayer.zPosition = 80
         contentLayer.contentsGravity = .resize
         contentLayer.zPosition = 0
@@ -1434,7 +1440,8 @@ final class GridAccessoryCoordinator {
             cursorFrame: state.cursorLayer.isHidden ? nil : state.cursorLayer.frame,
             scrollerIsVisible: !state.interactionView.scroller.isHidden,
             minimapLayerSuperviewIsGridLayer:
-                state.minimapLayer.superlayer === state.presentationGridLayer)
+                state.minimapLayer.superlayer === state.presentationGridLayer,
+            minimapUsesTopOrigin: state.minimapLayer.isGeometryFlipped)
     }
 
     func scroller(gridID: Int) -> NSScroller? {

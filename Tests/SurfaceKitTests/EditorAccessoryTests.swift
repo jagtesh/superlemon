@@ -186,6 +186,32 @@ private struct AccessoryHarness {
         #expect(harness.view.cell(at: gutterPoint) == nil)
     }
 
+    @Test func toplineZeroMarkerUsesTheVisualTopOfTheGutter() {
+        let harness = AccessoryHarness()
+        var request: GridAccessorySizeRequest?
+        harness.view.onGridAccessorySizeRequest = { request = $0 }
+        harness.presentInitial()
+        harness.acknowledge(request!)
+        harness.view.present(accessoryFlush(harness.store, [
+            .winViewport(
+                grid: 2, win: harness.windowHandle, topline: 0,
+                botline: request!.rows, curline: 0, curcol: 0,
+                lineCount: 2_000, scrollDelta: 0),
+        ]))
+
+        guard let snapshot = harness.view.editorAccessoryDebugSnapshot(gridID: 2)
+        else {
+            Issue.record("minimap debug geometry missing")
+            return
+        }
+        #expect(snapshot.minimapUsesTopOrigin,
+                "minimap children must use a top-origin local coordinate system")
+        #expect(snapshot.displayRange?.lowerBound == 0)
+        #expect(snapshot.viewportFrame?.minY == 0,
+                "topline zero must draw at the visual top, not gutter bottom")
+        #expect(snapshot.cursorFrame?.minY == 0)
+    }
+
     @Test func disablingMinimapReleasesOwnershipAndHidesImmediately() {
         let harness = AccessoryHarness()
         var requests: [GridAccessorySizeRequest] = []
