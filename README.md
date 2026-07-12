@@ -72,6 +72,19 @@ swift test
 bash runtime/tests/run.sh
 ```
 
+Every push and pull request also produces a packaged macOS application in
+GitHub Actions. To create a versioned GitHub Release from a clean, up-to-date
+`main` branch:
+
+```sh
+scripts/release.sh 0.2.0
+```
+
+The command updates the application version, creates and pushes the release
+commit and `v0.2.0` tag, and starts the release workflow. GitHub Actions tests
+the tagged source, uploads its packaged application as a workflow artifact,
+and attaches that exact archive to the corresponding GitHub Release.
+
 See [DESIGN.md](DESIGN.md) for the implemented architecture,
 [NORTHSTAR.md](NORTHSTAR.md) for the product direction, and
 [runtime/CONTRACT.md](runtime/CONTRACT.md) for the Swift/Lua interface.

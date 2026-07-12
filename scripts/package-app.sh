@@ -3,12 +3,12 @@ set -euo pipefail
 
 root=${0:A:h:h}
 configuration=${1:-release}
-build_dir="$root/.build/arm64-apple-macosx/$configuration"
 app="$root/dist/Superlemon.app"
 contents="$app/Contents"
 
 cd "$root"
 swift build -c "$configuration"
+build_dir=$(swift build -c "$configuration" --show-bin-path)
 
 rm -rf "$app"
 mkdir -p "$contents/MacOS" "$contents/Resources"
