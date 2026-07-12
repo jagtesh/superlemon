@@ -47,5 +47,5 @@ git push origin main
 git push origin "$tag"
 
 echo "Release build started: https://github.com/jagtesh/superlemon/actions"
-echo "After it completes, publish the Homebrew cask with:"
-echo "  scripts/publish-homebrew-cask.sh $version"
+echo "After it completes, publish the source-build Homebrew formula with:"
+echo "  scripts/publish-homebrew-formula.sh $version"

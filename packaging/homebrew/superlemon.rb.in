@@ -1,15 +1,49 @@
-cask "superlemon" do
-  version "@VERSION@"
-  sha256 "@SHA256@"
-
-  url "https://github.com/jagtesh/superlemon/releases/download/v#{version}/Superlemon-#{version}-macOS.zip"
-  name "Superlemon"
+class Superlemon < Formula
   desc "Native graphical interface built around Neovim"
   homepage "https://github.com/jagtesh/superlemon"
+  url "https://github.com/jagtesh/superlemon/archive/refs/tags/v@VERSION@.tar.gz"
+  sha256 "@SOURCE_SHA256@"
+  license "BSD-3-Clause"
 
   depends_on macos: :sonoma
+  depends_on xcode: ["16.0", :build]
 
-  app "Superlemon.app"
+  resource "neovim" do
+    on_arm do
+      url "https://github.com/neovim/neovim/releases/download/v0.12.4/nvim-macos-arm64.tar.gz"
+      sha256 "51ab83afa66d663627c2ab1be43209b0f4e81360d4598b53efaa4d8195f24c89"
+    end
+    on_intel do
+      url "https://github.com/neovim/neovim/releases/download/v0.12.4/nvim-macos-x86_64.tar.gz"
+      sha256 "03fe16f8dd9f1e9eaf52d5e294913a39917b9e2faea30d7fb0fb385fbd36fe59"
+    end
+  end
 
-  zap trash: "~/.config/superlemon"
+  def install
+    source_root = buildpath
+    resource("neovim").stage do
+      nvim_distribution = Dir["nvim-macos-*"].first
+      odie "Neovim distribution is incomplete" if nvim_distribution.nil?
+
+      ENV["SUPERLEMON_NVIM_DIST"] = Pathname.pwd/nvim_distribution
+      system source_root/"scripts/package-app.sh", "release"
+    end
+
+    prefix.install source_root/"dist/Superlemon.app"
+    bin.write_exec_script prefix/"Superlemon.app/Contents/MacOS/superlemon"
+  end
+
+  def caveats
+    <<~EOS
+      Superlemon was built locally and installed at:
+        #{opt_prefix}/Superlemon.app
+
+      Run `superlemon` from a project directory, or open the app with:
+        open #{opt_prefix}/Superlemon.app
+    EOS
+  end
+
+  test do
+    assert_match "SMOKE OK", shell_output("#{bin}/superlemon --smoke")
+  end
 end

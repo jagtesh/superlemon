@@ -39,13 +39,12 @@ Install the latest release with Homebrew:
 
 ```sh
 brew tap jagtesh/tap
-brew install --cask --no-quarantine superlemon
+brew install superlemon
 ```
 
-The current preview builds are ad-hoc signed rather than Apple Developer ID
-signed and notarized. The `--no-quarantine` option bypasses Gatekeeper for this
-app; only use it if you trust this repository and its checksum-pinned release.
-Future notarized releases will use the normal `brew install --cask` command.
+Homebrew builds Superlemon from source on your Mac and packages the application
+locally, so this route does not need to bypass Gatekeeper. It requires Xcode 16
+or newer. Run `superlemon` from a project directory after installation.
 
 Or build and run from source:
 
@@ -99,10 +98,10 @@ The command updates the application version, creates and pushes the release
 commit and `v0.2.0` tag, and starts the release workflow. GitHub Actions tests
 the tagged source, uploads its packaged application as a workflow artifact,
 and attaches that exact archive to the corresponding GitHub Release.
-Once the release workflow completes, publish its checksum-pinned Homebrew cask:
+Once the release workflow completes, publish its checksum-pinned source formula:
 
 ```sh
-scripts/publish-homebrew-cask.sh 0.2.0
+scripts/publish-homebrew-formula.sh 0.2.0
 ```
 
 See [DESIGN.md](DESIGN.md) for the implemented architecture,
