@@ -1,9 +1,9 @@
 -- Superlemon's managed configuration.
 --
--- Used when "Use Superlemon Config" is enabled in the app menu: nvim launches
--- with `-u` pointing here, so the user's own init (and its statusline /
--- bufferline plugins) never loads. This is the fully-native experience —
--- Superlemon's chrome replaces the in-grid equivalents.
+-- Used when Settings selects Superlemon's managed configuration (the default):
+-- nvim launches with `-u` pointing here, so the user's own Neovim init (and its
+-- statusline / bufferline plugins) never loads. This is the fully-native
+-- experience — Superlemon's chrome replaces the in-grid equivalents.
 --
 -- Deliberately small: ordinary editor defaults and one example plugin.
 -- Superlemon-specific behavior lives in the annotated sibling

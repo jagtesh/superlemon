@@ -114,7 +114,8 @@ public struct MessageModel: Sendable, Equatable, Identifiable {
 
     public var text: String { content.joinedText }
 
-    /// Error-kind messages are tinted red and never auto-dismiss.
+    /// Error-kind messages receive red styling; dismissal policy belongs to
+    /// `MessageToastController` and currently applies equally to all kinds.
     public var isError: Bool {
         ["emsg", "echoerr", "lua_error", "rpc_error"].contains(kind)
     }
@@ -127,9 +128,8 @@ public struct MessageModel: Sendable, Equatable, Identifiable {
     }
 }
 
-/// Decoded `tabline_update`: current tabpage index + labels.
-/// Feeds a buffer/workspace switcher later (NORTHSTAR delta 4); no view
-/// in this wave.
+/// Decoded `tabline_update`: current tabpage index + labels. Retained for
+/// protocol completeness; the shipped buffer strip uses `superlemon.buffers`.
 public struct TablineModel: Sendable, Equatable {
     /// Index into `tabs` of the current tabpage.
     public var currentTab: Int

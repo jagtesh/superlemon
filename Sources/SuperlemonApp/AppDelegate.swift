@@ -1,7 +1,6 @@
-// AppDelegate — window/chrome layout and the app-level quit flow (DESIGN.md
-// §10/§14, NORTHSTAR: flat opaque chrome, three-pane layout — sidebar,
-// editor grid, 24pt status bar; light/dark follows nvim's default background
-// via NvimController).
+// AppDelegate — current window/chrome layout and app-level quit flow
+// (DESIGN.md §10/§14). Light/dark follows nvim's default background through
+// NvimController.
 
 import AppKit
 import GridKit
@@ -71,8 +70,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
     // MARK: - NSWindowDelegate
 
-    /// Window close routes through the same `:confirm qa` quit flow as ⌘Q;
-    /// the window actually closes when nvim exits.
+    /// Window close routes through the same native modified-buffer quit flow
+    /// as ⌘Q; the window actually closes when nvim exits.
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         guard let controller, !controller.sessionExited else { return true }
         // Defer out of the delegate callback before starting app termination.
@@ -80,7 +79,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         return false
     }
 
-    // MARK: - Window construction (NORTHSTAR three-pane layout)
+    // MARK: - Window construction
 
     private func makeWindow(for controller: NvimController) {
         let contentRect = NSRect(x: 0, y: 0, width: 1160, height: 720)
@@ -321,8 +320,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         controller?.toggleNativeChrome("statusbar")
     }
 
-    /// App menu ▸ Use Superlemon Config: launch nvim with the managed,
-    /// native-first init instead of the user's own (takes effect at launch).
+    /// Configuration-source selector retained for the Settings-owned managed
+    /// versus user-init preference; changes take effect at launch.
     @objc private func toggleManagedConfig(_ sender: Any?) {
         let defaults = UserDefaults.standard
         let key = NvimController.managedConfigDefaultsKey

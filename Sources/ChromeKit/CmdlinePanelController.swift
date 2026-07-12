@@ -1,6 +1,6 @@
 // The ext_cmdline palette: a borderless floating panel, 560pt wide, anchored
 // upper-center over the parent window (Spotlight-like). Vibrancy is allowed
-// here — cmdline is a transient palette surface (NORTHSTAR §1, delta 9).
+// here because the cmdline is a transient palette surface (NORTHSTAR §1).
 import AppKit
 
 /// Renders `CmdlineModel` one-way (model -> view). Constructible and

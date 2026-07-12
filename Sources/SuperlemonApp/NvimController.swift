@@ -17,10 +17,10 @@ final class NvimController {
     private(set) var session: NvimSession?
     weak var window: NSWindow?
     var surface: GridSurfaceView?
-    /// Wave-3 chrome (ChromeKit + ShellKit); nil in smoke mode.
+    /// Native ChromeKit + ShellKit workspace UI; nil in smoke mode.
     var chrome: WorkspaceChrome?
 
-    /// UserDefaults key for the App-menu "Use Superlemon Config" switch.
+    /// UserDefaults key for the Settings managed-versus-user init choice.
     static let managedConfigDefaultsKey = "UseSuperlemonManagedConfig"
 
     /// Attach size used when there is no surface (headless `--smoke`).
@@ -105,7 +105,7 @@ final class NvimController {
             {
                 arguments += ["--listen", listen]
             }
-            // Config source (Settings window / app menu), in priority order:
+            // Config source (Settings), in priority order:
             // 1. an explicit custom init path, 2. the managed native-first
             // config (the default), 3. the user's own init (no -u at all).
             let defaults = UserDefaults.standard
@@ -485,8 +485,8 @@ final class NvimController {
 
     // MARK: - Quit flow (DESIGN §3)
 
-    /// Backs `applicationShouldTerminate`: nvim decides via `:confirm qa`;
-    /// actual termination happens only on the lifecycle exit event.
+    /// Backs `applicationShouldTerminate`: the app owns the native modified-
+    /// buffer choice, while actual termination waits for nvim's lifecycle exit.
     func handleTerminationRequest() -> NSApplication.TerminateReply {
         if sessionExited || session == nil { return .terminateNow }
         terminationPending = true

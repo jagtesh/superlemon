@@ -28,9 +28,10 @@ public final class ChromeState {
     public private(set) var showcmd: [Chunk] = []
     /// `msg_ruler` content (line/col when 'ruler' is set).
     public private(set) var ruler: [Chunk] = []
-    /// `msg_history_show` entries (for a `:messages` panel, later wave).
+    /// `msg_history_show` entries retained from Neovim's redraw stream.
     public private(set) var history: [MessageModel] = []
-    /// Current tabpages; feeds a buffer switcher later.
+    /// Current ext-tabline model. The shipped native strip is instead driven
+    /// by the runtime's buffer-oriented `superlemon.buffers` notification.
     public private(set) var tabline = TablineModel()
 
     /// Invoked once after any `apply(_:)` that mutated state.

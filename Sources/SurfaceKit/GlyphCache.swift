@@ -15,7 +15,7 @@ struct ShapedRun {
 }
 
 /// LRU cache of shaped runs, keyed by (text, font variant) — deliberately
-/// COLOR-INDEPENDENT (DESIGN §6 step 5): colors are applied at draw time, so
+/// COLOR-INDEPENDENT (DESIGN §6): colors are applied at draw time, so
 /// one entry serves every theme. Owned by a TextRasterizer and discarded
 /// wholesale on font change.
 final class GlyphCache {

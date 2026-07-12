@@ -58,7 +58,8 @@ public struct MsgPosition: Sendable, Equatable {
     }
 }
 
-/// Scroll/cursor state from `win_viewport` (drives native scrollbars).
+/// Scroll/cursor state from `win_viewport`; currently drives smooth viewport
+/// motion and cursor coupling. Native scrollbars are not implemented.
 public struct Viewport: Sendable, Equatable {
     public var topline: Int
     public var botline: Int

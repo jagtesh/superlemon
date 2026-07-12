@@ -10,8 +10,8 @@
 import AppKit
 
 /// superlemon.ui `toast show` kinds (runtime/CONTRACT.md). Mapped onto the
-/// nvim message-kind styling: `error` gets the red persistent treatment,
-/// `info`/`warn` the standard auto-dismissing one.
+/// nvim message-kind styling: `error` gets red treatment; all kinds use the
+/// controller's standard auto-dismiss interval.
 public enum ToastKind: String, Sendable {
     case info
     case warn

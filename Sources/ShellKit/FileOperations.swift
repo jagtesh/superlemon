@@ -1,8 +1,8 @@
 // FileOperations — the actual FileManager mutations behind the sidebar's
 // context menu. The sidebar itself only *emits* `FileOperation` values via
 // its `onFileOperation` callback; the embedder (app layer) decides when to
-// call these (so nvim buffer state can be kept coherent per DESIGN §14.1),
-// then asks the sidebar to reload the affected subtree.
+// call these and then reloads the affected subtree. The current app does not
+// yet reconcile renamed or deleted paths with open nvim buffers (DESIGN §14.1).
 
 import Foundation
 

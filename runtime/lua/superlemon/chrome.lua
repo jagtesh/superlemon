@@ -6,11 +6,12 @@
 -- g:superlemon_native_statusbar seed the state, :SuperlemonChrome flips it,
 -- and the GUI merely reflects `superlemon.chrome` notifications.
 --
--- FAITHFULNESS RULE: this module never touches user options. Turning native
--- chrome on does NOT hide an in-grid statusline/bufferline the user's config
--- draws — resolving the duplication (laststatus/cmdheight/plugins) belongs
--- to whichever init is loaded. Superlemon's annotated managed settings
--- (runtime/config/superlemon.vim) make those choices for the native look.
+-- Native-statusbar adoption is the one deliberate option bridge: by default
+-- this module saves `laststatus`, sets it to zero while the native bar renders
+-- the evaluated statusline, and restores it exactly when the bar turns off.
+-- Set g:superlemon_adopt_statusline = 0 to keep the in-grid bar. Native tabs
+-- do not mutate `showtabline`; the separate startup-only
+-- g:superlemon_hide_tabline setting owns that choice.
 
 local M = {}
 

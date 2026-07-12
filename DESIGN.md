@@ -1,759 +1,961 @@
-# Superlemon — Design Document
+# Superlemon — Current Design
 
-A macOS-native code editor. **Neovim is the editor engine; macOS is the face.**
+Superlemon is a macOS-native code editor with Neovim as its editing engine.
+Neovim runs as an embedded child process and remains authoritative for buffers,
+undo, modes, mappings, registers, syntax, LSP, plugins, windows, and editor
+writes. Superlemon supplies the native window, menus, workspace chrome,
+filesystem browsing and sidebar mutations, input bridge, and rendering pipeline.
 
-Neovim runs headless as an embedded child process and owns everything editorial:
-buffers, undo, modes, motions, registers, tree-sitter, LSP, plugins, the user's
-entire config. Superlemon owns everything the user sees and touches: a
-high-performance native rendering surface, the input system, windows, menus,
-tabs, and dialogs.
+This document describes the implementation currently checked into this
+repository. Anything described as **open work** is not part of the current
+product contract.
 
-**North star:** it never makes you wait. Instant launch, zero perceptible
-typing latency, smooth scrolling. We achieve this by *not* building an editor
-core — Neovim already has a 30-year-hardened editing engine — and spending all
-our engineering budget on the last inch: pixels and input.
-
-**Rendering ground rule:** no WebGL, no hand-rolled Metal pipeline. We render
-with the platform's own text stack — Core Text for shaping, Core Graphics for
-rasterization, Core Animation for compositing. The GPU still does the
-compositing work, but through the same machinery every native Mac app uses.
-That's the point: Superlemon should render like the Mac, look like the Mac, and
-inherit every OS improvement (Retina, ProMotion, vibrancy, wide color) for free.
+The rendering stack is deliberately native: Core Text shapes glyphs, Core
+Graphics rasterizes row tiles, IOSurface provides compositor-shareable backing,
+and Core Animation positions and composites those tiles. Superlemon contains no
+custom Metal renderer. The WindowServer/GPU may still accelerate composition
+under Core Animation.
 
 ---
 
-## 1. Goals & Non-Goals
+## 1. Current product contract and boundaries
 
-### Goals
-- **Full Neovim fidelity.** Anything that works in terminal nvim works here:
-  the user's `init.lua`, plugins, `:terminal`, LSP, tree-sitter highlighting,
-  macros, all of it. We are a UI, not a fork.
-- **A native rendering bridge** (`GridSurface`) that translates Neovim's grid
-  protocol into Core Animation content with terminal-emulator performance.
-- **A native input system**: full IME (Japanese/Chinese/Korean, dead keys,
-  press-and-hold accents), every macOS keyboard convention, ⌘-shortcuts that
-  coexist with Vim's key language and are remappable *from the user's nvim
-  config*.
-- **Native chrome for externalized UI**: Neovim's cmdline, completion popup,
-  tabline, and messages rendered as real AppKit components, not cell-grid
-  imitations.
-- Window/tab/session behavior a Mac user expects: state restoration, native
-  fullscreen, drag-and-drop, Services, the standard Edit menu actually working.
+### Current contract
 
-### Non-Goals (v1)
-- Multiple Neovim instances per window, or one instance across windows
-  (one window ↔ one `nvim` process; simple, crash-isolated).
-- Remote/SSH nvim attachment (the architecture allows it — the RPC layer
-  doesn't care what's on the other end of the pipe — but it's post-v1).
-- Custom file-tree/search UI beyond what nvim plugins provide (post-v1 native
-  sidebar can come later; Neovim's ecosystem covers it meanwhile).
-- Windows/Linux. AppKit is the point.
+- One Superlemon workspace window owns one embedded `nvim --embed` process.
+- Neovim's `ext_linegrid` and `ext_multigrid` protocols are rendered as native
+  Core Animation layers.
+- Compatible vertical viewport scrolling is reconciled with a display-linked,
+  interruptible row filmstrip. Neovim's final grid remains authoritative.
+- Keyboard, IME, mouse, trackpad, paste, and resize input ultimately route back
+  through Neovim.
+- Native chrome currently includes a file-tree sidebar, Quick Open, an optional
+  buffer strip and status bar, externalized command line, completion popup,
+  message toast/history, native prompts, Settings, and standard file panels.
+- Users may run Superlemon's managed Neovim configuration, their normal Neovim
+  configuration, or an explicit init file. Superlemon-specific overrides live
+  in `$XDG_CONFIG_HOME/superlemon/init.vim`.
+- macOS 14 or newer is the package deployment target.
+
+### Intentional or current boundaries
+
+- macOS only. AppKit and Core Animation are part of the product architecture.
+- There is currently one workspace/editor window and one Neovim process.
+  Settings, message history, panels, and sheets are auxiliary windows. Multiple
+  workspace windows and shared/remote Neovim sessions are open work.
+- Neovim owns editor semantics. Superlemon does not implement a parallel buffer,
+  undo, selection, layout, or save model.
+- Vertical viewport scrolling is the optimized interpolated path. Horizontal
+  scrolling and conflicting partial-region scrolls present atomically.
+- The current IME bridge supports marked text, commit/cancel, and candidate
+  placement, but not rich per-clause styling or reconversion fidelity.
+- Session restoration, Finder/Dock open-file routing, drag-and-drop, Services, a
+  command-line helper, signed distribution, and notarization are open work.
 
 ---
 
-## 2. Architecture Overview
+## 2. Architecture overview
 
+The Swift package contains modules with deliberately narrow responsibilities:
+
+```text
+SuperlemonApp (@MainActor integration)
+├── AppDelegate
+│   ├── application/window lifecycle
+│   ├── menus, About, Settings, open/save panels
+│   └── native workspace layout
+├── NvimController
+│   ├── one NvimSession
+│   ├── one GridStore
+│   ├── ordered input queue
+│   └── redraw/runtime/chrome coordination
+├── InputHostView
+│   └── first responder + NSTextInputClient + mouse adapter
+├── WorkspaceChrome
+│   └── ChromeKit + ShellKit wiring
+└── UIComponentRouter
+    └── superlemon.ui protocol dispatcher
+
+NvimKit (actor)                 InputKit (pure value translation)
+├── child process + pipes       ├── key notation
+├── MessagePack-RPC             ├── Option policy
+├── typed redraw decoding       ├── mouse translation
+└── lifecycle/notification      └── fractional scroll accumulation
+
+GridKit (@MainActor store)      ShellKit (@MainActor views + FileIndex actor)
+├── row-COW Grid values         ├── file tree and file operations
+├── highlights and layout       ├── Quick Open and fuzzy scoring
+├── damage/scroll provenance    ├── buffer strip
+└── deferred presentation       └── native status bar
+
+SurfaceKit (@MainActor)         ChromeKit (@MainActor)
+├── Core Text rasterizer        ├── cmdline state/panel
+├── row IOSurface renderer      ├── popupmenu state/panel
+├── display-linked filmstrip    └── messages/toasts/history
+└── cursor layer
 ```
-┌────────────────────────────── superlemon.app ──────────────────────────────┐
-│                                                                            │
-│  ShellKit          windows, menus, dialogs, session restore, settings      │
-│     │                                                                      │
-│  ┌──▼───────────────────────── per window ─────────────────────────────┐   │
-│  │                                                                     │   │
-│  │  InputKit ──────────────┐            ┌───────────── ChromeKit       │   │
-│  │  NSTextInputClient,     │            │   native cmdline, popupmenu, │   │
-│  │  key translation,       │            │   tabline, messages          │   │
-│  │  mouse/trackpad         │            │                              │   │
-│  │            │            │            │                              │   │
-│  │            ▼            ▼            ▼                              │   │
-│  │  SurfaceKit — GridSurfaceView (the bridge, §5–6)                    │   │
-│  │  CALayer tree · Core Text raster · damage tracking · cursor         │   │
-│  │            ▲                                                        │   │
-│  │            │ typed UI events (batched, flush-atomic)                │   │
-│  │  GridKit — grid model: cells, highlight table, windows, viewport    │   │
-│  │            ▲                                                        │   │
-│  └────────────┼────────────────────────────────────────────────────────┘   │
-│               │                                                            │
-│  NvimKit — msgpack-RPC session (actor): requests, notifications,           │
-│            redraw-event decoding, process lifecycle                        │
-│               ▲                                                            │
-└───────────────┼────────────────────────────────────────────────────────────┘
-                │ stdin/stdout pipes (msgpack-RPC)
-        ┌───────▼────────┐
-        │  nvim --embed  │   + bundled runtime plugin (§9)
-        └────────────────┘
-```
 
-Local SwiftPM packages, dependency arrows point down only. Swift 6 strict
-concurrency: `NvimKit` is an actor; `GridKit` produces `Sendable` snapshots;
-everything above the model layer is `@MainActor`.
+SwiftPM dependency edges remain one-way:
 
-### Data flow, both directions
+- `GridKit` depends on `NvimKit` for typed UI events.
+- `SurfaceKit` depends on `GridKit`.
+- `ChromeKit` depends on `NvimKit`.
+- `InputKit` and `ShellKit` are independent libraries.
+- `SuperlemonApp` is the integration target and depends on all six libraries.
 
-**Down (input):** NSEvent → InputKit translates to Neovim key notation →
-`nvim_input("<D-s>")` / `nvim_input_mouse(...)` — fire-and-forget
-notifications, never blocking the main thread.
+### Concurrency and ownership
 
-**Up (rendering):** nvim emits `redraw` notification batches → NvimKit decodes
-into typed events → GridKit applies them to the grid model, accumulating
-damage → on `flush`, a snapshot + damage list hops to the main actor →
-SurfaceKit rasterizes damaged spans and commits one `CATransaction`.
+- `NvimSession` is an actor. Pipe pumps read off-actor and deliver decoded
+  chunks back to the actor.
+- `RedrawBatch`, RPC values, grid snapshots, and model records are `Sendable`
+  value types.
+- `NvimController`, `GridStore`, SurfaceKit, ChromeKit, ShellKit views, and the
+  app shell run on the main actor.
+- `FileIndex` is an actor so project walking and fuzzy queries do not execute in
+  view callbacks.
+- IOSurface and CGImage row snapshots are immutable once published. Explicit
+  leases keep IOSurfaces out of the reuse pool while model history or the
+  compositor can still reference them.
 
-The `flush` event is Neovim's frame boundary: everything between two flushes is
-one consistent screen state. We never present a partial batch — this is what
-makes the UI tear-free without any frame synchronization of our own.
+### Data flow from Neovim
 
----
+1. Neovim writes MessagePack-RPC `redraw` notifications to stdout.
+2. NvimKit decodes them into typed `RedrawBatch` values.
+3. `NvimController` consumes batches on the main actor.
+4. `WorkspaceChrome` observes every batch in wire order.
+5. `GridStore.applyDeferred(_:)` applies every authoritative model event in wire
+   order and classifies flushed frames as immediate or display-linked.
+6. Immediate frames drain pending presentation synchronously. Compatible scroll
+   frames may accumulate until the next shared display callback while motion is
+   active.
+7. `GridSurfaceView` updates row revisions, viewport motion, and cursor state in
+   one Core Animation transaction with implicit actions disabled.
 
-## 3. NvimKit — process & RPC layer
+Neovim's `flush` event is the wire-level consistency boundary. Superlemon never
+presents a half-applied wire frame. Display-linked coalescing may skip obsolete
+intermediate *presentations*, but it never skips model events or protocol input.
 
-### Process lifecycle
-- Spawn `nvim --embed` via `Process`, pipes on stdin/stdout, stderr captured to
-  a ring buffer (surfaced in a debug console and in crash reports).
-- Binary discovery: user setting → `$PATH` (login-shell resolved, since GUI
-  apps don't inherit shell PATH) → optional bundled nvim in
-  `Contents/Helpers/` as fallback. Minimum supported: nvim 0.10.
-- Handshake: `nvim_get_api_info` (validate API level), `nvim_set_client_info`,
-  load bundled runtime plugin (§9), then `nvim_ui_attach(cols, rows, opts)`
-  with:
+### Data flow to Neovim
 
-  ```
-  ext_linegrid: true      // modern grid protocol — required
-  ext_multigrid: true     // one grid per window (§5)
-  ext_cmdline:  true      // native command line (§8)
-  ext_popupmenu: true     // native completion popup (§8)
-  ext_tabline:  true      // native tab bar (§8)
-  ext_messages: true      // native message toasts (§8)
-  rgb: true
-  ```
-
-- Exit handling: normal exit closes the window; abnormal exit shows a native
-  alert with the stderr tail and a Relaunch button that restores the session
-  (via nvim's own `:mksession` autosaved by the runtime plugin).
-- Quit flow: ⌘Q and window-close send `:confirm qa` semantics — nvim itself
-  prompts about unsaved buffers through the native dialog path (§8), so we
-  never second-guess buffer state from outside.
-
-### RPC
-- msgpack-RPC over the pipes: requests (with msgid correlation), responses,
-  notifications. Implemented as a small hand-rolled codec (~500 lines: msgpack
-  is simple, and owning it avoids dependency drift on the hot path).
-- `NvimSession` actor API:
-  - `func request(_ method: String, _ params: [Value]) async throws -> Value`
-  - `func notify(_ method: String, _ params: [Value])` — used for all input
-  - `var uiEvents: AsyncStream<RedrawBatch>` — decoded, typed, batched
-- Redraw decoding is table-driven: event name → decoder. Unknown events are
-  logged and skipped (forward compatibility with newer nvim).
-- The decode hot path (`grid_line`) avoids intermediate `[Value]` arrays —
-  it parses cells straight into `GridKit` cell runs.
+Keyboard, mouse, wheel, paste, and resize commands enter one main-actor FIFO in
+`NvimController`. Adjacent compatible input commands coalesce without changing
+their semantics. Notifications are serialized into one contiguous pipe write;
+wheel repeats remain an exact repeated sequence of `nvim_input_mouse`
+notifications. Paste uses one `nvim_paste` request and resize uses
+`nvim_ui_try_resize`.
 
 ---
 
-## 4. GridKit — the model
+## 3. NvimKit — process and RPC layer
 
-Neovim's linegrid protocol is a terminal-shaped abstraction: numbered grids of
-cells, each cell a grapheme cluster plus a highlight ID.
+### Process startup
+
+`NvimController.start()` resolves Neovim in this order:
+
+1. executable path in `SUPERLEMON_NVIM`;
+2. an app-bundled `Contents/Helpers/nvim` or development sibling binary;
+3. `command -v nvim` from a login zsh;
+4. `/opt/homebrew/bin/nvim` as the final fallback.
+
+The controller launches `nvim --embed`. `SUPERLEMON_LISTEN=<path>` adds
+`--listen <path>` for diagnostics and external driving.
+
+Neovim configuration is selected before launch:
+
+1. an existing explicit custom init path from Settings;
+2. the managed `runtime/config/init.lua` when managed configuration is enabled;
+3. otherwise no `-u` flag, allowing Neovim to load the user's normal init.
+
+After the process starts, Superlemon:
+
+1. calls `nvim_get_api_info` and records channel/API/version metadata;
+2. identifies itself with `nvim_set_client_info`;
+3. attaches the UI with `ext_linegrid`, `ext_multigrid`, `ext_cmdline`,
+   `ext_popupmenu`, `ext_messages`, and RGB color enabled;
+4. prepends the bundled runtime to `runtimepath`;
+5. sources the personal Superlemon configuration once; and
+6. calls `require('superlemon').setup(channel)`.
+
+`ext_tabline` is decoded by NvimKit but is not enabled by the application. The
+visible native strip is a runtime-driven buffer list, not Neovim tabpages.
+
+The handshake currently records API compatibility data but does not reject an
+older Neovim version. Version claims should therefore be treated as tested
+compatibility, not an enforced runtime gate.
+
+### RPC implementation
+
+NvimKit owns a hand-written MessagePack encoder/decoder and MessagePack-RPC
+session:
+
+- requests correlate responses by message ID;
+- input notifications are fire-and-forget;
+- package-scoped notification batches preserve ordering in one pipe write;
+- requests initiated by Neovim are dispatched through an async handler;
+- non-redraw notifications feed a separate ordered stream;
+- unknown redraw events are logged and skipped;
+- malformed MessagePack terminates the session rather than advancing a corrupt
+  model, while well-formed unknown/non-RPC payloads are logged and skipped;
+- stderr is retained in a bounded 64 KiB ring.
+
+`grid_line` is decoded from MessagePack values into typed `CellRun` values. It is
+not a raw-byte zero-copy parser.
+
+### Exit and quit behavior
+
+Normal Neovim exit closes the window and terminates the current app instance.
+Unexpected exit presents the exit code and captured stderr tail, then closes.
+There is no current session autosave or automatic relaunch.
+
+Quit and window close use an app-owned native flow:
+
+1. query listed modified buffers, guarded by a two-second timeout;
+2. if none are modified, issue `qa!`;
+3. otherwise present Save All & Quit, Discard All & Quit, and Cancel;
+4. Save All runs `wall` and then `qa!`;
+5. if Neovim does not answer, offer Cancel or Force Quit.
+
+Neovim still owns the actual write operations and buffer state. The native sheet
+does not maintain a duplicate modified-buffer model.
+
+---
+
+## 4. GridKit — authoritative presentation model
+
+Neovim exposes terminal-shaped grids. GridKit stores the last authoritative
+state needed to render them.
 
 ```swift
-struct Cell { var text: SmallString   // grapheme cluster, usually 1 scalar
-              var hlID: HlID }        // index into the highlight table
-
-final class Grid {                    // one per nvim window (ext_multigrid)
-    var id: Int
-    var size: (rows: Int, cols: Int)
-    var cells: [[Cell]]               // row-major
-    var damage: DamageMap             // per-row dirty column ranges
-    var winFrame: GridFrame?          // position from win_pos / win_float_pos
-    var viewport: Viewport            // topline/botline/curline from win_viewport
-    var zIndex: Int                   // floats stack above windows above grid 1
+struct Grid: Sendable {
+    let id: Int
+    private(set) var rows: Int
+    private(set) var cols: Int
+    private var cellRows: [[Cell]]       // row-level copy-on-write
+    var damage: DamageMap                // dirty spans + ordered scrolls
+    var windowFrame: WindowFrame?
+    var floatAnchor: FloatAnchor?
+    var msgPosition: MsgPosition?
+    var viewport: Viewport?
+    var viewportMargins: ViewportMargins?
+    var isHidden: Bool
+    var isExternal: Bool
 }
 ```
 
-Events applied (the full `ext_linegrid` + `ext_multigrid` vocabulary):
+`cells` remains a flattened compatibility view. Renderers use `rowCells(_:)` so
+editing one line copies only that row. A full-width vertical `grid_scroll`
+rotates row-array references; partial-column and horizontal scrolls copy only
+the affected destination rows.
 
-| Event | Model effect |
-|---|---|
-| `grid_resize`, `grid_clear`, `grid_destroy` | structure |
-| `hl_attr_define`, `default_colors_set`, `hl_group_set` | highlight table: fg/bg/special color, bold/italic/underline(+curl/dot/dash), strikethrough, reverse, blend |
-| `grid_line` | write cell runs, mark damage |
-| `grid_scroll` | rotate row-COW model storage and record a scroll delta so the row renderer can rotate cached tiles (§6) |
-| `grid_cursor_goto` | cursor grid+position |
-| `win_pos`, `win_float_pos`, `win_hide`, `win_close`, `msg_set_pos` | window geometry & z-order |
-| `win_viewport` | scrollbar model: per-window native overlay scrollers |
-| `mode_info_set`, `mode_change` | cursor shape (block/beam/underline), blink timing, per-mode attributes |
-| `busy_start/stop`, `mouse_on/off`, `bell`, `visual_bell`, `set_title`, `option_set` | shell-level state |
+### Damage and scroll provenance
 
-`option_set guifont` deserves a callout: `:set guifont=SF\ Mono:h13` in the
-user's config drives the *native* font. GridKit parses it, SurfaceKit rebuilds
-metrics, and we call `nvim_ui_try_resize` with the new cell geometry. Font
-choice lives in the user's dotfiles, where a vim user expects it.
+`DamageMap` retains:
 
-Damage tracking is the renderer's contract: after applying a batch, GridKit
-hands SurfaceKit `(grid snapshot, dirty row-ranges, scroll deltas)` — nothing
-else gets touched at draw time.
+- sorted, coalesced dirty column spans per row; and
+- ordered `ScrollDelta` records.
 
----
+Compatible adjacent, same-region, same-direction vertical scroll records compact
+for presentation. Reversals, horizontal motion, and conflicting regions remain
+ordered so the renderer can choose an atomic repaint. Recording a scroll also
+translates existing dirty spans with their content and marks the exposed strip.
 
-## 5. SurfaceKit — the bridge component
+`FlushResult` contains:
 
-This is the piece the whole design exists for: **`GridSurfaceView`**, a
-layer-hosting `NSView` that makes Neovim's cell grids into native pixels.
+- immutable damaged-grid snapshots and consumed damage;
+- all live grids for layout;
+- one-shot semantic `win_viewport` movement per grid;
+- motion provenance including net delta, largest individual step, direction,
+  step count, and reversal state;
+- an `allowsScrollInterpolation` safety flag;
+- highlights, cursor/mode, title, busy state, and mouse state.
 
-### Layer tree
+Semantic viewport deltas are consumed once per presented frame, including when
+several wire flushes coalesce.
 
-```
-GridSurfaceView (layer-hosting NSView, @MainActor)
-└── rootLayer
-    ├── GridLayer (grid 2 — window)          ← one per nvim window
-    ├── GridLayer (grid 3 — window)
-    ├── GridLayer (grid 5 — float)             rounded corners, shadow,
-    │                                          optional NSVisualEffectView blur
-    ├── GridLayer (message grid)
-    ├── CursorLayer                          ← §6, drawn above everything
-    └── IMEOverlayLayer                      ← marked-text preedit (§7)
-```
+### Event handling
 
-With `ext_multigrid`, every Neovim window is its own grid — so every window is
-its own `CALayer`, positioned by `win_pos`/`win_float_pos`. Consequences that
-fall out for free:
+GridKit applies linegrid, multigrid, highlight, cursor, mode, title, option,
+busy, and mouse events. `win_viewport_margins` records stationary rows/columns
+such as winbars and status columns. `win_viewport` currently drives smooth
+viewport motion and cursor coupling; native scrollbars are not implemented.
 
-- **Floats are native surfaces.** Rounded corners (`cornerRadius`), real
-  `CALayer` shadows, and — because `hl_attr_define` carries `blend` — background
-  blur via a sibling `NSVisualEffectView` clipped to the float's frame. Neovim
-  floats look like macOS popovers.
-- **Per-window scrolling is per-layer damage.** A `grid_scroll` in one split
-  never invalidates a pixel of another.
-- **Z-order is `zPosition`.** No painter's-algorithm bookkeeping.
+Some global events are decoded for forward compatibility but do not yet have an
+app-shell effect, including bell, visual bell, icon, suspend, menu update, and
+redraw-level directory-change events.
 
-### GridLayer: row tiles + display-linked scrolling
-
-Each `GridLayer` owns Retina-scaled, row-sized bitmap contexts backed by sRGB
-`IOSurface` allocations. Immutable row revisions are shared by the
-authoritative layer tree and a two-viewport circular history; Core Animation
-imports those surfaces directly instead of synchronously converting and
-copying a `CGImage` at transaction commit. The pool is bounded to four grid
-heights and recycles a surface only after its revision lease and compositor
-use count are clear. A plain immutable `CGImage` is the saturation fallback,
-and full-grid composition remains on demand for tests and screenshots.
-
-Per flush, for each damaged grid:
-
-1. **Rotate row references.** A compatible vertical `grid_scroll` reorders
-   row backings and recycles the rows that left the viewport. Cached outgoing
-   images remain immutable through Core Graphics COW.
-2. **Rasterize only damaged rows/spans** (§6). Horizontal or conflicting
-   partial regions repaint their affected rows atomically from the final Grid
-   model.
-3. **Present exact row revisions.** Margins remain in stationary row layers;
-   the inner viewport uses `height + 1` recyclable layers in a clipped
-   container. A critically damped spring translates that one container,
-   pixel-snapped at Retina scale. Filmstrip slots move with the history head,
-   so surviving rows keep their existing `CALayer.contents`; only an exposed
-   edge or genuinely revised row binds new surface contents.
-4. **Coalesce to display cadence.** The first idle scroll presents
-   immediately. While motion is active, compatible Neovim flushes accumulate
-   in GridKit and are consumed once at the next shared display callback. No
-   protocol event or input is dropped; non-scroll frames drain immediately
-   and settle any active tail atomically. Coalesced viewport metadata retains
-   net displacement, largest individual step, and reversal provenance, so
-   many small steps never masquerade as one far jump.
-
-Why this shape and not the alternatives:
-
-- **Plain `draw(_:)` NSView** — redraws every visible line on scroll; CPU-bound
-  on large windows; no per-window compositing. Rejected.
-- **`CATiledLayer`** — asynchronous tile draws cause visible pop-in; built for
-  maps, not editors. Rejected.
-- **One full-grid bitmap plus scroll blits** — correct, but fast momentum
-  repeatedly snapshots, blits, and uploads the entire surface on the main
-  thread. Replaced by bounded row tiles; full-image composition remains an
-  on-demand test/screenshot fallback.
-- **A bespoke `CAMetalLayer` renderer** — offers explicit texture ownership and
-  a glyph atlas, but duplicates Core Animation's already-GPU-backed translation
-  path and greatly expands renderer scope. Direct `IOSurface` row contents
-  remove the measured upload/copy bottleneck while retaining AppKit/Core Text.
-
-### Resize & metrics
-
-- Window resize → `cols = floor(surfaceWidth / cellWidth)`, likewise rows →
-  `nvim_ui_try_resize`. During live-resize, coalesce to one request per frame;
-  nvim replies with `grid_resize` and repaint events.
-- Cell geometry from the primary font: `cellWidth = advance('M')`,
-  `cellHeight = ceil(ascent + descent + leading) + linespace` (linespace from
-  `option_set`). All layout in cell units × these two numbers; fractional
-  scaling never appears because layers sit on pixel-aligned cell boundaries.
+`option_set` values are retained by GridStore. `NvimController` parses `guifont`
+and `linespace`, updates the SurfaceKit `FontSpec`, and requests a fresh Neovim
+layout when metrics change.
 
 ---
 
-## 6. Text rendering pipeline (Core Text)
+## 5. SurfaceKit — row rendering and viewport motion
 
-The rasterization of a damaged span, start to finish:
+`GridSurfaceView` is a layer-hosting, flipped `NSView`. It resolves multigrid
+positions with `GridLayout`, creates one host CALayer per visible grid, and keeps
+one cursor layer above the grid tree.
 
-1. **Run coalescing.** Walk the span's cells, merging consecutive cells with
-   identical `hlID` into *style runs*. Typical code line: 5–15 runs.
-2. **Background pass.** Fill each run's background rect (`CGContextFillRect`,
-   batched by color). Backgrounds are painted full-cell so double-width and
-   ligature cells never leave seams.
-3. **Shaping.** Per run: build the run's string (concatenated cell graphemes),
-   shape with `CTTypesetter`/`CTLine` using the resolved font (base font +
-   bold/italic traits via `CTFontCreateCopyWithSymbolicTraits`). Core Text
-   handles font fallback (CJK, emoji, symbols) via cascade lists — we get
-   correct glyphs for every script without any work.
-4. **Ligatures for free, columns preserved.** Because a style run shapes as one
-   string, `=>` `!=` `->` form ligatures naturally in fonts that have them
-   (opt-out setting). Monospaced advances mean shaped positions already land on
-   cell boundaries; double-width CJK occupies two cells exactly as nvim
-   allocated them (nvim sends the trailing half as an empty cell).
-5. **Glyph cache.** Extract `(glyphs[], positions[])` from the CTLine's runs
-   once, cache keyed by `(string, fontID, traits)` — colors deliberately
-   excluded so one cache entry serves every theme color. LRU-capped (~4 MB).
-   Cache hit rate while typing/scrolling is ≈99%: most lines repeat.
-6. **Draw.** Set fill color from the highlight attrs, `CTFontDrawGlyphs` into
-   the backing store (handles color-bitmap emoji correctly, unlike raw
-   `CGContextShowGlyphs`). Then decorations: underline/undercurl/underdot/
-   strikethrough as paths, in the highlight's `special` color.
-7. **Font smoothing** matches Terminal.app's behavior (respect the user's
-   global font-smoothing default; no forced faux-bolding).
+```text
+GridSurfaceView
+├── grid host layer (one per visible Neovim grid)
+│   ├── stationary base row layers
+│   └── clipped SmoothViewportState
+│       ├── translated row container (innerHeight + 1 recyclable rows)
+│       ├── velocity-veil snapshot
+│       └── accent gradient
+└── CursorLayer
+```
+
+Grid host layers preserve Neovim's resolved geometry and z-order. They are
+opaque and clipped. Float positioning works, but native rounded corners, float
+shadows, and background blur are not currently applied.
+
+The IME preedit layer does not live here; `InputHostView` owns it so marked-text
+state remains part of the input bridge.
+
+### Row-backed renderer
+
+Each `GridRenderer` owns row-sized BGRA bitmap contexts at the current backing
+scale. The preferred backing is sRGB IOSurface memory:
+
+- a compatible full-width vertical scroll rotates row backings;
+- exposed or damaged rows receive new writable backings;
+- published revisions are immutable;
+- use-count leases and `IOSurfaceIsInUse` prevent premature reuse;
+- each per-grid pool is bounded to four grid heights;
+- saturation falls back to an immutable CGImage-backed context;
+- only style runs intersecting dirty spans repaint; and
+- `image()` composes a full grid only for tests, screenshots, and compatibility.
+
+Core Animation receives the IOSurface object directly as row-layer contents on
+the production path. Normal viewport scrolling never uploads a newly composed
+full-grid image.
+
+### Display-linked row filmstrip
+
+Each grid has an independent `SmoothViewportState`:
+
+- history capacity is twice the inner viewport height;
+- stationary margin rows/columns remain in base layers;
+- the inner viewport uses `innerHeight + 1` recyclable row layers;
+- only the clipped row container translates each display tick;
+- row layers rebind when an integer boundary is crossed or a row revision
+  changes; and
+- translation is snapped to physical backing pixels.
+
+The first scroll from idle presents immediately. While compatible motion is
+active, later scroll-only flushes may accumulate in GridStore and are consumed
+at the start of the next shared display callback. Immediate model changes drain
+pending scroll state before presenting.
+
+The motion model is a 0.3-second analytical critically damped spring in row
+units. New deltas retarget position without zeroing velocity, including through
+reversals. Delayed display intervals are integrated in steps no larger than
+1/120 second while only the final result is rendered.
+
+A jump is considered truly far only when one incoming semantic step exceeds the
+inner viewport height. Many individually valid steps keep history and velocity
+even if cumulative visual debt reaches a screen. Debt clamps to retained
+capacity. A true far jump discards unavailable history and shows a final
+one-line directional cue.
+
+Horizontal scrolls, mismatched semantic/pixel directions, resize/layout changes,
+and conflicting partial scroll regions settle and present atomically.
+
+### Adaptive velocity veil
+
+Exact rows remain the primary presentation. A short velocity veil appears only
+when exact retained history cannot represent the transition:
+
+- a true beyond-screen jump;
+- clamped debt receiving new input for two display periods; or
+- a measured display callback gap of at least two periods.
+
+The veil uses a throttled quarter-resolution snapshot assembled off-main from
+immutable row images. It is softly magnified and directionally offset, with a
+moving accent gradient capped at 8% opacity. It fades in over one display period,
+fades out over 50 ms when exact motion resumes, and has a 150 ms hard limit.
+Direction changes remove or reverse it immediately. The cursor dims without
+restarting blink.
+
+### Motion policy and accessibility
+
+`GridSurfaceView.scrollMotionStyle` is public and source-compatible:
+
+- `.tightNative` enables filmstrip interpolation and the adaptive veil;
+- `.immediate` installs every authoritative frame without interpolation.
+
+`NSWorkspace.accessibilityDisplayShouldReduceMotion` is observed live. Reduce
+Motion settles all springs and scheduled presentation immediately and bypasses
+interpolation and veil behavior.
+
+### Resize and backing changes
+
+The grid size is the number of whole cells that fit the view bounds. Live resize
+requests coalesce once per main-run-loop turn. Neovim remains authoritative for
+the resulting `grid_resize` and repaint sequence.
+
+Cell width is the ceiling of the primary font's `M` advance. Cell height is the
+ceiling of ascent + descent + leading, plus `linespace`. A font, linespace, or
+backing-scale change destroys incompatible history, rebuilds row contexts, and
+forces an authoritative repaint.
+
+---
+
+## 6. Text and cursor rendering
+
+### Text rasterization
+
+For each damaged row, SurfaceKit:
+
+1. coalesces adjacent equal-highlight cells into style runs;
+2. splits configured Powerline/PUA and synthesized-ligature runs when needed;
+3. fills the full run background;
+4. shapes non-synthetic text through Core Text;
+5. snaps glyph positions back onto Neovim's fixed cell grid;
+6. draws glyphs with `CTFontDrawGlyphs`; and
+7. draws underline, double underline, dotted/dashed underline, undercurl, and
+   strikethrough from resolved highlight attributes.
+
+Core Text provides fallback segmentation for CJK, emoji, and symbols. Bold and
+italic variants come from symbolic font traits when the family supports them.
+
+The glyph cache is color-independent and scoped to one `TextRasterizer`. It is
+bounded by 4,096 shaped-run entries and is rebuilt on font changes. It is not a
+byte-counted 4 MB cache and no fixed hit-rate is guaranteed.
+
+Row contexts use sRGB BGRA storage and explicitly disable font smoothing for
+stable, pixel-consistent rasterization. Antialiasing remains enabled.
+
+### Fonts, ligatures, and symbols
+
+Neovim's `guifont` and `linespace` own font name, size, and cell spacing. Runtime
+settings additionally control:
+
+- standard ligatures;
+- vector Powerline fallback;
+- the process-local bundled Fira Code Nerd Font companion for symbols and
+  coding ligatures; and
+- forced fallback synthesis for testing or broken fonts.
+
+The companion font affects symbols/ligatures only; normal source text continues
+to use `guifont`.
 
 ### Cursor
 
-`CursorLayer` is separate from grid content so it can move without touching any
-backing store:
+`CursorLayer` is separate from row backing stores:
 
-- Shape and blink cadence from `mode_info_set`/`mode_change` (block in normal,
-  beam in insert, underline for replace, plus per-mode `attr_id` colors).
-- A block cursor re-renders its one cell with reversed colors *into the cursor
-  layer* — the grid underneath stays untouched.
-- Blink via `CAKeyframeAnimation` (no timers, no main-thread wakeups); blink
-  suppressed while typing.
-- During display-linked viewport motion, cursor Y uses the same residual
-  offset and clamps to the nearest inner edge. Authoritative cursor changes
-  preserve its visual position with a short correction spring; scroll-only
-  frames never restart blink.
-- `busy_start`/`busy_stop` hide/show the cursor.
+- shape, percentage, color attributes, and blink timings come from Neovim mode
+  events;
+- a block cursor re-renders its current cell with reversed colors into the
+  cursor layer;
+- blink uses a `CAKeyframeAnimation`;
+- style/glyph/blink state rebuilds only when its semantic signature changes;
+- scroll-only frames preserve the existing blink phase;
+- active viewport motion derives cursor Y from the same pixel-snapped residual;
+- the cursor clamps to the nearest inner viewport edge;
+- authoritative cursor-row changes during motion retain the prior visual
+  position through a 40 ms correction spring; and
+- `busy_start` hides the cursor.
 
-### Performance budgets
+Typing does not currently suppress blink. The velocity veil alone reduces cursor
+opacity temporarily.
 
-| Metric | Budget |
+### Instrumentation and targets
+
+Scroll frames emit `os_signpost` events and can record a bounded in-memory
+diagnostic ring when `SUPERLEMON_SCROLL_TRACE=1` or a test hook is installed.
+Samples include time, semantic delta, history head, spring position/velocity,
+and authoritative/visual cursor Y.
+
+Low input latency, hitch-free 60/120 Hz scrolling, bounded memory growth, and
+fast launch remain product targets. End-to-end key/RPC/raster/commit signposts,
+cold-launch budgets, and automated performance gates are open work rather than
+current test guarantees.
+
+---
+
+## 7. InputKit and the application input bridge
+
+InputKit is a pure translation library. `InputHostView` in SuperlemonApp owns
+AppKit event handling and is the window's first responder.
+
+### 7.1 Keyboard path
+
+```text
+NSEvent.keyDown
+├── marked text active ───────────────► interpretKeyEvents
+├── translatable chord/special key ───► NvimController.sendInput
+└── printable/dead-key input ─────────► interpretKeyEvents
+                                        ├── insertText
+                                        └── setMarkedText
+```
+
+InputKit covers Escape, Return, Backspace/Delete, Tab, arrows, Home/End,
+PageUp/PageDown, Insert-position Help, F1–F20, and distinct keypad keys. Chords
+use Neovim notation with canonical modifier order `M-`, `C-`, `S-`, `D-`.
+Literal `<` becomes `<lt>` before `nvim_input`.
+
+The current Option policy is left Option = Meta and right Option = native Option.
+It is represented as a value type and thoroughly unit-tested, but no runtime
+setting currently changes `InputHostView.optionPolicy`.
+
+Superlemon disables macOS press-and-hold accents in its app defaults so holding
+Vim movement keys repeats normally. Dead keys and marked-text IMEs still route
+through `NSTextInputClient`.
+
+### 7.2 IME and marked text
+
+`InputHostView` implements `NSTextInputClient` and keeps uncommitted marked text
+out of Neovim. A `CATextLayer` at the cursor displays the marked string with a
+single underline. `firstRect(forCharacterRange:)` maps the cursor cell into
+screen coordinates so macOS can place its candidate window.
+
+Commit clears the overlay and sends escaped text through `nvim_input`; cancel
+removes it without changing the buffer. Current limitations are deliberate to
+document: replacement ranges, attributed substring retrieval, rich active-clause
+styling, and reconversion-specific behavior are not implemented.
+
+### 7.3 Command shortcuts and File menu
+
+Command chords without native menu ownership reach Neovim as `<D-...>`. The
+runtime installs defaults only where the user has no existing mapping. Users can
+disable all defaults with `g:superlemon_default_keymaps = 0`.
+
+Native menu key equivalents run before `keyDown`. Current File workflows are:
+
+| Menu item | Shortcut | Current behavior |
+|---|---:|---|
+| Open File… | ⌘O | Native `NSOpenPanel`, then Neovim `:drop` |
+| Open Folder… | ⇧⌘O | Native folder panel, `nvim_set_current_dir`, then re-root native project state |
+| Save | ⌘S | Send remappable `<D-s>`; default writes a named buffer or asks the GUI for Save As |
+| Save As… | ⇧⌘S | Native `NSSavePanel`, then Neovim `nvim_cmd({cmd='saveas', bang=true})` |
+| Close | ⌘W | Begin the app's native modified-buffer quit flow |
+
+Other native equivalents include Settings (`⌘,`), Paste (`⌘V`), sidebar toggle
+(`⌘B`), Quick Open (`⌘P`), and Quit (`⌘Q`). Quick Open and native file panels
+are app actions, not Neovim mappings. Native Tabs and Native Status Bar menu
+validation reflects runtime state; general enabled/modified menu validation is
+not currently pushed from Neovim.
+
+The clipboard provider supports plain strings for the `+` and `*` registers.
+It does not currently publish HTML or rich-text pasteboard flavors.
+
+### 7.4 Mouse and trackpad
+
+Mouse press, drag, and release become `nvim_input_mouse` with multigrid-local
+coordinates. Double/triple/quadruple click counts are encoded on press. The grid
+under mouse-down is latched for drag and release, as required by Neovim's
+multigrid contract.
+
+Precise trackpad deltas accumulate independently in fractional row/column units.
+Each whole cell crossed emits an exact wheel notification; sub-cell remainder is
+retained. Direction reversal clears stale remainder on that axis. Non-precise
+wheel input is already line-based and every nonzero notch emits at least one
+step. Adjacent repeats use the input queue's batched pipe write.
+
+The managed Superlemon configuration sets `mousescroll=ver:1,hor:1` for fine
+steps. A user/custom Neovim configuration remains authoritative for its own
+`mousescroll`. `mouse_on` and `mouse_off` gate pointer and wheel forwarding.
+
+Pinch-to-zoom and Force Click LSP actions are not currently implemented. Font
+zoom is available through the runtime's Command-=, Command--, and Command-0
+mappings.
+
+---
+
+## 8. ChromeKit — externalized Neovim UI
+
+ChromeKit models and renders the external UI extensions currently enabled at
+attach:
+
+| Neovim surface | Current native presentation |
 |---|---|
-| Keystroke → glyph on screen (end-to-end, incl. nvim round trip) | < 8 ms (one 120 Hz frame) |
-| Full-screen scroll, 4K display | no dropped frames |
-| Flush → CATransaction commit | < 2 ms typical |
-| Cold launch → first render of restored session | < 400 ms |
+| `ext_cmdline` | With native status bar off: upper-center nonactivating vibrancy panel. With it on: an attributed command segment inside the bottom bar. Nested levels and block lines are modeled. |
+| `ext_popupmenu` | Nonactivating child panel with virtualized NSTableView, word text, textual kind, selection syncing, and grid/cmdline anchoring. Menu/info columns and SF Symbol kind icons are not rendered. |
+| `ext_messages` | One replacing toast, a bounded timestamped history panel, and NSAlert sheets for confirm-kind prompts. Toasts auto-dismiss; they do not stack. |
+| `ext_tabline` | Decoder/model support only. It is not attached or used for the visible strip. |
 
-Instrumented with `os_signpost` at each pipeline stage (keyDown, RPC write,
-redraw decode, raster, commit) so latency regressions show up in Instruments
-as a labeled waterfall, and enforced by an XCTest perf suite driving a real
-headless nvim.
+`msg_showmode`, `msg_showcmd`, and `msg_ruler` are retained in `ChromeState`, but
+the current status bar is driven by runtime notifications and evaluated
+`statusline` content instead.
 
----
-
-## 7. InputKit — the input system
-
-Input is half the product. The design principle: **macOS conventions at the
-edge, Vim semantics at the core, and one source of truth (nvim) for what any
-key means.**
-
-### 7.1 The key path
-
-`GridSurfaceView` is the first responder and conforms to **`NSTextInputClient`**
-— non-negotiable, because it's the only way to be a first-class citizen of the
-macOS text input system (IMEs, dead keys, press-and-hold accents, dictation).
-
-```
-keyDown(event)
-  │
-  ├─ if marked text active ──────────────► interpretKeyEvents (IME owns it)
-  │
-  ├─ translate to nvim notation possible? ─► nvim_input("<C-w>") etc.
-  │    (any Ctrl/Cmd chord, specials,        fire-and-forget notification
-  │     function keys, meta-Option)
-  │
-  └─ else ───────────────────────────────► interpretKeyEvents(...)
-        └─ insertText(_:replacementRange:) ─► nvim_input(escaped text)
-        └─ setMarkedText(...) ──────────────► IME preedit overlay (§7.2)
-```
-
-- **Translation table** covers Neovim's full key notation: `<Esc>` `<CR>`
-  `<BS>` `<Tab>` `<Del>` arrows, Home/End/PageUp/PageDown, `<F1>`–`<F20>`,
-  keypad keys — each with modifier prefixes `S-`, `C-`, `M-` (Option), `D-`
-  (Command) in nvim's canonical order.
-- **Escaping:** literal text goes through `nvim_input` with `<` → `<lt>`;
-  large insertions (paste) use `nvim_paste`, which is mapping-immune and
-  streams in chunks so a 10 MB paste never stalls the UI.
-- **Option key policy** (the classic Mac-Vim tension): per-side setting —
-  *Option as Option* (types `é`, `∂`, dead keys; goes through the IME path) or
-  *Option as Meta* (sends `<M-x>` using `charactersIgnoringModifiers`).
-  Default: left Option = Meta, right Option = Option. Overridable from nvim
-  config via the runtime plugin (§9).
-- Key repeat, modifier-only events, and `performKeyEquivalent` ordering follow
-  AppKit rules — we never bypass the responder chain, which is what keeps
-  system-wide features (screenshot chords, VoiceOver, input-source switching)
-  working.
-
-### 7.2 IME — marked text done right
-
-Composition (Japanese/Chinese/Korean, dead keys, press-and-hold) must not
-touch the buffer until the user commits. Terminal nvim can't do this properly;
-we can:
-
-- `setMarkedText(...)` renders the preedit string into **`IMEOverlayLayer`**,
-  positioned at the cursor cell, styled with the theme's cursor-line colors and
-  proper underline segments for the active clause. Nvim knows nothing yet.
-- `firstRect(forCharacterRange:)` returns the caret cell's screen rect — this
-  is what places the IME candidate window correctly next to the cursor. In
-  insert mode with a full-width composition, the overlay pushes no cells; it
-  floats above (matching Terminal.app behavior).
-- `insertText(_:replacementRange:)` clears the overlay and commits via
-  `nvim_input`/`nvim_paste`.
-- `unmarkText`, cancellation, and clause selection all stay inside the overlay.
-- In *normal* mode, printable IME input still works (e.g. `f` + Japanese char),
-  because commit goes through `nvim_input` like any key.
-
-### 7.3 ⌘-shortcuts: menus and Vim, one namespace
-
-The elegant move: **⌘-chords are just keys.** Every Command chord is delivered
-to nvim as `<D-x>`, and the bundled runtime plugin (§9) defines the default
-mappings in Lua:
-
-```lua
-vim.keymap.set({ "n", "i", "v" }, "<D-s>", "<Cmd>write<CR>")
-vim.keymap.set("n", "<D-p>", function() require("superlemon").goto_anything() end)
-vim.keymap.set({ "n", "v" }, "<D-c>", '"+y')  -- etc.
-```
-
-- **NSMenu items are affordances, not implementations.** The File ▸ Save menu
-  item's action sends the same `<D-s>` into `nvim_input`. One namespace, one
-  behavior, and the user can remap or unmap *any* ⌘-shortcut in their own
-  `init.lua` — their config is the keybinding editor.
-- Menu **validation** (enabled/disabled, checkmarks) comes from cheap cached
-  state the runtime plugin pushes on relevant autocmds (`&modified`, mode,
-  etc.) — never a synchronous RPC in `validateMenuItem`.
-- **System-reserved chords stay native:** ⌘Q (quit flow §3), ⌘W (close window
-  → `:confirm qa` semantics per window), ⌘M, ⌘H, ⌘\`, ⌘, (Settings). AppKit
-  gets them via `performKeyEquivalent` before translation.
-- **Clipboard is native both ways:** the runtime plugin sets `g:clipboard` to
-  a provider that `rpcrequest`s Superlemon, which reads/writes `NSPasteboard`.
-  So `"+y` in a macro and ⌘C both hit the real pasteboard, including
-  rich-text/HTML flavors for paste *into* other apps (post-v1: paste with
-  syntax colors).
-
-### 7.4 Mouse & trackpad
-
-- Clicks/drags → `nvim_input_mouse(button, action, modifiers, grid, row, col)`
-  with per-grid coordinates (multigrid gives us the right window for free).
-  Double/triple-click counts pass through (`:h mouse` word/line selection).
-- **Trackpad scrolling with momentum:** `scrollWheel` deltas accumulate in
-  fractional cell units per axis; each whole cell crossed remains an exact
-  Neovim wheel notification. Adjacent repeats share one ordered pipe write.
-  Neovim stays authoritative while SurfaceKit reconciles its discrete
-  viewport rows through retained exact row history and a display-linked
-  spring. A brief low-resolution velocity veil appears only when a true jump,
-  sustained history clamp, or measured display gap cannot be represented
-  exactly; it is latched to avoid pulsing and capped at 150 ms. Reduce Motion
-  presents atomically.
-- **Pinch to zoom** (`magnify(with:)`) adjusts `guifont` size through the same
-  `option_set` path — metrics, resize, persist.
-- Force-click on a word → LSP hover/definition via the runtime plugin
-  (`vim.lsp.buf.hover()`); a genuinely Mac gesture mapped to a genuinely Vim
-  facility.
-- `mouse_on`/`mouse_off` events gate all of it (some plugins take the mouse).
+Command-line chunks resolve Neovim highlight IDs. Evaluated statusline segments
+carry their resolved Neovim colors. Popup rows, toasts, the sidebar, and most
+shell chrome use adaptive AppKit/system colors. A colorscheme therefore controls
+the editor and selected native content, but it does not recolor every chrome
+surface from Neovim highlight groups.
 
 ---
 
-## 8. ChromeKit — externalized UI as native components
+## 9. Bundled runtime and configuration
 
-Neovim lets a UI take over specific surfaces. Each becomes real AppKit:
+The bundled Lua runtime at `runtime/lua/superlemon/` is the Neovim-side half of
+the application. `runtime/CONTRACT.md` is the wire contract between Lua and
+Swift.
 
-| nvim extension | Native component |
+### Runtime modules
+
+| Module | Current responsibility |
 |---|---|
-| `ext_cmdline` | Floating command palette panel: `NSVisualEffectView` material, SF Mono text field look, centered top-third like Spotlight. `cmdline_show/pos/hide` drive it; blockwise mode (`cmdline_block_*`) grows it into a multi-line sheet. Wildmenu completions render inside it as a native list. |
-| `ext_popupmenu` | Completion popup: borderless `NSPanel` + virtualized `NSTableView`, anchored at the grid cell from `popupmenu_show` (works for cmdline completion too via `grid == -1`). Kind/menu columns, LSP kind icons in SF Symbols, scroll-synced with `popupmenu_select`. Insert-mode completion suddenly looks like Xcode's. |
-| `ext_tabline` | Native tab strip driven by `tabline_update`. Renders nvim *tabpages* as Mac tabs — dirty dots, close buttons, drag to reorder (reorders via `:tabmove`), ⌘1–9. |
-| `ext_messages` | `msg_show` routed by kind: errors/warnings as transient native toasts (top-right, stacking, click to expand); `confirm` prompts as native `NSAlert` sheets — **this is how ⌘Q's `:confirm qa` becomes a real Save/Don't Save/Cancel dialog**; `msg_history_show` as a scrollable panel. `msg_showmode`/`msg_showcmd`/`msg_ruler` feed a slim native status bar. |
-| `win_viewport` | Per-window **native overlay scrollbars** (`NSScroller`-style, drawn as layers on each `GridLayer`): thumb geometry from topline/botline/line-count, fade in on scroll, draggable (drag → `nvim_input_mouse` wheel or `winrestview` RPC). |
+| `init.lua` | Idempotent bridge setup and active-channel state |
+| `settings.lua` | Source the personal config once and push renderer settings |
+| `keymaps.lua` | Unmapped-only macOS defaults, native Save As request, font zoom |
+| `clipboard.lua` | Plain-text `+`/`*` clipboard provider |
+| `chrome.lua` | Native buffer-strip/status-bar toggles and buffer notifications |
+| `status.lua` | Mode/file/position/project/branch state |
+| `statusline.lua` | Evaluate the user's statusline with resolved highlights |
+| `git.lua` | Async Git status data for sidebar badges |
+| `preview.lua` | One preview buffer with single-click/double-click promotion semantics |
+| `ui.lua` | Generic sidebar, palette, toast, statusbar, input, and `vim.ui` bridge |
+| `health.lua` | Runtime health reporting |
 
-Chrome theming: derived from nvim's own highlight groups
-(`default_colors_set`, `hl_group_set` for `Normal`, `PMenu`, `TabLine`…), so
-the native chrome always matches the user's colorscheme — change your nvim
-theme, the whole app follows, light/dark appearance included (background
-luminance selects `NSAppearance`).
+There is no current runtime service API for arbitrary native open/save panels,
+Finder reveal, notifications, or URL opening, and there is no session autosave.
 
----
+### Configuration hierarchy
 
-## 9. The bundled runtime plugin (`superlemon.nvim`)
+The default experience uses `runtime/config/init.lua`. It establishes ordinary
+editor defaults, optionally loads its example plugin with Neovim's package
+manager, then sources:
 
-A small Lua plugin shipped in the app bundle and prepended to
-`runtimepath` at attach. It is the *nvim-side half of the bridge*:
+1. bundled `runtime/config/superlemon.vim`; and
+2. `$XDG_CONFIG_HOME/superlemon/init.vim` if present, normally
+   `~/.config/superlemon/init.vim`.
 
-- Default `<D-...>` keymaps (§7.3) — defined with `unique = false` so user
-  config wins.
-- `g:clipboard` provider → native pasteboard (§7.3).
-- Menu-validation state pushed on autocmds (`BufEnter`, `ModeChanged`,
-  `TextChanged` — debounced).
-- GUI services exposed to *any* plugin via `vim.rpcrequest(chan, ...)`:
-  native open/save panels, "reveal in Finder", notifications
-  (`UNUserNotificationCenter`), opening URLs. Plugin authors get Mac
-  integration without Superlemon knowing about their plugin.
-- Session autosave for crash recovery (§3).
-- Superlemon-facing Neovim options and `vim.g.superlemon_*` variables are
-  collected and explained in `runtime/config/superlemon.vim`. The managed init
-  loads that baseline first, then the primary user override at
-  `$XDG_CONFIG_HOME/superlemon/init.vim`. The Settings window creates that
-  user-owned file from the annotated template and opens it for editing. When
-  a user-selected Neovim init bypasses the managed baseline, the runtime still
-  sources the personal Superlemon init once before bridge setup.
+The second file is the user's primary Superlemon override and wins setting by
+setting. Settings ▸ Edit Superlemon Configuration creates it from the annotated
+bundled template only when absent, then opens it in Neovim.
 
----
+When Settings selects the user's normal Neovim config or an explicit custom init,
+the managed init is bypassed. Runtime bootstrap still sources the personal
+Superlemon init once before bridge setup. A marker prevents duplicate sourcing
+when the managed init already loaded it.
 
-## 10. ShellKit — app shell
-
-- `NSDocument`-less: windows are workspaces, not documents (nvim owns files).
-  State restoration via `NSWindowRestoration` + nvim sessions.
-- One window ↔ one nvim process. Crash isolation, trivially correct teardown.
-- Files opened from Finder/`open`/drag-onto-Dock route to the frontmost
-  window's nvim (`:drop`), or a new window per user preference.
-- `superlemon` CLI helper (like `subl`/`code`): opens files in a running
-  instance via `NSDistributedNotification`/XPC, supports `-w` wait flag for
-  `$EDITOR` use.
-- Sparkle-free v1; signed, notarized, hardened runtime from M0 (bundling an
-  nvim binary and shipping pipes means entitlements are settled early).
+Superlemon-specific values currently include native chrome toggles, native
+`vim.ui`, default keymaps, renderer ligatures/Powerline/symbol options, and the
+managed statusline. Neovim's standard `guifont`, `linespace`, and `mousescroll`
+remain authoritative. Configuration-source and renderer-setting changes apply
+on relaunch.
 
 ---
 
-## 11. Testing strategy
+## 10. Application shell and user experience
 
-- **Protocol tests:** golden msgpack transcripts (recorded from real nvim
-  sessions) replayed into GridKit; assert final grid state. Runs headless, no
-  UI, catches protocol regressions across nvim versions in CI.
-- **Renderer golden images:** GridSurfaceView rasterized offscreen against
-  reference PNGs (per Retina scale) for: ligatures, CJK double-width, emoji,
-  undercurl, floats with blend, cursor shapes. Tolerance-based comparison.
-- **Input matrix:** parameterized tests of NSEvent → notation translation
-  (every modifier combo × special keys), plus scripted IME composition
-  sequences through `NSTextInputClient`.
-- **End-to-end latency harness:** real `nvim --embed`, synthesized keyDowns,
-  signpost-measured budgets (§6) enforced as perf tests.
-- **Fuzzing:** random redraw-event sequences (structure-aware) into GridKit —
-  must never crash or desync damage tracking.
+SuperlemonApp is intentionally `NSDocument`-less. Neovim owns buffers and file
+state; the native window represents the current project/workspace around that
+process.
 
----
+The current default window contains:
 
-## 12. Milestones
+- an optional 28-point native buffer strip;
+- a vertical split with the file-tree sidebar and editor host; and
+- an optional 24-point native status/command bar.
 
-Each ends in a usable app; riskiest integrations first.
+The sidebar starts at 260 points and has a 180-point minimum. Opening a folder
+changes Neovim's global working directory, closes project-scoped palette state,
+and rebuilds the sidebar root, FileIndex, UI-component path base, Git decoration
+state, and project status label. Existing buffers remain in Neovim.
 
-**M0 — Pixels (2 weeks).** NvimKit process+RPC, single-grid linegrid (multigrid
-off), GridSurfaceView with bitmap store + blit scroll, basic keyDown → 
-`nvim_input`. *Exit: edit this repo in Superlemon with the user's own config
-loading, and it feels instant.*
+Settings chooses managed/user/custom Neovim initialization and opens the
+personal Superlemon config. About Superlemon uses the standard AppKit panel and
+states Copyright © 2026 Jagtesh Chadha, the BSD 3-Clause License, and the Vim,
+Neovim, and Sublime Text acknowledgements.
 
-**M1 — Input done right (2 weeks).** Full `NSTextInputClient`/IME with preedit
-overlay, complete key translation table, Option policy, clipboard provider,
-mouse/trackpad with momentum accumulator. *Exit: a Japanese-input user and a
-heavy Vim user both feel at home.*
-
-**M2 — Multigrid & cursor (2 weeks).** `ext_multigrid` per-window layers,
-floats with rounded corners/shadow/blend-blur, CursorLayer with mode shapes,
-per-window scrollbars from `win_viewport`. *Exit: a busy telescope/​float-heavy
-config looks native.*
-
-**M3 — Native chrome (2–3 weeks).** ext_cmdline palette, ext_popupmenu,
-ext_tabline, ext_messages with native confirm dialogs; menu bar wired through
-`<D-...>`; runtime plugin v1. *Exit: ⌘Q politely asks about unsaved files;
-completion looks like Xcode.*
-
-**M4 — Mac citizenship (2 weeks).** Session restore, Finder/CLI open paths,
-Settings window, ligature/font polish, notarized builds. *Exit: daily-driver
-replacement for terminal nvim.*
-
-**M5 — Performance hardening (ongoing, release-gated).** Row-layer scrolling,
-glyph-cache tuning, Instruments passes, perf suite in CI enforcing §6 budgets.
+Only one workspace/editor window is currently constructed; Settings, message
+history, panels, and sheets are auxiliary windows rather than workspaces.
+Secure restorable state is declared, but window/session restoration is not
+wired. Finder/Dock open-file callbacks, drag-and-drop, multi-window workspaces,
+and a `superlemon` CLI helper are open work.
 
 ---
 
-## 13. Risks & Mitigations
+## 11. Testing and verification
 
-| Risk | Impact | Mitigation |
+The repository uses Swift Testing across all six library targets plus a Lua
+runtime suite.
+
+Current Swift coverage includes:
+
+- MessagePack wire formats, incremental decoding, RPC lifecycle, ordered batch
+  writes, and a real-Neovim integration test when Neovim is available;
+- redraw decoding, GridStore event application, row COW, damage translation,
+  deferred presentation, scroll provenance, multigrid layout, and margins;
+- key, Option, mouse, click-count, and fractional wheel translation;
+- Core Text raster output, highlights, cursor glyphs, IOSurface row revisions,
+  pool bounds, circular history, spring equivalence, delayed frames, veil
+  behavior, pixel snapping, cursor coupling, and display-link idle behavior;
+- cmdline, popupmenu, messages, toast/history, and native view models; and
+- file indexing, ignore rules, fuzzy scoring, file operations, file tree, Quick
+  Open, buffer strip, status bar, and generic UI-component stores.
+
+The Lua specs cover setup, managed/personal config loading, runtime settings,
+default mappings, clipboard, chrome/buffers, status/statusline, Git, preview
+buffers, and `superlemon.ui`.
+
+Run the current gates from the repository root:
+
+```sh
+swift test
+bash runtime/tests/run.sh
+swift build -c release
+swift run superlemon --smoke
+```
+
+The smoke path attaches a headless grid, waits for the first flush, prints its
+size/title, and exits through the normal controller lifecycle.
+
+Current tests are programmatic; the repository does not contain recorded golden
+RPC transcripts, reference-PNG baselines, a structured redraw fuzzer, a scripted
+IME matrix, or automated latency/memory performance gates. Native File-menu and
+About-panel workflows are presently verified through live/manual app testing
+rather than a SuperlemonApp test target.
+
+---
+
+## 12. Implementation status and open work
+
+### Shipped in the current tree
+
+- Embedded Neovim process, MessagePack-RPC, typed redraw protocol, multigrid.
+- Row-COW grid model and damage/provenance-aware deferred presentation.
+- Core Text row renderer with IOSurface-backed revisions.
+- Display-linked two-viewport filmstrip, spring motion, cursor coupling, Reduce
+  Motion, and adaptive fast-scroll veil.
+- Keyboard, basic IME, mouse, trackpad, clipboard, and ordered input queue.
+- Native cmdline, popupmenu, messages, prompts, sidebar, Quick Open, preview
+  buffers, buffer strip, statusline/status bar, file panels, Settings, and About.
+- Annotated managed/personal configuration and generic `superlemon.ui` bridge.
+
+### Open work
+
+- Rich IME clause/reconversion behavior and a multi-IME validation matrix.
+- Native scrollbars, float materials/shadows, and separator affordance paint.
+- Workspace overview, multiple windows, restored sessions, Finder/Dock opening,
+  drag-and-drop, Services, and CLI/XPC integration.
+- Buffer-aware reconciliation for sidebar rename/trash operations.
+- Rich clipboard flavors and broader menu validation.
+- End-to-end latency/hitch/memory instrumentation and CI performance gates.
+- Signed/notarized application packaging and distribution.
+
+---
+
+## 13. Known risks and limitations
+
+| Area | Current risk or limitation | Current mitigation |
 |---|---|---|
-| Grid-model desync (damage bugs → visual corruption) | High | Golden transcript tests + fuzzing (§11); debug overlay that flashes damage rects; "full redraw" escape hatch (`nvim_ui_try_resize` forces repaint) |
-| IME edge cases (clause editing, reconversion, per-IME quirks) | High — headline feature | Test matrix across Kotoeri/Google JP/Sogou/2-Set Korean early (M1, not later); preedit overlay keeps nvim state uninvolved, bounding the blast radius |
-| ⌘-chord conflicts with plugin mappings | Medium | `<D-...>` defaults set `unique=false` and are documented; menu items reflect actual mappings post-config |
-| ext_messages fidelity (plugins that expect TUI message quirks) | Medium | `ext_messages` can be toggled per-user to fall back to grid-rendered messages; ship both paths |
-| nvim API evolution across versions | Medium | Table-driven event decoding skips unknown events; CI matrix against nvim stable + nightly; min-version gate at handshake |
-| Blit-scroll correctness on Retina fractional scales | Low | Cell-aligned layers + integral backing pixels by construction; golden images per scale factor |
-| Core Text shaping cost on pathological lines (minified JS) | Low | Runs cap at viewport width; glyph cache; worst case is one line of fresh shaping per frame |
+| Model/render synchronization | A bad damage or row-history decision can show stale pixels | Immutable row revisions, one-shot semantic deltas, authoritative-row assertions, extensive GridKit/SurfaceKit tests, atomic fallback |
+| Fast scrolling | Retained history cannot represent every true far jump or delayed compositor frame | One-line far cue, bounded debt, quarter-resolution velocity veil, diagnostics, Reduce Motion bypass |
+| IOSurface lifetime | Reusing a surface still referenced by history/compositor corrupts rows | Revision leases, IOSurface use counts, compositor-use checks, bounded CGImage fallback |
+| IME | Clause editing and reconversion are incomplete | Keep marked text out of Neovim; use AppKit candidate placement; document current scope |
+| Externalized messages | Plugins may depend on TUI-specific hit-enter/message behavior | Typed model, native history, atomic editor grid; no claim of complete TUI-message emulation |
+| Sidebar mutations | Rename/trash may leave an already-open Neovim buffer referring to the old path | File open/preview goes through Neovim; buffer-aware mutation integration remains open |
+| Config combinations | Managed, normal-user, and custom init paths can expose different plugin/chrome behavior | Explicit Settings choice, one documented personal override, idempotent runtime setup, Lua config tests |
+| Version compatibility | API metadata is observed but no minimum is enforced | Unknown events are skipped; decoder tests cover supported vocabulary; an explicit version gate remains open |
 
 ---
 
+## 14. Native workspace chrome
 
-`NORTHSTAR.md` (measured palettes, geometry, component inventory). It amends
-this design as follows — where the two conflict, NORTHSTAR.md wins on
-*appearance*, this document wins on *architecture*:
+`NORTHSTAR.md` describes the aspirational visual destination. This section is
+authoritative for what the current implementation actually does.
 
-1. **Native file-tree sidebar is v1, not post-v1** (reverses §1 non-goals).
-   ~370pt flat white/dark pane, 24pt rows, colored file-type icons, native
-   context menu. Lives in ShellKit; file ops (rename/delete/new) route through
-   the runtime plugin so `:e`/buffer state stays coherent.
-2. **Split-view host for non-grid panes.** The editor grid is one pane of an
-   `NSSplitView`; markdown preview (GitHub-styled, light `#FFFFFF`/dark
-   `#0D1117`) and the native image viewer (checkerboard + metadata bar,
-   binaries never touch nvim) are sibling panes. SurfaceKit stays unaware.
-3. **Tabs are workspaces, not tabpages** (amends §8). The 28pt top strip
-   switches *workspaces* (window-local sessions; one nvim per workspace,
-   post-v1 may pool). `ext_tabline` data feeds the status bar / a buffer
-   switcher instead of the strip.
-4. **Quick-open is a native fuzzy file palette** (498×346pt, upper-center,
-   30% scrim) — ⌘P opens it directly; it is not the ext_cmdline panel, though
-   both share the palette visual language. Backed by the runtime plugin
-   (`vim.fs`/fd) so ignore rules match the user's setup.
-5. **Powerline-flavored native status bar**: mode badge, file, git branch,
-   project, line:col chip — state pushed by the runtime plugin on autocmds
-   (richer than §8's msg_ruler sketch).
-6. **Appearance policy reconciled**: an explicit System/Light/Dark setting
-   selects `NSAppearance` and pushes `background=light/dark` to nvim; chrome
-   colors then derive from nvim highlight groups *within* that appearance
-   (§8's luminance heuristic becomes the "System" mode's tiebreaker).
-7. **Chrome is flat and opaque** — hairline separators, no vibrancy on
-   titlebar/sidebar/status. Vibrancy/materials only on transient surfaces
-   (palettes, menus, popups).
-   until product direction says otherwise.
+### 14.1 Sidebar and file operations
 
-Milestone impact: sidebar + status bar join M3 (native chrome); quick-open
-palette joins M3; preview/image panes and workspace strip join M4.
+`FileTreeSidebarView` is a native outline-style view rooted at the current
+project directory. Directories load lazily, sort before files, and expose native
+context-menu actions for New File, New Folder, Rename, Delete/Trash, and Reveal
+in Finder. File-type dots, Git badges, and namespaced `superlemon.ui`
+decorations compose in the row.
+
+Single-click opens a Neovim preview buffer; double-click opens permanently.
+Creating, renaming, and trashing currently use Swift `FileManager`, followed by
+sidebar/index refresh. These mutations do not yet rename or delete an already
+open Neovim buffer, which is a documented limitation rather than hidden
+behavior.
+
+### 14.2 Preview buffers
+
+The runtime permits at most one preview buffer. A new single-click preview
+replaces the previous clean preview. Editing or explicitly promoting it makes it
+permanent; modified previews are never silently discarded. The native buffer
+strip renders preview tabs in italics.
+
+### 14.3 Native buffer strip
+
+The optional top strip displays listed Neovim buffers from
+`superlemon.buffers`. Selecting uses `nvim_set_current_buf`; closing uses
+`confirm bdelete`; double-click promotes a preview. It is a buffer strip, not an
+`ext_tabline` tabpage strip and not a cross-window workspace switcher.
+
+The runtime variable `g:superlemon_native_tabs` is the source of truth. The View
+menu toggles runtime state and reflects the resulting notification.
+
+### 14.4 Quick Open
+
+Command-P opens a native upper-center palette with a scrim. The built-in picker
+is driven by the Swift `FileIndex` actor and `FuzzyScorer`:
+
+- `.git` is always excluded;
+- a documented subset of root `.gitignore` is honored;
+- indexing is capped at 50,000 files;
+- empty queries show recently modified files first;
+- nonempty queries rank fuzzy path matches and bold matched positions; and
+- opening a result calls Neovim `:drop`.
+
+Opening another folder discards the old index and invalidates stale queries.
+Built-in Quick Open is currently a native app action, not a Neovim mapping and
+not a bundled Lua provider. The same panel can be temporarily driven by a
+plugin's `superlemon.ui` palette session.
+
+### 14.5 Native status and command bar
+
+The optional bottom bar is controlled by
+`g:superlemon_native_statusbar`. When active, it can render the user's evaluated
+Neovim `statusline` with resolved highlight colors. The runtime's adopt mode
+temporarily moves that statusline out of the grid by managing `laststatus`; users
+can opt out and keep both.
+
+When no evaluated statusline is available, built-in mode, file, branch, project,
+and line/column chips provide a fallback. Namespaced `superlemon.ui` segments
+remain additive. While the command line is active, it replaces normal bar
+content with the externalized attributed command line.
+
+### 14.6 Appearance
+
+The Neovim default background fills the editor host and window resize gaps.
+`NvimController` derives light or dark `NSAppearance` from that background's
+luminance. ShellKit views then use appearance-aware AppKit palettes; cmdline and
+evaluated statusline content additionally use Neovim highlight colors.
+
+There is no independent System/Light/Dark preference today. Persistent chrome
+is flat and opaque. Vibrancy is reserved for transient command, completion, and
+Quick Open panels.
+
+### 14.7 Settings
+
+The native Settings window chooses the Neovim init source and opens the personal
+Superlemon configuration. Font, spacing, scroll steps, ligatures, symbols, native
+chrome, statusline, and default-keymap customization remain file-backed rather
+than duplicated in UserDefaults controls.
 
 ---
 
-## 15. The component framework — `superlemon.ui` (Lua-scriptable native UI)
+## 15. `superlemon.ui` component framework
 
-The architectural inversion that turns Superlemon from an app into a
-platform: native components stop being hard-wired feature consumers and
-become **servers scriptable from Lua**. Built-in features (git badges, ⌘P
-quick-open) are reimplemented as bundled plugins on the same public API any
-third-party plugin uses — permanent dogfooding.
+`runtime/lua/superlemon/ui.lua` exposes native components to any Neovim plugin.
+The framework is implemented and optional: it no-ops when Superlemon is not the
+attached UI.
 
-### Lua surface (sketch)
+### Lua surface
 
 ```lua
-local ui = require("superlemon.ui")
+local ui = require('superlemon.ui')
 
--- Sidebar decorations: plugins own namespaces; the GUI merges them.
-local ns = ui.sidebar.namespace("gitsigns-native")
-ns:set_badge("Sources/a.swift", { text = "M", color = "#E0B268" })
-ns:set_dot("Sources", { color = "#ADC694" })
+local ns = ui.sidebar.namespace('my-plugin')
+ns:set_badge('Sources/a.swift', { text = 'M', color = '#E0B268' })
+ns:set_dot('Sources', { color = '#ADC694' })
 ns:clear()
 
--- The palette is a generic fuzzy-picker COMPONENT; ⌘P is just one user.
 ui.palette.open({
-  placeholder = "Buffers…",
-  on_query = function(q) return {
-    { id = 3, title = "a.swift", subtitle = "Sources", positions = { 1, 2 } },
-  } end,
+  placeholder = 'Buffers…',
+  on_query = function(query)
+    return { { id = 3, title = 'a.swift', subtitle = 'Sources' } }
+  end,
   on_select = function(id) vim.api.nvim_set_current_buf(id) end,
 })
 
-ui.toast({ text = "Build failed", kind = "error" })          -- MessageToast
-ui.statusbar.segment("my-plugin", { text = "⚡ 3", color = "#E0B268" })
+ui.toast({ text = 'Build failed', kind = 'error' })
+ui.statusbar.segment('my-plugin', { text = '⚡ 3', color = '#E0B268' })
+ui.input({ prompt = 'Rename to:', default = 'name', on_submit = function(value) end })
 ```
 
-### Wire protocol (one generic pair, replacing bespoke notifications)
+### Wire protocol
 
-- nvim → GUI: `superlemon.ui` notification
-  `{ component, method, namespace, args }` — e.g.
-  `{ "sidebar", "set_badge", "gitsigns-native", { path, text, color } }`.
-- GUI → Lua callbacks: the Lua side registers functions in a registry keyed
-  by callback id; the GUI invokes them via
-  `nvim_exec_lua("require('superlemon.ui')._dispatch(...)", [id, payload])`
-  and awaits the return value (palette on_query round-trips in ~1 ms).
-- Namespacing gives isolation: a plugin's `clear()` never touches another's
-  badges; the GUI composes namespaces deterministically (sorted by name).
+Lua sends four positional notification parameters:
 
-### Externalization inventory — nvim constructs that can go native
+```lua
+vim.rpcnotify(channel, 'superlemon.ui', component, method, namespace, args)
+```
 
-| Construct | Mechanism | Status |
-|---|---|---|
-| Cmdline (`:` `/` `?`, prompts) | `ext_cmdline` → ChromeKit palette | **enabled** |
-| Completion + wildmenu dropdown | `ext_popupmenu` → native panel | **enabled** |
-| Messages, confirms, hit-enter | `ext_messages` → toasts/NSAlert | **enabled** |
-| Windows, floats, message grid | `ext_multigrid` → CALayers | **enabled** |
-| Statusline (any plugin) | `nvim_eval_statusline` harvest | **enabled** |
-| Tabpages / buffer list | `ext_tabline` + superlemon.buffers | **enabled** (buffer strip) |
-| Generic "pick one" dropdowns (code actions, plugin choices) | `vim.ui.select` override → palette | superlemon.ui wave A |
-| Text prompts (LSP rename, plugin inputs) | `vim.ui.input` override → native field | superlemon.ui wave A |
-| Notifications | `vim.notify` override → toasts | trivial follow-on |
-| Picker plugins (telescope et al.) | adapter tier (model-layer glue) | wave B |
-| nvim-cmp completions (insert + cmdline) | zero glue: `view = { entries = "native" }` routes through the already-externalized pum | user config one-liner |
-| Quickfix / location list | adapter tier → native list panel | backlog |
-| LSP progress ($/progress) | handler → statusbar segment | backlog |
-| Float dressing (hover/signature) | detect + material/shadow per kind | cosmetic backlog |
-| Semantic highlight metadata | `ext_hlstate` | cosmetic backlog |
+`args` is always a MessagePack map. `UIComponentRouter` validates the tuple and
+routes it to the current native component. Namespaces isolate sidebar and status
+state; clearing one namespace cannot erase another plugin's content.
 
-`vim.ui.select`/`vim.ui.input` are the sleeper hits: they are nvim's OWN
-designed override points — every well-behaved plugin's dropdowns and prompts
-route through them, so two Lua overrides nativize a whole ecosystem's worth
-of interaction.
+Palette and input callbacks live in a Lua registry with monotonic integer IDs.
+Swift invokes them through:
 
-### Migration path
+```lua
+return require('superlemon.ui')._dispatch(callback_id, payload)
+```
 
-1. Wave A: protocol plumbing (`superlemon.ui` module + dispatcher, GUI
-   router in WorkspaceChrome) + sidebar decorations as the first component;
-   port git badges onto it.
-2. Wave B: palette component; port ⌘P (the file picker moves into Lua —
-   FileIndex/FuzzyScorer stay as the GUI-side engine the built-in picker
-   uses, but any picker can bring its own source). `<D-p>` becomes a normal
-   plugin-owned mapping, rebindable from any vimrc — CtrlP semantics on a
-   native panel.
-3. Wave C: statusbar segments, toasts, prompts; document as the public
-   plugin-author API; CONTRACT.md's bespoke `superlemon.git`/quick-open
-   paths are subsumed and deprecated.
+Palette query callbacks are awaited; select/close/input callbacks do not require
+a return value. Session teardown frees callback IDs, and stale replies are
+discarded by generation tokens.
+
+### Current components
+
+| Component | Current methods |
+|---|---|
+| sidebar | `set_badge`, `set_dot`, `clear` |
+| palette | `open`, `close` with query/select/close callbacks |
+| toast | `show` with info/warn/error kind |
+| statusbar | `set_segment`, `clear` |
+| input | `open` with submit/cancel callback |
+
+The runtime overrides stock `vim.ui.select` and `vim.ui.input` when native UI is
+enabled. If the user's config already installed its own implementation, that
+implementation wins. The current `vim.ui.select` adapter uses a simple
+case-insensitive substring filter over formatted items.
+
+Built-in Git badges and Command-P Quick Open do not yet dogfood the generic API:
+Git still uses `superlemon.git`, and the built-in picker uses Swift FileIndex.
+`vim.notify` is not overridden. Quickfix, location lists, LSP progress, picker
+adapters, and native hover dressing remain open integration points.
 
 ---
 
-## 16. Splits: nvim as layout engine, macOS as hands and paint
+## 16. Splits: Neovim owns layout
 
-Nvim's window layout is an explicit tree (`winlayout()`: row/col/leaf) that
-is structurally isomorphic to nested NSSplitViews — but four mismatches rule
-out adopting NSSplitView's ENGINE, and each is load-bearing:
+Neovim is the only window-layout engine. `win_pos`, `win_float_pos`, hide/close,
+and message-grid events resolve atomically at flush boundaries, and SurfaceKit
+positions grid layers verbatim from that model.
 
-1. **Cell quantization vs pixel continuity** — nvim geometry is integer
-   cells; pixel-continuous dividers either snap (jitter) or float at
-   positions nvim cannot represent.
-2. **Separators are content, not chrome** — nvim draws them as themed cells
-   (`fillchars`/`WinSeparator`); native dividers would double them.
-3. **The oscillation trap** — two authoritative layout engines resolving the
-   same resize (holding priorities vs `equalalways`/`winfix*`) feed back;
-   every shipping nvim GUI keeps layout authority singular for this reason.
-4. **Atomicity** — win_pos batches arrive per flush (tear-free); NSSplitView
-   resizes panes across frames, letterboxing grids mid-transition.
+Superlemon does not mirror editor splits into nested NSSplitViews. Doing so would
+create competing layout authorities, continuous-pixel versus whole-cell
+geometry, duplicate separator drawing, and multi-frame intermediate states.
 
-**Status: DEPRIORITIZED** — the mouse-drag latch (below, implemented)
-made in-grid separator dragging feel right; the affordance overlay and
-hairline paint remain documented options, not scheduled work.
+Mouse drag and release remain on the grid that received the press. Re-hit-testing
+separator drags after each `win_pos` update caused a feedback loop when the
+target grid's origin moved. `InputHostView` therefore latches the press grid and
+uses `GridSurfaceView.cell(at:inGrid:)` with clamping for the drag lifetime.
 
-**The hybrid that survives all four**: grid layers positioned verbatim from
-win_pos (atomic, one engine); native SEPARATOR AFFORDANCES overlaid on the
-separator columns — resize cursors, generous hit targets, continuous drag
-translated to `nvim_win_set_width/height` at cell crossings; and native
-PAINT: the managed config blanks `fillchars` separators while the GUI draws
-a 1px hairline in the reserved column — native look without layout
-inversion.
-
-**Mouse-drag latching (implemented)**: per the UI contract, drag/release
-events stay on the PRESS grid. Re-hit-testing per event caused directional
-jitter: dragging toward the window whose origin moves with the separator
-(right/down) reported positions relative to an edge that had just moved —
-a feedback loop. InputHostView latches the grid at mouse-down and converts
-via `GridSurfaceView.cell(at:inGrid:)` (clamped) for the drag's duration.
+Native separator hit affordances and a replacement one-pixel hairline remain
+open work. The managed config does not currently blank Neovim `fillchars`, and
+the GUI does not paint its own split separators.
 
 ---
 
-## 17. What makes it feel right (checklist to protect)
+## 17. Invariants that protect the experience
 
-- Your `init.lua` loads unmodified; every plugin works
-- Keystroke latency indistinguishable from Terminal.app, UI polish
-  indistinguishable from a first-party Mac app
-- ⌘C/⌘V/⌘S/⌘Q behave like a Mac; `ciw`/`"+y`/`q:` behave like Vim; neither
-  ever surprises you
-- Japanese/Chinese/Korean input works *better* than terminal nvim
-- Floats look like popovers; completion looks like Xcode; ⌘Q asks nicely
-- Change your colorscheme and the whole app — chrome included — follows
+- Neovim is authoritative for editor semantics and final pixels.
+- Every protocol event is applied in wire order; display coalescing removes only
+  obsolete visual work.
+- A half-applied Neovim frame is never presented.
+- Compatible vertical scrolling moves immutable, pixel-snapped row revisions;
+  glyphs are never scaled or blurred during exact motion.
+- Independent grids keep independent history and motion.
+- The cursor follows the same viewport residual as its text, clamps at viewport
+  edges, and scroll-only frames do not restart blink.
+- Immediate mode and Reduce Motion leave no interpolated tail or velocity veil.
+- Keyboard and mouse input remain ordered and unpaced; wheel batching preserves
+  exact notification count and order.
+- Native file panels choose paths, but Neovim performs buffer open/write/save-as
+  operations.
+- User mappings present before initial bridge setup beat bundled Command-key
+  defaults; see the re-setup ownership caveat in `runtime/CONTRACT.md`.
+- The personal Superlemon config always overrides the bundled baseline and is
+  never overwritten once created.
+- Persistent chrome follows macOS appearance; editor content and evaluated
+  statusline colors remain Neovim-owned.
+- Claims in this document distinguish current behavior from open work.

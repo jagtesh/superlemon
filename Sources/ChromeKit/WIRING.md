@@ -1,155 +1,198 @@
-# ChromeKit — app wiring guide
+# ChromeKit wiring
 
-How SuperlemonApp integrates ChromeKit. ChromeKit depends only on NvimKit;
-everything below is `@MainActor`.
+ChromeKit renders Neovim's externalized command line, completion menu, and
+messages with AppKit. It depends only on NvimKit; the app layer supplies GridKit
+highlight and geometry information through small value/closure APIs.
 
-## Objects to own (one set per window / nvim session)
+All ChromeKit state and controllers are `@MainActor` and are owned once per
+window/Neovim session by `WorkspaceChrome`:
 
 ```swift
 let chromeState = ChromeState()
-let cmdlinePanel = CmdlinePanelController(font: editorFont)   // same mono font as the grid
-let popupMenu    = PopupMenuPanelController(font: editorFont)
-let toasts       = MessageToastController()
+let cmdlinePanel = CmdlinePanelController(font: editorFont)
+let popupMenu = PopupMenuPanelController(font: editorFont)
+let toasts = MessageToastController()
+
+toasts.attach(to: window)
 ```
 
-Attach the toast controller once the window exists:
+`MessageToastController` displays one replacing toast at the top-right of the
+content view. It also keeps a bounded, timestamped message history opened by
+clicking the toast or choosing View > Message History.
 
-```swift
-toasts.attach(to: window)   // toasts stack top-right of window.contentView
-```
+## Redraw ownership and presentation order
 
-## 1. Who calls `apply`
+Feed every `RedrawBatch` to `ChromeState`, without pre-filtering. ChromeState
+ignores events outside `ext_cmdline`, `ext_popupmenu`, `ext_messages`, and
+`ext_tabline`.
 
-Feed **every** `RedrawBatch` from `NvimSession.uiEvents` to *both* GridKit and
-`chromeState.apply(_:)` — ChromeState filters to the chrome events
-(`cmdline*`, `popupmenu*`, `msg*`, `tablineUpdate`) and ignores the rest, so
-no pre-filtering is needed:
+The app applies ChromeKit state before applying the same batch to GridKit:
 
 ```swift
 for await batch in session.uiEvents {
-    gridStore.apply(batch)        // GridKit (other owner)
-    chromeState.apply(batch)      // ChromeKit
+    chrome.apply(batch)
+
+    switch gridStore.applyDeferred(batch) {
+    case .none:
+        break
+    case .immediate:
+        drainPendingPresentation()
+    case .displayLinked:
+        let scheduled = surface.schedulePresentationOnNextDisplay {
+            drainPendingPresentation()
+        }
+        if !scheduled { drainPendingPresentation() }
+    }
+}
+
+func drainPendingPresentation() {
+    guard let flush = gridStore.consumePendingPresentation() else { return }
+    surface.present(flush)
 }
 ```
 
-Ordering: call `apply` on the same batch you hand to GridKit, *before* acting
-on `flush`, so chrome and grid present the same frame.
+GridKit always applies authoritative events in wire order. Compatible vertical
+viewport scroll flushes may remain unconsumed until the next display-link
+callback; mixed, layout, resize, highlight, and unsupported-scroll frames drain
+immediately. ChromeState still consumes every wire batch, but fires `onChange`
+only once per `apply(_:)` call and only when chrome state actually changed.
 
-## 2. When to render / present
+This distinction is intentional: the native grid may coalesce obsolete visual
+scroll work without dropping Neovim state or delaying input.
 
-Set one observer; it fires **at most once per mutating batch** (coalesced):
+## Synchronizing the native surfaces
+
+Set one observer and synchronize all ChromeKit views from it:
 
 ```swift
 chromeState.onChange = { [weak self] in self?.syncChrome() }
+```
 
-func syncChrome() {
-    // -- cmdline ---------------------------------------------------------
-    cmdlinePanel.render(chromeState.cmdline, resolver: highlightResolver)
-    if chromeState.cmdline != nil {
-        cmdlinePanel.present(over: window)   // idempotent; re-present is fine
-    }
-    // render(nil, ...) dismisses the panel automatically.
+### Command line
 
-    // -- popupmenu ---------------------------------------------------------
-    if let menu = chromeState.popupmenu {
-        if popupMenu.isPresented {
-            popupMenu.render(menu)           // selection-only updates: no reload
-        } else {
-            let anchor = windowPoint(forGrid: menu.grid, row: menu.row, col: menu.col)
-            popupMenu.present(anchoredAt: anchor, in: window, model: menu)
-        }
-    } else {
-        popupMenu.render(nil)                // hides
-    }
+The destination depends on Neovim-owned native chrome state:
 
-    // -- messages ------------------------------------------------------------
-    toasts.render(chromeState.messages)      // confirm-kind skipped automatically
+- With `native_statusbar` enabled, dismiss the floating panel and call
+  `statusBar.renderCommand(...)`. The command line temporarily replaces the
+  harvested statusline; fallback mode and line/column indicators remain.
+- With `native_statusbar` disabled, clear the status-bar command and render the
+  model in `CmdlinePanelController`, calling `present(over:)` while non-nil.
 
-    if let confirm = chromeState.pendingConfirm {
-        chromeState.clearPendingConfirm()
-        presentConfirmAlert(confirm)          // app-owned NSAlert, see §5
-    }
+Refresh `cmdlinePanel.font` from `GridSurfaceView.fontSpec` before rendering so
+font zoom and `guifont` changes are reflected in the native command line.
 
-    // showmode / showcmd / ruler / tabline feed the status bar & buffer
-    // switcher (ShellKit surfaces): chromeState.showmode, .showcmd, .ruler,
-    // .tabline — plain value reads, no ChromeKit view exists for them.
+### Popup menu
+
+`popupmenu_select` changes only the selected row, so an already-presented panel
+can use `render(_:)` without reloading its items. A fresh `popupmenu_show` must
+be re-anchored when any of its identity fields change:
+
+```swift
+struct PopupIdentity: Equatable {
+    let items: [PopupMenuItem]
+    let grid: Int
+    let row: Int
+    let col: Int
 }
 ```
 
-## 3. The highlight resolver closure
+If the new identity differs, call `present(anchoredAt:in:model:)`; otherwise
+call `render(_:)`. Passing `nil` to `render` dismisses the panel. The controller
+opens below the anchor when space permits and flips upward at the window edge.
 
-`CmdlinePanelController.render` takes
-`HighlightResolver = (_ hlID: Int) -> (fg: NSColor, bg: NSColor)`.
-Back it with GridKit's highlight table (ChromeKit deliberately has no GridKit
-dependency). ID 0 **must** return the default fg/bg pair
-(`default_colors_set`); the renderer uses it for the block cursor
-(inverted: cursor fg = default bg, cursor bg = default fg) and only paints
-chunk backgrounds for `hlID != 0`.
+### Messages and confirmations
+
+```swift
+toasts.render(chromeState.messages)
+
+if let confirm = chromeState.pendingConfirm {
+    chromeState.clearPendingConfirm()
+    presentConfirmAlert(confirm)
+}
+```
+
+Toasts exclude `confirm`/`confirm_sub` messages automatically. New messages
+replace the visible toast, all kinds auto-dismiss after three seconds by
+default, and the history retains the durable record. Error messages use error
+styling but do not remain indefinitely.
+
+Confirm prompts are app-owned `NSAlert` sheets. Parse Neovim's bracketed or
+parenthesized hotkeys from the final prompt line and return the selected key
+through `NvimController.sendInput`; use `<Esc>` for cancellation. Clear the
+pending model before presenting so a later redraw cannot open the same sheet
+again.
+
+`ChromeState.showmode`, `showcmd`, `ruler`, `history`, and `tabline` retain their
+decoded ext-message/tabline state, but they do not currently drive ShellKit.
+The native status bar and buffer strip are instead driven by the runtime
+notifications documented in `runtime/CONTRACT.md`.
+
+## Highlight resolution
+
+`CmdlinePanelController.render` accepts:
+
+```swift
+typealias HighlightResolver = (Int) -> (fg: NSColor, bg: NSColor)
+```
+
+ChromeKit deliberately does not depend on GridKit. The app resolves an ID to
+concrete colors, including defaults and `reverse`, before crossing the module
+boundary:
 
 ```swift
 let highlightResolver: HighlightResolver = { hlID in
-    let attrs = gridStore.highlightTable[hlID]   // GridKit lookup
-    let fg = attrs?.foreground ?? gridStore.defaultColors.fg
-    let bg = attrs?.background ?? gridStore.defaultColors.bg
-    return (NSColor(rgb: fg), NSColor(rgb: bg))  // app-side RGBColor -> NSColor
+    let attrs = controller.store.highlights.resolved(id: hlID)
+    return (nsColor(attrs.foreground), nsColor(attrs.background))
 }
 ```
 
-## 4. Grid cell -> window point for the popupmenu anchor
+ID 0 must resolve to the current `default_colors_set` pair. The cmdline renderer
+uses that pair for its block cursor and paints explicit chunk backgrounds only
+for nonzero highlight IDs.
 
-`present(anchoredAt:in:model:)` takes a point in the **window's contentView
-coordinate space** (AppKit bottom-left origin) marking the **top-left corner
-of the anchor cell**; the popup's top-left lands there, dropping downward.
+## Grid cell to popup anchor
+
+`present(anchoredAt:in:model:)` takes a point in the host window's `contentView`
+coordinate space. `GridSurfaceView` is flipped, so Neovim and view coordinates
+both grow downward; AppKit conversion handles the change into the content view:
 
 ```swift
-func windowPoint(forGrid gridID: Int, row: Int, col: Int) -> NSPoint {
-    if gridID == -1 {
-        // Cmdline (wildmenu) completion: anchor under the cmdline panel.
-        // Simplest v1: anchor at the panel's bottom-left in content coords.
-        let panelFrame = window.contentView!.convert(
-            cmdlinePanel.panel.frame, from: nil)  // screen -> content view
-        return NSPoint(x: panelFrame.minX + 16, y: panelFrame.minY)
-    }
-    // Editor grid: GridSurfaceView knows each grid's origin (win_pos) and
-    // cell metrics. Flip rows: nvim rows grow downward, AppKit y grows upward.
-    let gridOrigin = surfaceView.origin(ofGrid: gridID)  // in surfaceView coords, top-left
-    let x = gridOrigin.x + CGFloat(col) * cellWidth
-    let yTop = gridOrigin.y + CGFloat(row) * cellHeight   // top-left-origin distance from grid top
-    let pointInSurface = NSPoint(x: x, y: surfaceView.bounds.height - yTop)
-    return surfaceView.convert(pointInSurface, to: window.contentView)
-}
+guard let gridRect = surface.rect(ofGrid: grid) else { return .zero }
+let cellTopLeft = NSPoint(
+    x: gridRect.minX + CGFloat(col) * surface.cellSize.width,
+    y: gridRect.minY + CGFloat(row) * surface.cellSize.height
+)
+return surface.convert(cellTopLeft, to: window.contentView)
 ```
 
-Anchor one cell **below** the completed row if you want the popup to sit under
-the word being completed (`row + 1` before flipping) — nvim's `row`/`col` is
-the anchor cell of the pum itself, which already accounts for this.
+Grid `-1` is the wildmenu/cmdline case:
 
-## 5. Confirm dialogs (ext_messages `confirm` kind)
+- If the cmdline is in the native status bar, anchor at the bar's top edge; the
+  popup will flip upward.
+- If the floating cmdline is active, its panel frame is in screen coordinates.
+  Convert that screen frame through the host window before deriving the anchor.
 
-ChromeKit never shows NSAlert. When `pendingConfirm` is non-nil:
+Do not manually flip rows and do not use a cached grid origin: multigrid frames
+can move between redraws.
 
-1. Build an `NSAlert` from `confirm.text` (this is how `:confirm qa` /
-   ⌘Q becomes a native Save / Don't Save / Cancel sheet).
-2. Answer nvim by sending the keys the prompt expects, e.g.
-   `session.notify("nvim_input", [.string("y")])` (or `n` / `<Esc>`), matching
-   the choices in the message text.
-3. Call `chromeState.clearPendingConfirm()` when the alert is presented.
+## Input and lifecycle
 
-## 6. Input while chrome is up
+ChromeKit views are render-only. The cmdline and completion panel are
+nonactivating; editor keys continue through InputKit to Neovim. App-owned
+sheets and palettes coordinate returning focus to `InputHostView` when they
+close. Message History is an explicit key utility window rather than part of
+the editor-input path.
 
-ChromeKit views are render-only; **all** keys still go to nvim via InputKit
-(the cmdline panel shows state, it is not a text field; arrows/`<C-n>` drive
-the popupmenu inside nvim). Do not give the panels key focus —
-`.nonactivatingPanel` is already set.
+Controllers can be constructed and rendered without a visible parent window.
+Their panels use `isReleasedWhenClosed = false`; retain the controllers for the
+window lifetime and reuse `render`, `present`, and `dismiss`.
 
-## 7. Headless / lifecycle notes
+## Tests
 
-- All controllers construct and `render` without a screen; `present` no-ops
-  window-server work when the parent window isn't visible.
-- Panels set `isReleasedWhenClosed = false`; keep the controllers alive for
-  the window's lifetime and just `render`/`dismiss`.
-- `MessageToastController.autoDismissInterval` defaults to 4s for non-error
-  kinds; error kinds persist until click or `msg_clear`.
-- Tabline: no ChromeKit view in this wave by design (NORTHSTAR delta 3 — tabs
-  are workspaces). `chromeState.tabline` carries current index + names for the
-  future buffer switcher.
+```sh
+swift test --filter ChromeKitTests
+```
+
+The ChromeKit suite covers nested command lines and blocks, popup selection,
+sizing and anchoring, message replacement/history/expiry, confirmation state,
+tabline decoding, rendering smoke tests, and headless controller lifecycle.

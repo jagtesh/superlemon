@@ -1,4 +1,5 @@
-// (NORTHSTAR §4.1 item 4, §5 "Status bar", DESIGN §14.5).
+// StatusBarView — Superlemon's powerline-flavored native status bar
+// (NORTHSTAR §4.1 item 4, §5 "Status/command bar", DESIGN §14.5).
 //
 // 24 pt flat opaque bar with a hairline top border. Left: mode badge
 // (color by mode, chip-flip per appearance), file chip (name + modified
@@ -270,8 +271,8 @@ public final class StatusBarView: NSView {
         )
 
         if !model.branch.isEmpty {
-            // U+2387 alternative to the Nerd-Font branch glyph; dimmed, no fill
-            // per NORTHSTAR §4.1 ("branch glyph + name in dimmed gray, no fill").
+            // U+2387 alternative to the Nerd-Font branch glyph; the current
+            // fallback model renders branch text dimmed with no fill.
             branchChip.configure(
                 text: "⎇ \(model.branch)",
                 textColor: ShellPalette.secondaryText(dark: dark),
@@ -575,8 +576,7 @@ public final class StatusBarView: NSView {
 // MARK: - Chip
 
 /// A flat colored capsule-less chip: mono label with horizontal padding on
-/// an opaque fill (powerline chip minus the angled edge — square edges per
-/// this wave; angle treatment is a later polish pass).
+/// an opaque fill. The current implementation uses square edges.
 @MainActor
 final class ChipView: NSView {
 

@@ -194,8 +194,8 @@ public actor NvimSession {
         }
     }
 
-    /// Ask the OS to terminate nvim (SIGTERM). Prefer quitting via
-    /// `:confirm qa` semantics; this is the hard-stop path.
+    /// Ask the OS to terminate nvim (SIGTERM). Prefer a graceful RPC-driven
+    /// quit flow; this is the hard-stop path.
     public func terminate() {
         process?.terminate()
     }

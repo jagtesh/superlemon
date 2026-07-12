@@ -1,3 +1,4 @@
+// FileTreeSidebarView — Superlemon's native file-tree sidebar
 // (NORTHSTAR §4.1 item 3, §5 "Sidebar", DESIGN §14.1).
 //
 // NSOutlineView-based, ~370 pt design width, 24 pt rows. The directory
@@ -7,7 +8,7 @@
 // Context menu: New File, New Folder, Rename, Delete (to Trash), Reveal in
 // Finder — all emitted through `onFileOperation`; actual mutations happen
 // in the embedder via `FileOperations`, followed by `reload(path:)`.
-// FSEvents integration is a later wave.
+// Tree refreshes are explicit; there is currently no FSEvents watcher.
 
 import AppKit
 
@@ -136,8 +137,8 @@ public final class FileTreeSidebarView: NSView {
     /// COMPOSED across namespaces by the embedder: absolute path →
     /// decoration. Precedence rule: where a ui decoration and a git badge
     /// target the same path, the UI DECORATION WINS — explicit plugin
-    /// intent outranks the built-in git provider (which is itself being
-    /// migrated onto this API, DESIGN §15). Paths without a ui decoration
+    /// intent outranks the built-in git provider. Built-in Git still uses its
+    /// bespoke notification path (DESIGN §15). Paths without a ui decoration
     /// keep their git badge; `setGitStatus` keeps working unchanged.
     private var uiDecorations: [String: SidebarDecoration] = [:]
 

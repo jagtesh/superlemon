@@ -5,6 +5,7 @@
 // Components:
 //   FuzzyScorer              — pure fzy-style subsequence scorer (nonisolated)
 //   FileIndex                — actor; project file walk + gitignore + queries
+//   QuickOpenPanelController — fuzzy file palette (498×346 NSPanel + scrim)
 //   StatusBarView            — 24pt powerline status bar fed by superlemon.status
 //   FileTreeSidebarView      — lazy NSOutlineView file tree + context menu
 //   FileOperations           — FileManager mutations behind sidebar callbacks

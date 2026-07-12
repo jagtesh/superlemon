@@ -1,4 +1,5 @@
-// (NORTHSTAR §4.3, §5 "Quick-open palette", DESIGN §14.4).
+// QuickOpenPanelController — Superlemon's fuzzy file palette
+// (NORTHSTAR §4.3, §5 "Quick Open / palettes", DESIGN §14.4).
 //
 // Borderless key NSPanel, 498×346 pt fixed, upper-center over the parent
 // window (top edge ≈96 pt below the content top), 10 pt radius, #ECECEC
@@ -258,6 +259,7 @@ public final class QuickOpenPanelController: NSObject {
         onQueryChange?("")
 
         if let parent, let parentContent = parent.contentView {
+            // Scrim over the full content region while the palette is active.
             let scrim = ScrimView(frame: parentContent.bounds)
             scrim.wantsLayer = true
             scrim.layer?.backgroundColor = NSColor.black.withAlphaComponent(Self.scrimAlpha).cgColor

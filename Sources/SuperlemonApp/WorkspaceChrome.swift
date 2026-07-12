@@ -1,4 +1,4 @@
-// WorkspaceChrome — owns every wave-3 chrome component and its wiring:
+// WorkspaceChrome — owns every native chrome component and its wiring:
 // ChromeKit (cmdline palette, popupmenu, toasts, confirm alerts), ShellKit
 // (sidebar, status bar, quick-open), and the superlemon.* RPC notifications.
 // See Sources/ChromeKit/WIRING.md and Sources/ShellKit/WIRING.md.
@@ -197,7 +197,9 @@ final class WorkspaceChrome {
         tabStrip.applyAppearance(dark: dark)
     }
 
-    // MARK: - ChromeKit sync (WIRING.md §2)
+    // MARK: - ChromeKit sync
+
+    // See ChromeKit/WIRING.md, “Synchronizing the native surfaces”.
 
     private func syncChrome() {
         guard let window else { return }
@@ -275,7 +277,8 @@ final class WorkspaceChrome {
         return line
     }
 
-    /// GridKit-backed resolver (WIRING.md §3): id 0 = the default pair.
+    /// GridKit-backed resolver (ChromeKit/WIRING.md “Highlight resolution”):
+    /// id 0 = the default pair.
     private var highlightResolver: HighlightResolver {
         let highlights = controller.store.highlights
         return { hlID in
@@ -284,7 +287,8 @@ final class WorkspaceChrome {
         }
     }
 
-    /// Grid cell → contentView point for the popupmenu (WIRING.md §4).
+    /// Grid cell → contentView point for the popupmenu (ChromeKit/WIRING.md
+    /// “Grid cell to popup anchor”).
     private func anchorPoint(grid: Int, row: Int, col: Int) -> NSPoint {
         guard let window, let contentView = window.contentView else { return .zero }
         if grid == -1 {
@@ -312,7 +316,8 @@ final class WorkspaceChrome {
         return surface.convert(cellTopLeft, to: contentView)
     }
 
-    /// ext_messages `confirm` → native sheet (WIRING.md §5). Buttons are
+    /// ext_messages `confirm` → native sheet (ChromeKit/WIRING.md “Messages
+    /// and confirmations”). Buttons are
     /// parsed from nvim's "&Yes\n&No\n&Cancel"-style prompt text; each reply
     /// is the button's hotkey via nvim_input.
     private func presentConfirmAlert(_ confirm: MessageModel) {

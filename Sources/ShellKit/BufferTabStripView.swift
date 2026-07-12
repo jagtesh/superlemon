@@ -1,4 +1,5 @@
-// buffer tab strip (NORTHSTAR §4.1 item 2, §5 "Tab strip", §8 geometry).
+// BufferTabStripView — Superlemon's tab strip band rendered as a native
+// buffer tab strip (NORTHSTAR §4.1 item 2, §5 "Buffer strip", §8 geometry).
 //
 // 28 pt flat opaque band in the titlebar colors with a 1 px hairline
 // bottom border. Tabs are leading-aligned, intrinsic width capped at

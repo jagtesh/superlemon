@@ -1,5 +1,6 @@
 // FileIndex — actor that walks a project root and serves the quick-open
-// palette: full file list (recency-ordered) and fuzzy queries via FuzzyScorer.
+// palette: full file list (modification-time ordered) and fuzzy queries via
+// FuzzyScorer.
 //
 // Walking happens on the actor's executor (off the main thread). `.git` is
 // always skipped. Root-level `.gitignore` rules are honored per the subset
@@ -73,6 +74,7 @@ public actor FileIndex {
     }
 
     /// Fuzzy query over the index. Empty query returns the most recently
+    /// modified files first; otherwise
     /// results are ranked by FuzzyScorer, best first.
     public func query(_ q: String, limit: Int = 50) -> [(path: String, positions: [Int])] {
         if q.isEmpty {
@@ -115,7 +117,7 @@ public actor FileIndex {
 ///   `/` in anchored patterns (FNM_PATHNAME is NOT set) — close enough for
 ///   typical ignore files.
 ///
-/// NOT supported (out of scope per DESIGN §14 wave notes): `**` semantics
+/// NOT supported by the current index (see DESIGN §14.4): `**` semantics
 /// beyond what plain fnmatch gives, nested .gitignore files,
 /// `.git/info/exclude`, global core.excludesFile, escaping (`\#`, `\!`),
 /// and trailing-space quirks.
