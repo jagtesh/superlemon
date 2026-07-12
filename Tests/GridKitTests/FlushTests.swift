@@ -284,6 +284,10 @@ import NvimKit
     @Test func externalizedModeCommandAndRulerMessagesRemainScrollCompatible() {
         let store = makeStore(rows: 6, cols: 6)
         let disposition = store.applyDeferred(batch(
+            .msgShow(
+                kind: "echo", content: [(hlID: 0, text: "working")],
+                replaceLast: false),
+            .msgClear,
             .msgShowmode(content: [(hlID: 0, text: "-- NORMAL --")]),
             .gridScroll(
                 grid: 1, top: 0, bottom: 6, left: 0, right: 6,
@@ -291,6 +295,9 @@ import NvimKit
             line(1, 5, 0, runs("next  ")),
             .msgShowcmd(content: [(hlID: 0, text: "^E")]),
             .msgRuler(content: [(hlID: 0, text: "2,1")]),
+            .msgHistoryShow(entries: [
+                (kind: "echo", content: [(hlID: 0, text: "previous")]),
+            ]),
             .winViewport(
                 grid: 1, win: 10, topline: 1, botline: 7,
                 curline: 2, curcol: 0, lineCount: 100, scrollDelta: 1),
@@ -307,9 +314,16 @@ import NvimKit
     @Test func standaloneExternalizedMessagesDoNotRequestDeferredPresentation() {
         let store = makeStore(rows: 6, cols: 6)
         let messages = batch(
+            .msgShow(
+                kind: "echo", content: [(hlID: 0, text: "working")],
+                replaceLast: false),
+            .msgClear,
             .msgShowmode(content: [(hlID: 0, text: "-- NORMAL --")]),
             .msgShowcmd(content: [(hlID: 0, text: "^E")]),
             .msgRuler(content: [(hlID: 0, text: "2,1")]),
+            .msgHistoryShow(entries: [
+                (kind: "echo", content: [(hlID: 0, text: "previous")]),
+            ]),
             .flush
         )
 

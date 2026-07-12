@@ -576,10 +576,11 @@ private struct DeferredFrameClassification {
                 regions[gridID] = region
             }
 
-        // These surfaces are externalized from the grid. Neovim commonly
-        // emits `msg_ruler` beside every viewport move and `msg_showcmd` beside
-        // keyboard scrolling; neither changes row pixels or geometry.
-        case .msgShowmode, .msgShowcmd, .msgRuler:
+        // Every ext_messages surface is owned by ChromeKit. Neovim commonly
+        // emits `msg_ruler` beside viewport moves and `msg_showcmd` beside
+        // keyboard scrolling; none of these events changes grid pixels or geometry.
+        case .msgShow, .msgClear, .msgShowmode, .msgShowcmd, .msgRuler,
+             .msgHistoryShow:
             break
 
         default:

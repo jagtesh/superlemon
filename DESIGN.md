@@ -275,10 +275,11 @@ several wire flushes coalesce. Within each wire frame, ordered compatible
 `win_viewport.scroll_delta`. Matching nets preserve repeated one-row provenance
 even when Neovim reports one aggregated viewport delta; mismatches force atomic
 presentation and retain the authoritative semantic report. Externalized
-`msg_showmode`, `msg_showcmd`, and `msg_ruler` updates do not invalidate an
-otherwise-compatible grid scroll. A flush containing only those externalized
-messages requests no SurfaceKit presentation and cannot drain or cancel a
-display-linked scroll already waiting for vsync.
+`msg_show`, `msg_clear`, `msg_showmode`, `msg_showcmd`, `msg_ruler`, and
+`msg_history_show` updates do not invalidate an otherwise-compatible grid
+scroll. A flush containing only those externalized messages requests no
+SurfaceKit presentation and cannot drain or cancel a display-linked scroll
+already waiting for vsync.
 
 ### Event handling
 
@@ -483,8 +484,9 @@ Scroll frames emit `os_signpost` events and can record a bounded in-memory
 diagnostic ring when `SUPERLEMON_SCROLL_TRACE=1` or a test hook is installed.
 Samples include time, semantic delta, history head, envelope position, velocity,
 and acceleration, snapped physical translation, and authoritative/visual cursor
-Y. Display-linked presentation emits one final-state sample per target frame
-after any queued residual has been applied. Setting
+Y. Only display-linked targets emit trajectory samples, with one final-state
+sample after any queued residual has been applied; immediate commits cannot
+interleave wall-clock timestamps into that series. Setting
 `SUPERLEMON_SCROLL_TRACE_FILE=/path/to/trace.jsonl` also enables sampling and
 writes the bounded ring off-main after motion settles, keeping file I/O out of
 the input, raster, and display-commit paths.

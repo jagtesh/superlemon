@@ -40,6 +40,20 @@ private struct ScrollDiagnosticRing {
     }
 }
 
+/// Preserve export order without putting file I/O on the main actor. Every
+/// submission originates on the main actor, and the serial queue guarantees
+/// that a newer settled gesture is always the final payload on disk.
+private final class ScrollDiagnosticExporter: @unchecked Sendable {
+    private let queue = DispatchQueue(
+        label: "com.superlemon.editor.scroll-diagnostics", qos: .utility)
+
+    func submit(_ payload: Data, to url: URL) {
+        queue.async {
+            try? payload.write(to: url, options: .atomic)
+        }
+    }
+}
+
 /// Font + spacing configuration for the surface. `name == nil` means the
 /// system monospaced font. Mirrors nvim's `guifont`/`linespace` (DESIGN §4).
 public struct FontSpec: Sendable, Equatable {
@@ -263,7 +277,7 @@ public final class GridSurfaceView: NSView {
         ProcessInfo.processInfo.environment["SUPERLEMON_SCROLL_TRACE"] == "1"
         || ProcessInfo.processInfo.environment["SUPERLEMON_SCROLL_TRACE_FILE"] != nil
     private var diagnosticRing = ScrollDiagnosticRing(capacity: 2_048)
-    private var diagnosticExportTask: Task<Void, Never>?
+    private let diagnosticExporter = ScrollDiagnosticExporter()
     private static let scrollSignpostLog = OSLog(
         subsystem: "com.superlemon.editor",
         category: OSLog.Category.pointsOfInterest.rawValue)
@@ -445,9 +459,6 @@ public final class GridSurfaceView: NSView {
 
         if motionStarted || cursorCorrectionActive {
             resumeDisplayLink()
-        }
-        if !isInsideDisplayTick {
-            emitDiagnostics(timestamp: CACurrentMediaTime())
         }
     }
 
@@ -651,8 +662,8 @@ public final class GridSurfaceView: NSView {
     }
 
     /// Export only after motion settles so diagnostics never add file I/O to
-    /// the input, raster, or display-commit path. A later gesture cancels and
-    /// replaces an older pending export with the ring's newest bounded view.
+    /// the input, raster, or display-commit path. Exports are serialized so a
+    /// later gesture's bounded snapshot always remains the final file content.
     private func exportScrollDiagnosticsIfRequested() {
         guard let diagnosticExportURL else { return }
         let samples = diagnosticRing.ordered
@@ -670,11 +681,7 @@ public final class GridSurfaceView: NSView {
         }
         guard let payload = (lines.joined(separator: "\n") + "\n").data(using: .utf8)
         else { return }
-        diagnosticExportTask?.cancel()
-        diagnosticExportTask = Task.detached(priority: .utility) {
-            guard !Task.isCancelled else { return }
-            try? payload.write(to: diagnosticExportURL, options: .atomic)
-        }
+        diagnosticExporter.submit(payload, to: diagnosticExportURL)
     }
 
     private func updateCursorPresentation() {
