@@ -22,10 +22,14 @@ class Superlemon < Formula
   def install
     source_root = buildpath
     resource("neovim").stage do
-      nvim_distribution = Dir["nvim-macos-*"].first
-      odie "Neovim distribution is incomplete" if nvim_distribution.nil?
+      nvim_distribution = Pathname.pwd
+      unless (nvim_distribution/"bin/nvim").executable?
+        nested = Dir["nvim-macos-*"].first
+        nvim_distribution /= nested unless nested.nil?
+      end
+      odie "Neovim distribution is incomplete" unless (nvim_distribution/"bin/nvim").executable?
 
-      ENV["SUPERLEMON_NVIM_DIST"] = Pathname.pwd/nvim_distribution
+      ENV["SUPERLEMON_NVIM_DIST"] = nvim_distribution
       system source_root/"scripts/package-app.sh", "release"
     end
 
