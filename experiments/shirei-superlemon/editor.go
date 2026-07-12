@@ -1,81 +1,137 @@
 package main
 
 import (
-	"bufio"
-	"errors"
+	"context"
 	"fmt"
-	"io"
+	"log"
 	"os"
-	"os/exec"
+	"slices"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/vmihailenco/msgpack/v5"
+	"github.com/neovim/go-client/nvim"
 	shirei "go.hasen.dev/shirei"
 )
 
-type Snapshot struct {
-	Mode  string
-	Row   int
-	Col   int
-	Name  string
-	Lines []string
-	Error string
+type NvimColor struct {
+	RGB   uint32
+	Valid bool
 }
 
-func (s Snapshot) DisplayText() string {
-	if len(s.Lines) == 0 {
-		return "Starting Neovim…"
-	}
-	lines := append([]string(nil), s.Lines...)
-	row := s.Row
-	if row >= 0 && row < len(lines) {
-		col := min(max(s.Col, 0), len(lines[row]))
-		lines[row] = lines[row][:col] + "▏" + lines[row][col:]
-	}
-	text := ""
-	for index, line := range lines {
-		if index > 0 {
-			text += "\n"
-		}
-		text += line
-	}
-	return text
+type Highlight struct {
+	Foreground NvimColor
+	Background NvimColor
+	Bold       bool
+	Italic     bool
+	Underline  bool
+	Reverse    bool
+}
+
+type GridCell struct {
+	Text      string
+	Highlight Highlight
+}
+
+type Cursor struct {
+	Row        int
+	Col        int
+	Shape      string
+	Percentage int
+	Visible    bool
+}
+
+type Snapshot struct {
+	Mode      string
+	Name      string
+	Rows      [][]GridCell
+	Cursor    Cursor
+	DefaultFG NvimColor
+	DefaultBG NvimColor
+	Error     string
+}
+
+type gridCell struct {
+	text string
+	hlID int
+}
+
+type modeInfo struct {
+	shape      string
+	percentage int
 }
 
 type grid struct {
 	width, height int
-	rows          [][]string
+	rows          [][]gridCell
 	cursorRow     int
 	cursorCol     int
 	title         string
+	mode          string
+	modeIndex     int
+	modes         []modeInfo
+	highlights    map[int]Highlight
+	defaultFG     NvimColor
+	defaultBG     NvimColor
+}
+
+func newGrid() *grid {
+	return &grid{
+		highlights: make(map[int]Highlight),
+		defaultFG:  NvimColor{RGB: 0xd8dee9, Valid: true},
+		defaultBG:  NvimColor{RGB: 0x151820, Valid: true},
+	}
 }
 
 func (g *grid) resize(width, height int) {
+	old := g.rows
 	g.width, g.height = width, height
-	g.rows = make([][]string, height)
+	g.rows = make([][]gridCell, height)
 	for row := range g.rows {
-		g.rows[row] = make([]string, width)
+		g.rows[row] = make([]gridCell, width)
 		for col := range g.rows[row] {
-			g.rows[row][col] = " "
+			g.rows[row][col].text = " "
+			if row < len(old) && col < len(old[row]) {
+				g.rows[row][col] = old[row][col]
+			}
 		}
 	}
 }
 
 func (g *grid) clear() {
-	g.resize(g.width, g.height)
+	for row := range g.rows {
+		for col := range g.rows[row] {
+			g.rows[row][col] = gridCell{text: " "}
+		}
+	}
 }
 
 func (g *grid) snapshot() Snapshot {
-	lines := make([]string, len(g.rows))
-	for row, cells := range g.rows {
-		lines[row] = strings.TrimRight(strings.Join(cells, ""), " ")
+	rows := make([][]GridCell, len(g.rows))
+	for row := range g.rows {
+		rows[row] = make([]GridCell, len(g.rows[row]))
+		for col, cell := range g.rows[row] {
+			highlight := g.highlights[cell.hlID]
+			if highlight.Reverse {
+				highlight.Foreground, highlight.Background = highlight.Background, highlight.Foreground
+			}
+			rows[row][col] = GridCell{Text: cell.text, Highlight: highlight}
+		}
+	}
+	cursor := Cursor{Row: g.cursorRow, Col: g.cursorCol, Shape: "block", Percentage: 100, Visible: true}
+	if g.modeIndex >= 0 && g.modeIndex < len(g.modes) {
+		cursor.Shape = g.modes[g.modeIndex].shape
+		cursor.Percentage = g.modes[g.modeIndex].percentage
+	}
+	if cursor.Shape == "" {
+		cursor.Shape = "block"
+	}
+	if cursor.Percentage <= 0 {
+		cursor.Percentage = 100
 	}
 	return Snapshot{
-		Mode: "nvim", Row: g.cursorRow, Col: g.cursorCol,
-		Name: g.title, Lines: lines,
+		Mode: g.mode, Name: g.title, Rows: rows, Cursor: cursor,
+		DefaultFG: g.defaultFG, DefaultBG: g.defaultBG,
 	}
 }
 
@@ -115,13 +171,28 @@ func (e *Editor) Input(input string) {
 	}
 }
 
-func (e *Editor) Snapshot() Snapshot {
-	return *e.snapshot.Load()
-}
+func (e *Editor) Snapshot() Snapshot { return *e.snapshot.Load() }
 
 func (e *Editor) store(snapshot Snapshot) {
+	if current := e.snapshot.Load(); current != nil && snapshotsEqual(*current, snapshot) {
+		return
+	}
 	e.snapshot.Store(&snapshot)
 	shirei.RequestNextFrame()
+}
+
+func snapshotsEqual(left, right Snapshot) bool {
+	if left.Mode != right.Mode || left.Name != right.Name || left.Cursor != right.Cursor ||
+		left.DefaultFG != right.DefaultFG || left.DefaultBG != right.DefaultBG || left.Error != right.Error ||
+		len(left.Rows) != len(right.Rows) {
+		return false
+	}
+	for row := range left.Rows {
+		if !slices.Equal(left.Rows[row], right.Rows[row]) {
+			return false
+		}
+	}
+	return true
 }
 
 func (e *Editor) supervise() {
@@ -140,6 +211,7 @@ func (e *Editor) supervise() {
 			return
 		default:
 		}
+		log.Printf("Neovim session stopped: %v; restarting in %s", err, delay)
 		e.store(Snapshot{Mode: "restarting", Error: fmt.Sprintf("Neovim stopped: %v", err)})
 		timer := time.NewTimer(delay)
 		select {
@@ -153,78 +225,84 @@ func (e *Editor) supervise() {
 }
 
 func (e *Editor) runSession() error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	binary := os.Getenv("SUPERLEMON_NVIM")
 	if binary == "" {
 		binary = "nvim"
 	}
-	arguments := []string{"--embed"}
-	arguments = append(arguments, e.arguments...)
-	command := exec.Command(binary, arguments...)
-	command.Dir = e.cwd
-	stdin, err := command.StdinPipe()
+	arguments := append([]string{"--embed"}, e.arguments...)
+	logf := func(string, ...any) {}
+	if os.Getenv("SUPERLEMON_SHIREI_DEBUG") != "" {
+		logf = log.Printf
+	}
+	client, err := nvim.NewChildProcess(
+		nvim.ChildProcessCommand(binary),
+		nvim.ChildProcessArgs(arguments...),
+		nvim.ChildProcessDir(e.cwd),
+		nvim.ChildProcessEnv(os.Environ()),
+		nvim.ChildProcessContext(ctx),
+		nvim.ChildProcessLogf(logf),
+	)
 	if err != nil {
 		return err
 	}
-	stdout, err := command.StdoutPipe()
-	if err != nil {
-		return err
-	}
-	stderr, err := command.StderrPipe()
-	if err != nil {
-		return err
-	}
+	defer client.Close()
 
-	rpc := newRPC(stdin, stdout)
-	if err := command.Start(); err != nil {
-		return err
-	}
-	defer func() {
-		_ = command.Process.Kill()
-		_ = command.Wait()
-	}()
-	go io.Copy(io.Discard, stderr)
-	go rpc.readLoop()
-
-	if _, err := rpc.request("nvim_ui_attach", []any{
-		110, 36, map[string]any{"ext_linegrid": true, "rgb": true},
+	redraw := make(chan [][]any, 256)
+	if err := client.RegisterHandler("redraw", func(updates ...[]any) {
+		if os.Getenv("SUPERLEMON_SHIREI_DEBUG") != "" {
+			log.Printf("redraw updates=%d first=%#v", len(updates), updates[0][0])
+		}
+		select {
+		case redraw <- updates:
+		case <-ctx.Done():
+		}
 	}); err != nil {
 		return err
 	}
-	screen := &grid{}
+	if err := client.AttachUI(110, 36, map[string]any{
+		"ext_linegrid": true,
+		"rgb":          true,
+	}); err != nil {
+		return err
+	}
+
+	screen := newGrid()
+	health := time.NewTicker(time.Second)
+	defer health.Stop()
 	for {
 		select {
 		case <-e.stop:
-			// The deferred kill is deliberate: shutdown must not hang if Neovim
-			// is wedged and unable to answer a graceful RPC request.
 			return nil
-		case err := <-rpc.failed:
-			return err
-		case notification := <-rpc.notifications:
-			if notification.method == "redraw" && applyRedraw(screen, notification.params) {
+		case <-health.C:
+			if _, err := client.Mode(); err != nil {
+				return fmt.Errorf("Neovim health check failed: %w", err)
+			}
+		case updates := <-redraw:
+			if applyRedraw(screen, updates) {
 				e.store(screen.snapshot())
 			}
 		case input := <-e.inputs:
 			if input == "" {
 				continue
 			}
-			if _, err := rpc.request("nvim_input", []any{input}); err != nil {
+			if _, err := client.Input(input); err != nil {
 				return err
 			}
 		}
 	}
 }
 
-func applyRedraw(screen *grid, params []any) bool {
-	changed := false
-	for _, rawEvent := range params {
-		event, ok := rawEvent.([]any)
-		if !ok || len(event) == 0 {
+func applyRedraw(screen *grid, updates [][]any) bool {
+	flushed := false
+	for _, event := range updates {
+		if len(event) == 0 {
 			continue
 		}
-		name := stringValue(event[0])
-		// Zero-argument redraw events are encoded as only their event name.
+		name, _ := event[0].(string)
 		if name == "flush" && len(event) == 1 {
-			changed = true
+			flushed = true
 			continue
 		}
 		for _, rawInvocation := range event[1:] {
@@ -233,33 +311,42 @@ func applyRedraw(screen *grid, params []any) bool {
 			case "grid_resize":
 				if len(invocation) >= 3 && intValue(invocation[0]) == 1 {
 					screen.resize(intValue(invocation[1]), intValue(invocation[2]))
-					changed = true
 				}
 			case "grid_clear":
 				if len(invocation) >= 1 && intValue(invocation[0]) == 1 {
 					screen.clear()
-					changed = true
 				}
 			case "grid_cursor_goto":
 				if len(invocation) >= 3 && intValue(invocation[0]) == 1 {
 					screen.cursorRow = intValue(invocation[1])
 					screen.cursorCol = intValue(invocation[2])
-					changed = true
 				}
 			case "grid_line":
 				applyGridLine(screen, invocation)
-				changed = true
+			case "default_colors_set":
+				if len(invocation) >= 2 {
+					screen.defaultFG = colorValue(invocation[0])
+					screen.defaultBG = colorValue(invocation[1])
+				}
+			case "hl_attr_define":
+				applyHighlight(screen, invocation)
+			case "mode_info_set":
+				applyModeInfo(screen, invocation)
+			case "mode_change":
+				if len(invocation) >= 2 {
+					screen.mode, _ = invocation[0].(string)
+					screen.modeIndex = intValue(invocation[1])
+				}
 			case "set_title":
 				if len(invocation) >= 1 {
-					screen.title = stringValue(invocation[0])
-					changed = true
+					screen.title, _ = invocation[0].(string)
 				}
 			case "flush":
-				changed = true
+				flushed = true
 			}
 		}
 	}
-	return changed
+	return flushed
 }
 
 func applyGridLine(screen *grid, invocation []any) {
@@ -271,120 +358,81 @@ func applyGridLine(screen *grid, invocation []any) {
 		return
 	}
 	cells, _ := invocation[3].([]any)
+	hlID := 0
 	for _, rawCell := range cells {
 		cell, _ := rawCell.([]any)
 		if len(cell) == 0 {
 			continue
 		}
-		text, repeat := stringValue(cell[0]), 1
+		text, _ := cell[0].(string)
+		if len(cell) >= 2 {
+			hlID = intValue(cell[1])
+		}
+		repeat := 1
 		if len(cell) >= 3 {
 			repeat = max(1, intValue(cell[2]))
 		}
 		for range repeat {
 			if col >= 0 && col < len(screen.rows[row]) {
-				screen.rows[row][col] = text
+				screen.rows[row][col] = gridCell{text: text, hlID: hlID}
 			}
 			col++
 		}
 	}
 }
 
-type rpcClient struct {
-	encoder       *msgpack.Encoder
-	decoder       *msgpack.Decoder
-	writes        sync.Mutex
-	mu            sync.Mutex
-	nextID        uint64
-	pending       map[uint64]chan rpcResponse
-	failed        chan error
-	notifications chan rpcNotification
+func applyHighlight(screen *grid, invocation []any) {
+	if len(invocation) < 2 {
+		return
+	}
+	attributes, _ := invocation[1].(map[string]any)
+	highlight := Highlight{
+		Foreground: colorFromMap(attributes, "foreground"),
+		Background: colorFromMap(attributes, "background"),
+		Bold:       boolFromMap(attributes, "bold"), Italic: boolFromMap(attributes, "italic"),
+		Underline: boolFromMap(attributes, "underline"), Reverse: boolFromMap(attributes, "reverse"),
+	}
+	screen.highlights[intValue(invocation[0])] = highlight
 }
 
-type rpcNotification struct {
-	method string
-	params []any
-}
-
-type rpcResponse struct {
-	value any
-	err   error
-}
-
-func newRPC(stdin io.Writer, stdout io.Reader) *rpcClient {
-	return &rpcClient{
-		encoder: msgpack.NewEncoder(stdin), decoder: msgpack.NewDecoder(bufio.NewReader(stdout)),
-		pending: make(map[uint64]chan rpcResponse), failed: make(chan error, 1),
-		notifications: make(chan rpcNotification, 256),
+func applyModeInfo(screen *grid, invocation []any) {
+	if len(invocation) < 2 {
+		return
+	}
+	items, _ := invocation[1].([]any)
+	screen.modes = make([]modeInfo, len(items))
+	for index, raw := range items {
+		item, _ := raw.(map[string]any)
+		shape, _ := item["cursor_shape"].(string)
+		screen.modes[index] = modeInfo{shape: shape, percentage: intValue(item["cell_percentage"])}
 	}
 }
 
-func (r *rpcClient) request(method string, params []any) (any, error) {
-	r.mu.Lock()
-	r.nextID++
-	id := r.nextID
-	response := make(chan rpcResponse, 1)
-	r.pending[id] = response
-	r.mu.Unlock()
-
-	r.writes.Lock()
-	err := r.encoder.Encode([]any{0, id, method, params})
-	r.writes.Unlock()
-	if err != nil {
-		return nil, err
+func colorValue(value any) NvimColor {
+	number := intValue(value)
+	if number < 0 {
+		return NvimColor{}
 	}
-	result := <-response
-	return result.value, result.err
+	return NvimColor{RGB: uint32(number), Valid: true}
 }
 
-func (r *rpcClient) readLoop() {
-	for {
-		var message []any
-		if err := r.decoder.Decode(&message); err != nil {
-			r.fail(err)
-			return
-		}
-		if len(message) == 3 && intValue(message[0]) == 2 {
-			params, _ := message[2].([]any)
-			r.notifications <- rpcNotification{method: stringValue(message[1]), params: params}
-			continue
-		}
-		if len(message) != 4 || intValue(message[0]) != 1 {
-			continue
-		}
-		id := uint64(intValue(message[1]))
-		r.mu.Lock()
-		response := r.pending[id]
-		delete(r.pending, id)
-		r.mu.Unlock()
-		if response == nil {
-			continue
-		}
-		if message[2] != nil {
-			response <- rpcResponse{err: fmt.Errorf("Neovim RPC: %v", message[2])}
-		} else {
-			response <- rpcResponse{value: message[3]}
-		}
+func colorFromMap(values map[string]any, key string) NvimColor {
+	value, ok := values[key]
+	if !ok {
+		return NvimColor{}
 	}
+	return colorValue(value)
 }
 
-func (r *rpcClient) fail(err error) {
-	if errors.Is(err, io.EOF) {
-		err = errors.New("Neovim exited")
-	}
-	r.mu.Lock()
-	for id, response := range r.pending {
-		response <- rpcResponse{err: err}
-		delete(r.pending, id)
-	}
-	r.mu.Unlock()
-	select {
-	case r.failed <- err:
-	default:
-	}
+func boolFromMap(values map[string]any, key string) bool {
+	value, _ := values[key].(bool)
+	return value
 }
 
 func intValue(value any) int {
 	switch number := value.(type) {
+	case int:
+		return number
 	case int8:
 		return int(number)
 	case int16:
@@ -392,6 +440,8 @@ func intValue(value any) int {
 	case int32:
 		return int(number)
 	case int64:
+		return int(number)
+	case uint:
 		return int(number)
 	case uint8:
 		return int(number)
@@ -401,16 +451,22 @@ func intValue(value any) int {
 		return int(number)
 	case uint64:
 		return int(number)
-	case int:
-		return number
 	default:
 		return 0
 	}
 }
 
-func stringValue(value any) string {
-	if text, ok := value.(string); ok {
-		return text
+func modeLabel(mode string) string {
+	switch {
+	case strings.HasPrefix(mode, "i"):
+		return "INSERT"
+	case strings.HasPrefix(mode, "v") || mode == "V" || mode == "\x16":
+		return "VISUAL"
+	case strings.HasPrefix(mode, "c"):
+		return "COMMAND"
+	case strings.HasPrefix(mode, "R"):
+		return "REPLACE"
+	default:
+		return "NORMAL"
 	}
-	return ""
 }

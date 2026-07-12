@@ -3,7 +3,7 @@ module github.com/jagtesh/superlemon/experiments/shirei-superlemon
 go 1.24.4
 
 require (
-	github.com/vmihailenco/msgpack/v5 v5.4.1
+	github.com/neovim/go-client v1.2.1
 	go.hasen.dev/shirei v0.5.1-0.20260711160307-71ade6ce7569
 )
 
@@ -16,7 +16,6 @@ require (
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/go-text/typesetting v0.3.0 // indirect
 	github.com/jezek/xgb v1.1.1 // indirect
-	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	go.hasen.dev/generic v0.1.6 // indirect
 	golang.org/x/image v0.29.0 // indirect
 	golang.org/x/sys v0.40.0 // indirect
