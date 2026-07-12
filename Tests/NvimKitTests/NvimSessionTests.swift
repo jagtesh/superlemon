@@ -112,6 +112,35 @@ private func lineText(_ event: UIEvent) -> String? {
         #expect(tail.contains("bye"))
     }
 
+    @Test func closedChildInputDoesNotRaiseSIGPIPE() async throws {
+        // Keep the child alive briefly after closing stdin. This makes the
+        // session write while its pipe has no reader: write(2) must return
+        // EPIPE rather than terminating the whole test process with SIGPIPE.
+        let session = NvimSession(
+            configuration: NvimLaunchConfiguration(
+                binaryURL: URL(fileURLWithPath: "/bin/sh"),
+                arguments: ["-c", "exec 0<&-; sleep 0.2"]))
+        let exitBox = ExitBox()
+        let watcher = Task {
+            for await event in session.lifecycleEvents {
+                await exitBox.set(event)
+                break
+            }
+        }
+        defer { watcher.cancel() }
+
+        try await session.start()
+        try await Task.sleep(for: .milliseconds(50))
+        await session.notify("write_to_closed_pipe", [])
+        try await waitUntil { await exitBox.event != nil }
+
+        guard case .exited(let code, _)? = await exitBox.event else {
+            Issue.record("expected lifecycle exit event")
+            return
+        }
+        #expect(code == 0)
+    }
+
     @Test func notificationBatchPreservesFrameOrder() async throws {
         // cat echoes our one contiguous write back to the session decoder. If
         // the concatenated MessagePack frames are malformed or reordered, the

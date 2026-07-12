@@ -1,5 +1,8 @@
 import Foundation
 import os
+#if canImport(Darwin)
+import Darwin
+#endif
 
 // MARK: - Launch configuration
 
@@ -480,6 +483,13 @@ private final class PipeWriter: @unchecked Sendable {
 
     init(handle: FileHandle) {
         self.handle = handle
+#if canImport(Darwin)
+        // FileHandle writes ultimately call write(2), whose default behavior
+        // is to terminate the entire process with SIGPIPE when the child has
+        // already closed stdin. Convert that condition into EPIPE so the
+        // throwing FileHandle API can report it normally instead.
+        _ = fcntl(handle.fileDescriptor, F_SETNOSIGPIPE, 1)
+#endif
     }
 
     func write(_ bytes: [UInt8]) {
