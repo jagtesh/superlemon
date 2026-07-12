@@ -126,7 +126,7 @@ let g:superlemon_force_glyph_fallback = 0
 " overrides before sending them to the GUI.
 let g:superlemon_minimap_width = 88
 let g:superlemon_minimap_scale = 0.20
-let g:superlemon_minimap_pitch = 2.0
+let g:superlemon_minimap_pitch = 3.0
 
 " Hide the minimap unless the split can retain at least this many editor
 " columns after reserving its native gutter. A small hysteresis band prevents

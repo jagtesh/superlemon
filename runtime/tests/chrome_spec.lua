@@ -88,6 +88,11 @@ vim.cmd("SuperlemonChrome minimap off")
 H.eq(last_notify("superlemon.chrome").native_minimap, false, "minimap off state pushed")
 vim.cmd("SuperlemonChrome scrollbars on")
 H.eq(last_notify("superlemon.chrome").native_scrollbars, true, "scrollbars on state pushed")
+local scrollbar_topology = last_notify("superlemon.minimap")
+H.eq(scrollbar_topology and scrollbar_topology.kind, "windows",
+  "scrollbar-only mode keeps validated window topology active")
+H.ok(scrollbar_topology and #scrollbar_topology.windows > 0,
+  "scrollbar-only topology identifies its target window")
 require("superlemon").chrome_toggle("minimap")
 H.eq(last_notify("superlemon.chrome").native_minimap, true, "chrome_toggle flips minimap on")
 

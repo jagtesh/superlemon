@@ -127,7 +127,7 @@ personal configuration may override those ordinary Neovim options.
 
 ### `superlemon.settings`
 
-One complete renderer-settings map, pushed at every setup:
+One complete renderer/accessory-settings map, pushed at every setup:
 
 ```lua
 {
@@ -137,7 +137,8 @@ One complete renderer-settings map, pushed at every setup:
   force_glyph_fallback = false,
   minimap_width = 88,
   minimap_scale = 0.20,
-  minimap_pitch = 2.0,
+  minimap_pitch = 3.0,
+  minimap_min_editor_columns = 40,
 }
 ```
 
@@ -150,20 +151,26 @@ Values come from:
 | `use_symbol_font` | `g:superlemon_use_symbol_font` | false |
 | `force_glyph_fallback` | `g:superlemon_force_glyph_fallback` | false |
 | `minimap_width` | `g:superlemon_minimap_width` | 88 pt |
-| `minimap_scale` | `g:superlemon_minimap_scale` | 0.20 |
-| `minimap_pitch` | `g:superlemon_minimap_pitch` | 2.0 pt |
+| `minimap_scale` | `g:superlemon_minimap_scale` | 0.20 × active editor font size |
+| `minimap_pitch` | `g:superlemon_minimap_pitch` | 3.0 pt |
+| `minimap_min_editor_columns` | `g:superlemon_minimap_min_editor_columns` | 40 columns |
 
 Boolean values accept `1`/`true` or `0`/`false`. The complete snapshot replaces
 native renderer state atomically. Numeric minimap values must be finite; width
-clamps to 48...160, scale to 0.10...0.50, and pitch to 1...6 before crossing
-the wire. Neovim's standard `guifont` and `linespace` remain authoritative for
-font name, size, and spacing.
+clamps to 48...160, scale to 0.10...0.50, pitch to 1...6, and minimum editor
+columns to 20...120 before crossing the wire. Scale multiplies the active
+editor-font size; pitch independently controls vertical line spacing and is
+snapped to physical pixels by SurfaceKit. Neovim's standard `guifont` and
+`linespace` remain authoritative for font name, size, and spacing.
 
 ### `superlemon.minimap`
 
-One map argument with a required `kind`. The provider is active only while
-`native_minimap` is enabled. It reports data; SurfaceKit/AppKit owns every
-pixel, layer, clipping decision, and interaction.
+One map argument with a required `kind`. The lightweight topology provider is
+active while either `native_minimap` or `native_scrollbars` is enabled, because
+both controls validate semantic viewport targets against the current
+window/buffer pair. Highlighted content is requested only for a visible
+minimap. The provider reports data; SurfaceKit/AppKit owns every pixel, layer,
+clipping decision, and interaction.
 
 #### `kind = "windows"`
 
@@ -178,6 +185,7 @@ hidden-tab, and external windows are not included:
       winid = 1000,
       bufnr = 3,
       buftype = "",
+      buffer_name = "/workspace/Sources/App.swift",
       filetype = "swift",
       tabstop = 4,
       changedtick = 27,

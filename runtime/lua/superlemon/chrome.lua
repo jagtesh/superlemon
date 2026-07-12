@@ -62,6 +62,17 @@ local function push_chrome()
   })
 end
 
+-- Window/buffer topology is also required to validate native scrollbar drags
+-- when the visible minimap is off. Content remains demand-driven, so keeping
+-- this lightweight provider active does not rasterize or mirror the buffer.
+local function sync_accessory_provider()
+  pcall(function()
+    require("superlemon.minimap").set_enabled(
+      state.native_minimap or state.native_scrollbars
+    )
+  end)
+end
+
 local function push_buffers()
   if not (active() and state.native_tabs) then
     return
@@ -133,14 +144,13 @@ function M.set(part, on)
       return
     end
     state.native_minimap = on
-    pcall(function()
-      require("superlemon.minimap").set_enabled(on)
-    end)
+    sync_accessory_provider()
   elseif part == "scrollbars" then
     if state.native_scrollbars == on then
       return
     end
     state.native_scrollbars = on
+    sync_accessory_provider()
   else
     return
   end

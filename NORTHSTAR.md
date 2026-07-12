@@ -185,7 +185,9 @@ regions:
      plugin decorations. Selection is a square full-row fill.
    - **Neovim editor:** the visual center of gravity. Multigrid splits and
      floats retain Neovim geometry; the colorscheme owns all cells. No permanent
-     bezel surrounds it. Native overlay scrollbars are invisible at rest.
+     bezel surrounds it. A syntax-colored minimap may occupy a quiet trailing
+     gutter for each split that can afford it; independent native overlay
+     scrollbars are invisible at rest.
    - **Utility pane:** optional and contextual. Markdown preview, image metadata,
      documentation, or another native companion may occupy the right side
      without shrinking the editor when it has no reason to exist.
@@ -255,8 +257,8 @@ without weakening Vim's command language:
 - **Edit:** Undo, Redo, Cut, Copy, Paste, Select All, Find, Spelling and
   Substitutions, and Services. Each editor command maps to Neovim or the native
   clipboard bridge; menu state reflects whether the operation is meaningful.
-- **View:** sidebar, buffer strip, status bar, utility pane, native scrollbars,
-  focus/fullscreen controls, and appearance command entry points.
+- **View:** sidebar, buffer strip, status bar, utility pane, minimap, native
+  scrollbars, focus/fullscreen controls, and appearance command entry points.
 - **Go:** Quick Open, Go to File/Symbol/Line, Back/Forward, buffer/tab/window
   navigation, and workspace overview.
 
@@ -298,7 +300,8 @@ authorities instead of inventing opaque app-only settings.
 **Editor** includes:
 
 - font family, size, line spacing, ligatures, and symbol/Powerline fallback;
-- smooth-motion style, scrollbar visibility, and Reduce Motion explanation;
+- smooth-motion style, minimap visibility/width/density, independent scrollbar
+  visibility, and Reduce Motion explanation;
 - preview-buffer and native-chrome behavior; and
 - a clear “Use values from Neovim configuration” mode.
 
@@ -363,7 +366,7 @@ foreground strategy as defined in §6.3. Window, palette, overview, preferences,
 and utility surfaces must look intentionally related without collapsing into
 one undifferentiated gray rectangle.
 
-### 4.9 Scrolling, motion, and native scrollbars
+### 4.9 Scrolling, motion, minimaps, and native scrollbars
 
 The ideal scrolling model extends Superlemon's exact-row architecture rather
 than asking Neovim to synthesize fake intermediate edits:
@@ -394,11 +397,34 @@ than asking Neovim to synthesize fake intermediate edits:
 - Reduce Motion presents every authoritative state immediately and removes all
   interpolation and ornamental movement.
 
-Each Neovim window/split gains an independent native overlay scrollbar. Thumb
-geometry comes from `win_viewport`; it appears on hover/scroll, fades at rest,
-and never consumes a text column. Dragging requests a semantic Neovim viewport
-change and lets the same exact-row renderer reconcile the result. A scrollbar
-cannot directly move pixels into a state Neovim has not accepted.
+Each normal Neovim window/split should gain an independent syntax-colored
+minimap when it can preserve a useful editor width. The target is a stable
+approximately 88-point trailing gutter with real miniature glyphs, a restrained
+viewport rectangle, and a cursor marker. Small splits collapse the minimap
+before they crush source text, with hysteresis so crossing one resize boundary
+cannot make the gutter chatter.
+
+The miniature should show a bounded sliding neighborhood rather than pretend to
+be a full-document mirror. While the viewport remains inside that neighborhood,
+the sampled content stays fixed and the viewport/cursor markers follow the same
+fractional residual as the exact editor rows. Re-centering happens only when the
+semantic window is exhausted, avoiding a one-pitch sawtooth on every accepted
+line. Active syntax colors and durable decorations are retained; unavailable or
+over-budget highlight sources degrade quietly without delaying input.
+
+Because the minimap consumes width, Superlemon should request a smaller
+whole-cell grid from Neovim and wait for the acknowledged geometry before
+showing pixels or accepting input. It must never cover a text column and then
+claim that column is still interactive editor state.
+
+Each Neovim window/split should also have an independent native overlay
+scrollbar. Minimap and scrollbar visibility are separate choices: the scroller
+may occupy the minimap's trailing edge or overlay the grid when no minimap is
+present. Thumb geometry comes from `win_viewport`; it appears on hover/scroll,
+fades at rest, and by itself never consumes a text column. Dragging requests a
+semantic Neovim viewport change and lets the same exact-row renderer reconcile
+the result. Neither accessory can directly move pixels into a state Neovim has
+not accepted.
 
 All non-scroll animation follows the same discipline: short ease-out entry,
 faster exit, velocity continuity when interrupted, no bounce in dense editor
@@ -477,6 +503,7 @@ or plugin state store.
 | **Sidebar** | Resizable lazy tree, compact project header, type symbols, Git/diagnostic/plugin decorations, FSEvents refresh, preview/pin behavior, and buffer-aware file operations |
 | **Editor surface** | Exact Neovim multigrid with Core Text glyphs, per-grid row surfaces, native float treatment, and no theme translation |
 | **Smooth viewport** | Display-linked exact-row history, overlapping C2 minimum-jerk row envelopes, presentation-only Retina snapping, coupled cursor, exact-only capacity handling, and atomic fallback |
+| **Native minimaps** | Independent syntax-colored trailing projection per eligible Neovim window, with bounded sliding content, coupled markers, responsive collapse, and acknowledged whole-cell ownership |
 | **Native scrollbars** | Independent overlay scroller per Neovim window, derived from viewport metadata and routed back through Neovim |
 | **Status/command bar** | User-evaluated statusline, polished fallback, plugin segments, and in-place externalized command line |
 | **Quick Open / palettes** | 498 × 346 pt file palette and reusable provider-driven native picker with cancellable async data |
@@ -566,11 +593,11 @@ Neovim with a second editor core:
 | **SuperlemonApp** | Multi-window lifecycle, workspace restoration/overview, menus, panels, routing, Settings, native document-view selection, and integration |
 | **NvimKit** | Reliable local embedded sessions, typed MessagePack-RPC, version negotiation, ordered batch input, lifecycle, recovery context, and optional future transport abstraction |
 | **GridKit** | Row-COW authoritative model, highlight/layout/viewport state, complete redraw vocabulary, damage provenance, and presentation classification |
-| **SurfaceKit** | Core Text rasterization, IOSurface row revisions, exact filmstrips, horizontal/vertical motion, cursor, scrollbars, float treatment, backing changes, and diagnostics |
+| **SurfaceKit** | Core Text rasterization, IOSurface row revisions, exact filmstrips, horizontal/vertical motion, cursor, minimaps, scrollbars, float treatment, backing changes, and diagnostics |
 | **InputKit** | Pure key/mouse/gesture translation policies that remain independently testable |
 | **ChromeKit** | Externalized command line, completion, messages, prompts, documentation, and transient native Neovim UI |
 | **ShellKit** | Sidebar, buffers, status, Quick Open, workspace cards, utility panes, file operations, native palette, and shared chrome primitives |
-| **Bundled runtime** | Default mappings, clipboard, previews, native-chrome data, statusline evaluation, Git/diagnostics providers, settings snapshot, session support, and `superlemon.ui` |
+| **Bundled runtime** | Default mappings, clipboard, previews, native-chrome/minimap data, statusline evaluation, Git/diagnostics providers, settings snapshot, session support, and `superlemon.ui` |
 
 ### Authority rules
 
@@ -618,6 +645,12 @@ outside that grid and the app shell owns their split geometry. Native separator
 paint/hit targets may overlay Neovim separators, but width/height changes are
 requested from Neovim at whole-cell crossings.
 
+Native per-window accessories follow the same rule. A minimap may reserve a
+trailing gutter only by proposing a whole-cell grid size and waiting for Neovim
+to acknowledge it; hiding releases that ownership. Scrollbar/minimap gestures
+request semantic viewport changes and become visible state only through the
+normal authoritative redraw path.
+
 ---
 
 ## 8. Quick-reference geometry and motion sheet
@@ -642,6 +675,9 @@ requested from Neovim at whole-cell crossings.
 | Markdown preview padding | 24 pt |
 | Image metadata bar | ≈30 pt |
 | Editor font | User `guifont`; managed target 13–14 pt mono |
+| Minimap gutter | ≈88 pt; requires 40 editor columns to appear and uses a four-column hide hysteresis |
+| Minimap miniature | 0.20 × active editor font size; 3 pt line pitch snapped to physical pixels |
+| Native scrollbar | 12 pt overlay; independent of minimap visibility |
 | Hairlines | 1 physical pixel at active backing scale |
 | Window corners/shadow | Standard macOS window geometry |
 | Scroll history | At least two inner viewports per grid |

@@ -27,6 +27,9 @@ under Core Animation.
   Core Animation layers.
 - Compatible vertical viewport scrolling is reconciled with a display-linked,
   interruptible row filmstrip. Neovim's final grid remains authoritative.
+- Each sufficiently large normal Neovim split can reserve a native trailing
+  minimap gutter. The minimap is enabled by default; the independent native
+  overlay scrollbar is disabled by default.
 - Keyboard, IME, mouse, trackpad, paste, and resize input ultimately route back
   through Neovim.
 - Native chrome currently includes a file-tree sidebar, Quick Open, an optional
@@ -45,6 +48,11 @@ under Core Animation.
   workspace windows and shared/remote Neovim sessions are open work.
 - Neovim owns editor semantics. Superlemon does not implement a parallel buffer,
   undo, selection, layout, or save model.
+- The minimap is a bounded, versioned projection of a sliding buffer range, not
+  a second buffer or full-document cache. It includes active Tree-sitter or
+  legacy syntax plus persistent text-range extmarks when available; ephemeral
+  decorations, virtual text/lines, search matches, and conceal are outside the
+  current projection.
 - Vertical viewport scrolling is the optimized interpolated path. Horizontal
   scrolling and conflicting partial-region scrolls present atomically.
 - The current IME bridge supports marked text, commit/cancel, and candidate
@@ -68,7 +76,7 @@ SuperlemonApp (@MainActor integration)
 │   ├── one NvimSession
 │   ├── one GridStore
 │   ├── ordered input queue
-│   └── redraw/runtime/chrome coordination
+│   └── redraw/runtime/chrome/accessory coordination
 ├── InputHostView
 │   └── first responder + NSTextInputClient + mouse adapter
 ├── WorkspaceChrome
@@ -92,6 +100,9 @@ SurfaceKit (@MainActor)         ChromeKit (@MainActor)
 ├── Core Text rasterizer        ├── cmdline state/panel
 ├── row IOSurface renderer      ├── popupmenu state/panel
 ├── display-linked filmstrip    └── messages/toasts/history
+├── per-grid accessory manager
+├── Core Text minimap renderer
+├── native overlay scrollers
 └── cursor layer
 ```
 
@@ -113,6 +124,10 @@ SwiftPM dependency edges remain one-way:
   app shell run on the main actor.
 - `FileIndex` is an actor so project walking and fuzzy queries do not execute in
   view callbacks.
+- Minimap content collection yields cooperatively inside Neovim. Native
+  miniature rasterization runs in a detached utility task; request, buffer,
+  changed-tick, highlight-generation, and render serials prevent stale work
+  from installing.
 - IOSurface and CGImage row snapshots are immutable once published. Explicit
   leases keep IOSurfaces out of the reuse pool while model history or the
   compositor can still reference them.
@@ -143,6 +158,34 @@ their semantics. Notifications are serialized into one contiguous pipe write;
 wheel repeats remain an exact repeated sequence of `nvim_input_mouse`
 notifications. Paste uses one `nvim_paste` request and resize uses
 `nvim_ui_try_resize`.
+
+### Per-split accessory data flow
+
+The minimap is deliberately separate from Neovim's `redraw` stream:
+
+1. `runtime/lua/superlemon/minimap.lua` pushes the complete set of visible
+   normal windows and lightweight invalidations containing buffer identity,
+   `changedtick`, line count, and highlight generation.
+2. SurfaceKit derives a centered display window from `win_viewport` and asks
+   for a sliding range with surrounding overscan. It never requests more than
+   384 lines; the Lua provider also enforces that bound.
+3. The provider returns ordered chunks of at most 16 lines per scheduled turn.
+   Text is UTF-8-safe and capped at 256 Unicode characters per line. Syntax
+   source attempts receive about 1.5 ms before degrading from active
+   Tree-sitter to legacy syntax and finally `Normal`.
+4. Swift accumulates chunks until the visible range is covered or the provider
+   marks the request complete. A response must still match the request ID,
+   grid/window/buffer identity, `changedtick`, line count, and highlight
+   generation before it can replace displayed content.
+5. SurfaceKit rasterizes the accepted text and resolved foreground/style spans
+   as real miniature Core Text glyphs off the main actor. The result becomes a
+   clipped child layer of that grid, while viewport and cursor markers remain
+   cheap main-actor layers driven by the same snapped scroll residual as the
+   editor.
+
+Content requests are demand-driven. Edits, buffer switches, colorscheme or
+syntax changes, minimap disablement, and replacement requests retire obsolete
+work instead of allowing stale pixels to arrive late.
 
 ---
 
@@ -285,8 +328,9 @@ already waiting for vsync.
 
 GridKit applies linegrid, multigrid, highlight, cursor, mode, title, option,
 busy, and mouse events. `win_viewport_margins` records stationary rows/columns
-such as winbars and status columns. `win_viewport` currently drives smooth
-viewport motion and cursor coupling; native scrollbars are not implemented.
+such as winbars and status columns. `win_viewport` drives smooth viewport
+motion, cursor coupling, minimap viewport/cursor markers, and native scrollbar
+thumb geometry.
 
 Some global events are decoded for forward compatibility but do not yet have an
 app-shell effect, including bell, visual bell, icon, suspend, menu update, and
@@ -308,8 +352,13 @@ one cursor layer above the grid tree.
 GridSurfaceView
 ├── grid host layer (one per visible Neovim grid)
 │   ├── stationary base row layers
-│   └── clipped SmoothViewportState
-│       └── translated row container (innerHeight + 1 recyclable rows)
+│   ├── clipped SmoothViewportState
+│   │   └── translated row container (innerHeight + 1 recyclable rows)
+│   └── acknowledged accessory gutter
+│       ├── clipped minimap content
+│       ├── viewport and cursor markers
+│       └── optional trailing NSScroller
+├── topmost-safe accessory interaction views
 └── CursorLayer
 ```
 
@@ -407,11 +456,64 @@ and presents that exact result; it does not synthesize intermediate imagery.
 Motion settles all viewport envelopes, the cursor correction spring, and
 scheduled presentation immediately, then bypasses interpolation.
 
+### Per-grid minimap and native scrollbar
+
+Every visible normal window grid with viewport metadata has independent
+accessory state. The default minimap gutter is 88 points wide, with Core Text
+glyphs at 0.20 times the active editor font size on a 3-point vertical pitch.
+Runtime values clamp width to 48…160 points, glyph scale to 0.10…0.50, pitch to
+1…6 points, and the minimum retained editor width to 20…120 columns.
+
+The minimap appears only when the outer split can preserve the gutter plus 40
+editor columns and has at least 14 inner rows. Once visible, a four-column and
+four-row hysteresis band keeps it stable until fewer than 36 columns or 10 rows
+remain. Narrow or short splits therefore return the space to text instead of
+covering editor cells or repeatedly toggling at a resize boundary.
+
+The gutter uses an explicit ownership handshake:
+
+1. SurfaceKit computes the whole-cell inner size by subtracting enough columns
+   to cover the requested point width.
+2. `NvimController` queues `nvim_ui_try_resize_grid(grid, cols, rows)` through
+   the same ordered input path as other resize commands.
+3. The minimap layer and interaction view remain hidden until a later
+   `grid_resize` acknowledges exactly that size.
+4. Hiding or disabling sends `nvim_ui_try_resize_grid(grid, 0, 0)`, immediately
+   removes the native hit target, and returns to delegated layout after Neovim
+   expands the grid again.
+
+This keeps Neovim authoritative for split geometry. The acknowledged gutter is
+a child of the corresponding grid layer and is never reported as a Neovim cell.
+Floats, hidden-tab windows, and external windows do not receive minimaps.
+
+The displayed minimap range is centered around the viewport, constrained by
+the configured line pitch, and capped at 384 lines. It stays fixed while the
+whole viewport remains represented; re-centering on every one-line scroll would
+move the miniature beneath its marker and recreate a visible sawtooth. The
+viewport and cursor markers instead use the grid's live fractional scroll
+residual, so their motion remains continuous with the exact row filmstrip.
+
+Clicking or dragging the minimap and dragging its scrollbar send a semantic
+zero-based target topline. The controller validates the window/buffer pair,
+activates the window on gesture begin, and applies `winrestview()` inside that
+window. It does not scroll native pixels ahead of Neovim. Wheel events over
+either accessory rejoin `InputHostView`'s single `ScrollAccumulator` and ordered
+`nvim_input_mouse` route.
+
+The optional 12-point `NSScroller` is independent of the minimap. With a
+minimap it occupies the gutter's trailing edge; without one it overlays the
+grid edge and reserves no text column. It appears only for a scrollable viewport
+and derives its knob value/proportion from `win_viewport`.
+
 ### Resize and backing changes
 
 The grid size is the number of whole cells that fit the view bounds. Live resize
 requests coalesce once per main-run-loop turn. Neovim remains authoritative for
 the resulting `grid_resize` and repaint sequence.
+
+That outer `nvim_ui_try_resize` path sizes the root UI. Per-split minimap
+ownership uses the acknowledged `nvim_ui_try_resize_grid` handshake above; it
+does not mutate `GridLayout` frames locally or introduce a second split tree.
 
 Cell width is the ceiling of the primary font's `M` advance. Cell height is the
 ceiling of ascent + descent + leading, plus `linespace`. A font, linespace, or
@@ -622,10 +724,11 @@ Swift.
 | Module | Current responsibility |
 |---|---|
 | `init.lua` | Idempotent bridge setup and active-channel state |
-| `settings.lua` | Source the personal config once and push renderer settings |
+| `settings.lua` | Source the personal config once and push renderer/accessory settings |
 | `keymaps.lua` | Unmapped-only macOS defaults, native Save As request, font zoom |
 | `clipboard.lua` | Plain-text `+`/`*` clipboard provider |
-| `chrome.lua` | Native buffer-strip/status-bar toggles and buffer notifications |
+| `chrome.lua` | Neovim-owned buffer-strip, status-bar, minimap, and scrollbar toggles plus buffer notifications |
+| `minimap.lua` | Bounded visible-window topology, invalidation, and highlighted content chunks |
 | `status.lua` | Mode/file/position/project/branch state |
 | `statusline.lua` | Evaluate the user's statusline with resolved highlights |
 | `git.lua` | Async Git status data for sidebar badges |
@@ -655,11 +758,27 @@ the managed init is bypassed. Runtime bootstrap still sources the personal
 Superlemon init once before bridge setup. A marker prevents duplicate sourcing
 when the managed init already loaded it.
 
-Superlemon-specific values currently include native chrome toggles, native
-`vim.ui`, default keymaps, renderer ligatures/Powerline/symbol options, and the
-managed statusline. Neovim's standard `guifont`, `linespace`, and `mousescroll`
-remain authoritative. Configuration-source and renderer-setting changes apply
-on relaunch.
+Superlemon-specific values currently include native chrome/accessory toggles,
+native `vim.ui`, default keymaps, renderer ligatures/Powerline/symbol options,
+minimap geometry, and the managed statusline. The managed defaults enable the
+minimap, disable native scrollbars, and use an 88-point width, glyphs at 0.20
+times the active editor font size, a 3-point line pitch, and a 40-column minimum
+editor width. Neovim's standard `guifont`, `linespace`, and `mousescroll` remain
+authoritative. Configuration-source and settings-snapshot changes apply on
+relaunch; View-menu minimap and scrollbar toggles apply live through
+`superlemon.chrome` and remain Neovim-owned.
+
+| Accessory Vim global | Managed default |
+|---|---:|
+| `g:superlemon_native_minimap` | `1` |
+| `g:superlemon_native_scrollbars` | `0` |
+| `g:superlemon_minimap_width` | `88` pt |
+| `g:superlemon_minimap_scale` | `0.20` × active editor font size |
+| `g:superlemon_minimap_pitch` | `3.0` pt |
+| `g:superlemon_minimap_min_editor_columns` | `40` columns |
+
+`runtime/CONTRACT.md` defines the complete payload, clamps, and live toggle
+protocol.
 
 ---
 
@@ -674,6 +793,10 @@ The current default window contains:
 - an optional 28-point native buffer strip;
 - a vertical split with the file-tree sidebar and editor host; and
 - an optional 24-point native status/command bar.
+
+Inside the editor host, each sufficiently large normal Neovim split reserves
+its own native minimap gutter by default. Native scrollbars are a separate
+opt-in projection and can appear with or without the minimap.
 
 The sidebar starts at 260 points and has a 180-point minimum. Opening a folder
 changes Neovim's global working directory, closes project-scoped palette state,
@@ -708,14 +831,18 @@ Current Swift coverage includes:
 - Core Text raster output, highlights, cursor glyphs, IOSurface row revisions,
   pool bounds, circular history, minimum-jerk envelope equivalence and C2
   continuity, delayed frames, exact-only clamping/far jumps, pixel snapping,
-  cursor coupling, and display-link idle behavior;
+  cursor coupling, display-link idle behavior, accessory visibility hysteresis,
+  resize ownership/acknowledgement, bounded content accumulation, stale-chunk
+  rejection, syntax-colored miniature rasterization, marker motion, and native
+  scroller geometry;
 - cmdline, popupmenu, messages, toast/history, and native view models; and
 - file indexing, ignore rules, fuzzy scoring, file operations, file tree, Quick
   Open, buffer strip, status bar, and generic UI-component stores.
 
 The Lua specs cover setup, managed/personal config loading, runtime settings,
-default mappings, clipboard, chrome/buffers, status/statusline, Git, preview
-buffers, and `superlemon.ui`.
+default mappings, clipboard, chrome/buffers, bounded minimap topology/content/
+invalidation behavior, status/statusline, Git, preview buffers, and
+`superlemon.ui`.
 
 Run the current gates from the repository root:
 
@@ -746,6 +873,9 @@ rather than a SuperlemonApp test target.
 - Core Text row renderer with IOSurface-backed revisions.
 - Display-linked two-viewport filmstrip, overlapping minimum-jerk row envelopes,
   cursor coupling, exact-only exceptional presentation, and Reduce Motion.
+- Per-split native minimap gutters with acknowledged Neovim resizing, bounded
+  highlighted content, Core Text miniatures, coupled viewport/cursor markers,
+  semantic interactions, and independent opt-in native scrollbars.
 - Keyboard, basic IME, mouse, trackpad, clipboard, and ordered input queue.
 - Native cmdline, popupmenu, messages, prompts, sidebar, Quick Open, preview
   buffers, buffer strip, statusline/status bar, file panels, Settings, and About.
@@ -754,7 +884,7 @@ rather than a SuperlemonApp test target.
 ### Open work
 
 - Rich IME clause/reconversion behavior and a multi-IME validation matrix.
-- Native scrollbars, float materials/shadows, and separator affordance paint.
+- Float materials/shadows and separator affordance paint.
 - Workspace overview, multiple windows, restored sessions, Finder/Dock opening,
   drag-and-drop, Services, and CLI/XPC integration.
 - Buffer-aware reconciliation for sidebar rename/trash operations.
@@ -771,6 +901,7 @@ rather than a SuperlemonApp test target.
 | Model/render synchronization | A bad damage or row-history decision can show stale pixels | Immutable row revisions, one-shot semantic deltas, authoritative-row assertions, extensive GridKit/SurfaceKit tests, atomic fallback |
 | Fast scrolling | Retained history cannot represent every true far jump or delayed compositor frame | Exact authoritative rows stay visible; one-line far cue, bounded debt, diagnostics, Reduce Motion bypass |
 | IOSurface lifetime | Reusing a surface still referenced by history/compositor corrupts rows | Revision leases, IOSurface use counts, compositor-use checks, bounded CGImage fallback |
+| Minimap fidelity and staleness | A full-document/highlight mirror would block Neovim or install obsolete content; ephemeral decoration state is intentionally incomplete | Sliding 384-line requests, cooperative 16-line chunks, 256-character line cap, syntax budgets/fallbacks, identity and generation checks, detached raster cancellation |
 | IME | Clause editing and reconversion are incomplete | Keep marked text out of Neovim; use AppKit candidate placement; document current scope |
 | Externalized messages | Plugins may depend on TUI-specific hit-enter/message behavior | Typed model, native history, atomic editor grid; no claim of complete TUI-message emulation |
 | Sidebar mutations | Rename/trash may leave an already-open Neovim buffer referring to the old path | File open/preview goes through Neovim; buffer-aware mutation integration remains open |
@@ -860,8 +991,10 @@ Quick Open panels.
 
 The native Settings window chooses the Neovim init source and opens the personal
 Superlemon configuration. Font, spacing, scroll steps, ligatures, symbols, native
-chrome, statusline, and default-keymap customization remain file-backed rather
-than duplicated in UserDefaults controls.
+chrome/accessories, minimap width/scale/pitch, statusline, and default-keymap
+customization remain file-backed rather than duplicated in UserDefaults
+controls. The View menu exposes live minimap and native-scrollbar toggles, but
+their source of truth is still the runtime's `superlemon.chrome` notification.
 
 ---
 
@@ -949,6 +1082,14 @@ Superlemon does not mirror editor splits into nested NSSplitViews. Doing so woul
 create competing layout authorities, continuous-pixel versus whole-cell
 geometry, duplicate separator drawing, and multi-frame intermediate states.
 
+The minimap gutter is the narrow exception that proves the ownership rule. It
+does not edit `GridLayout` or position a parallel split. SurfaceKit proposes a
+smaller whole-cell size for one existing grid, sends that proposal through
+`nvim_ui_try_resize_grid`, and exposes native pixels/hit testing only after the
+authoritative grid acknowledges the dimensions. Hiding performs the inverse
+release handshake. The outer `win_pos` rectangle and every relationship between
+Neovim windows remain Neovim-owned throughout.
+
 Mouse drag and release remain on the grid that received the press. Re-hit-testing
 separator drags after each `win_pos` update caused a feedback loop when the
 target grid's origin moved. `InputHostView` therefore latches the press grid and
@@ -971,6 +1112,12 @@ the GUI does not paint its own split separators.
 - Independent grids keep independent history and motion.
 - The cursor follows the same viewport residual as its text, clamps at viewport
   edges, and scroll-only frames do not restart blink.
+- A minimap gutter is neither visible nor hit-testable until Neovim acknowledges
+  its per-grid resize, and no point in that gutter is reported as a grid cell.
+- Minimap content must match its request, window, buffer, changed tick, line
+  count, and highlight generation; stale asynchronous chunks never install.
+- Minimap and native-scrollbar interactions request semantic Neovim state; they
+  never authoritatively scroll the native layer tree on their own.
 - Immediate mode and Reduce Motion leave no interpolated tail; scrolling never
   places synthetic imagery above the exact row filmstrip.
 - Keyboard and mouse input remain ordered and unpaced; wheel batching preserves

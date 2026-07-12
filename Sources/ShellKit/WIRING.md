@@ -330,9 +330,11 @@ The managed init sources the annotated bundled baseline
 the personal Superlemon file once during bridge bootstrap.
 
 Settings chooses the init source and creates/opens the personal Superlemon file
-from the bundled template. Font, scrolling, native chrome, native UI, keymap,
-statusline, and renderer preferences live in that file and apply on relaunch;
-they are not mirrored into native controls.
+from the bundled template. Font, scrolling, native chrome, per-split
+minimap/scrollbar toggles and minimap geometry, native UI, keymap, statusline,
+and renderer preferences live in that file and apply on relaunch; they are not
+mirrored into native controls. Live View-menu accessory toggles still round-trip
+through Neovim's `superlemon.chrome` state.
 
 ## Tests
 

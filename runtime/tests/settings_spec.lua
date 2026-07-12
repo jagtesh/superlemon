@@ -31,7 +31,7 @@ H.eq(settings.payload(), {
   force_glyph_fallback = false,
   minimap_width = 88,
   minimap_scale = 0.20,
-  minimap_pitch = 2.0,
+  minimap_pitch = 3.0,
   minimap_min_editor_columns = 40,
 }, "renderer settings have stable defaults")
 

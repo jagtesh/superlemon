@@ -19,6 +19,12 @@ vim.opt.splitright = true
 vim.opt.splitbelow = true
 vim.opt.updatetime = 250
 
+-- The managed experience should be syntax-colored without depending on the
+-- user's normal Neovim init. Filetype detection selects the bundled syntax,
+-- indent, and ftplugin rules; the native minimap consumes the same semantics.
+vim.cmd("filetype plugin indent on")
+vim.cmd("syntax enable")
+
 -- Ships with nvim; calm and readable in both appearances.
 vim.cmd.colorscheme("habamax")
 

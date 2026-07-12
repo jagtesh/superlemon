@@ -34,8 +34,9 @@ function M.setup(channel)
   require("superlemon.clipboard").setup()
   require("superlemon.keymaps").setup()
   require("superlemon.chrome").setup(group)
+  local chrome = require("superlemon.chrome").state()
   require("superlemon.minimap").setup(
-    group, require("superlemon.chrome").state().native_minimap
+    group, chrome.native_minimap or chrome.native_scrollbars
   )
   require("superlemon.git").setup(group)
   require("superlemon.ui").setup()

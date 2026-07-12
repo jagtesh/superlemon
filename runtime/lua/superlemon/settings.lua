@@ -87,7 +87,7 @@ function M.payload()
     force_glyph_fallback = boolean_setting(vim.g.superlemon_force_glyph_fallback, false),
     minimap_width = number_setting(vim.g.superlemon_minimap_width, 88, 48, 160),
     minimap_scale = number_setting(vim.g.superlemon_minimap_scale, 0.20, 0.10, 0.50),
-    minimap_pitch = number_setting(vim.g.superlemon_minimap_pitch, 2.0, 1.0, 6.0),
+    minimap_pitch = number_setting(vim.g.superlemon_minimap_pitch, 3.0, 1.0, 6.0),
     minimap_min_editor_columns = number_setting(
       vim.g.superlemon_minimap_min_editor_columns, 40, 20, 120),
   }

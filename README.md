@@ -13,6 +13,9 @@ The current editor includes:
 - display-linked, interruptible smooth vertical scrolling with exact retained
   row history, cursor coupling, Reduce Motion support, and a bounded fast-scroll
   veil for gaps that cannot be represented exactly;
+- a syntax-colored native minimap for each sufficiently large Neovim split,
+  with viewport/cursor markers, automatic narrow-split hiding, and an
+  independently configurable native overlay scrollbar;
 - a native file tree, fuzzy Quick Open, buffer tabs with Sublime-style preview
   behavior, and an evaluated native Neovim statusline;
 - native command-line, completion, message, confirmation, file-open, folder-open,
@@ -70,6 +73,22 @@ Open **Superlemon > Settings…** to choose the Neovim init source or create and
 open the personal Superlemon file. Font name, font size, and line spacing stay
 in Neovim's `guifont` and `linespace`; renderer and native-chrome settings live
 in the annotated Superlemon file.
+
+The managed baseline enables the per-split minimap and leaves native
+scrollbars off. These settings are independent:
+
+| Vim global | Default | Purpose |
+|---|---:|---|
+| `g:superlemon_native_minimap` | `1` | Show the minimap when a split can retain a useful editor width |
+| `g:superlemon_native_scrollbars` | `0` | Show a small native overlay scroller per scrollable split |
+| `g:superlemon_minimap_width` | `88` | Desired gutter width in points; clamped to 48…160 |
+| `g:superlemon_minimap_scale` | `0.20` | Core Text glyph size relative to the active editor font; clamped to 0.10…0.50 |
+| `g:superlemon_minimap_pitch` | `3.0` | Vertical line pitch in points; clamped to 1…6 |
+| `g:superlemon_minimap_min_editor_columns` | `40` | Text columns that must remain before the gutter appears; clamped to 20…120 |
+
+Use **View > Minimap** and **View > Native Scrollbars** for live toggles. The
+menu asks Neovim to change the corresponding runtime state and reflects the
+resulting notification; it does not maintain a second preference value.
 
 ## Native file workflow
 
