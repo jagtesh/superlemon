@@ -283,6 +283,9 @@ return require("superlemon.minimap").request({
   request_id = 91,
   winid = 1000,
   bufnr = 3,
+  changedtick = 27,
+  line_count = 640,
+  highlight_generation = 3,
   firstline = 128,
   lastline = 512,
   max_columns = 120,
@@ -290,17 +293,24 @@ return require("superlemon.minimap").request({
 ```
 
 The call returns `true` only after validating that the enabled provider has the
-normal window, that the window still displays the supplied loaded buffer, and
-that the range is well formed. It then returns immediately. Results use at
-most 16 lines per scheduled turn. A request is capped to 384 lines and 256
-Unicode characters per line; partial reads and UTF-8-safe truncation prevent a
-pathological line from becoming a pathological payload. Each syntax source
-attempt receives about 1.5 ms and bounded capture/extmark counts.
+normal window, that the window still displays the supplied loaded buffer, that
+the range is well formed, and that `changedtick`, `line_count`, and
+`highlight_generation` exactly match the provider's current topology. A stale
+tuple cancels older work for that window, immediately republishes the complete
+current `kind="windows"` snapshot, and returns `false`; the fire-and-forget GUI
+therefore receives authoritative identity and issues a fresh request. No content
+work starts for the stale tuple.
+
+An accepted call returns immediately. Results use at most 16 lines per
+scheduled turn. A request is capped to 384 lines and 256 Unicode characters per
+line; partial reads and UTF-8-safe truncation prevent a pathological line from
+becoming a pathological payload. Each syntax source attempt receives about 1.5
+ms and bounded capture/extmark counts.
 
 Only the newest request generation for a window may notify. Each scheduled
-chunk revalidates window/buffer identity and `changedtick`; edits, buffer
-switches, minimap disablement, or a replacement request silently retire stale
-work.
+chunk revalidates window/buffer identity, `changedtick`, line count, and
+highlight generation; edits, buffer switches, minimap disablement, or a
+replacement request silently retire stale work.
 
 `ColorScheme`, `Syntax`, `FileType`, `LspTokenUpdate`, `DiagnosticChanged`, and
 relevant option changes advance the highlight generation. Buffer invalidations

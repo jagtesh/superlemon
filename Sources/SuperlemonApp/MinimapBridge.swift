@@ -149,6 +149,9 @@ final class MinimapBridge {
             (.string("request_id"), .string(String(request.requestID))),
             (.string("winid"), .int(Int64(current.windowHandle))),
             (.string("bufnr"), .int(Int64(current.bufferHandle))),
+            (.string("changedtick"), .int(current.changedTick)),
+            (.string("line_count"), .int(Int64(current.totalLineCount))),
+            (.string("highlight_generation"), .uint(current.highlightGeneration)),
             (.string("firstline"), .int(Int64(firstLine))),
             (.string("lastline"), .int(Int64(lastLine))),
             (.string("max_columns"), .int(Int64(maxColumns))),
@@ -318,15 +321,30 @@ final class MinimapBridge {
             pending.surfaceRequest.requestID == requestID,
             pending.surfaceRequest.topology.windowHandle == window,
             pending.surfaceRequest.topology.bufferHandle == buffer,
-            pending.surfaceRequest.topology.changedTick == changedTick,
-            pending.surfaceRequest.topology.totalLineCount == lineCount,
-            pending.surfaceRequest.topology.highlightGeneration == highlightGeneration,
+            lastLine <= lineCount,
+            lastLine - firstLine <= Self.maximumRequestLines,
+            rawLines.count == lastLine - firstLine
+        else { return false }
+
+        let expected = pending.surfaceRequest.topology
+        if changedTick != expected.changedTick
+            || lineCount != expected.totalLineCount
+            || highlightGeneration != expected.highlightGeneration
+        {
+            return recoverFromNewerContent(
+                window: window,
+                buffer: buffer,
+                changedTick: changedTick,
+                lineCount: lineCount,
+                highlightGeneration: highlightGeneration,
+                pending: pending)
+        }
+
+        guard
             topologiesByWindow[window] == pending.surfaceRequest.topology,
             firstLine == pending.nextLine,
             firstLine >= pending.wireRange.lowerBound,
             lastLine <= pending.wireRange.upperBound,
-            lastLine - firstLine <= Self.maximumRequestLines,
-            rawLines.count == lastLine - firstLine,
             complete ? lastLine == pending.wireRange.upperBound
                 : (lastLine > firstLine && lastLine < pending.wireRange.upperBound)
         else { return false }
@@ -359,6 +377,47 @@ final class MinimapBridge {
             pendingByWindow[window] = advanced
         }
         surface?.provideMinimapContent(chunk)
+        return true
+    }
+
+    /// A request may cross the process boundary after Neovim has loaded or
+    /// edited the buffer represented by the topology that originated it. Older
+    /// runtimes answer such a request with current metadata. Never install that
+    /// content under the old identity, but use a monotonic header to advance the
+    /// topology and let SurfaceKit issue a fresh request immediately.
+    private func recoverFromNewerContent(
+        window: Int,
+        buffer: Int,
+        changedTick: Int64,
+        lineCount: Int,
+        highlightGeneration: UInt64,
+        pending: PendingRequest
+    ) -> Bool {
+        let expected = pending.surfaceRequest.topology
+        guard topologiesByWindow[window] == expected,
+            expected.windowHandle == window,
+            expected.bufferHandle == buffer,
+            changedTick >= expected.changedTick,
+            highlightGeneration >= expected.highlightGeneration,
+            changedTick > expected.changedTick
+                || highlightGeneration > expected.highlightGeneration,
+            changedTick != expected.changedTick
+                || lineCount == expected.totalLineCount
+        else { return false }
+
+        let advanced = MinimapBufferTopology(
+            windowHandle: expected.windowHandle,
+            bufferHandle: expected.bufferHandle,
+            changedTick: changedTick,
+            totalLineCount: lineCount,
+            highlightGeneration: highlightGeneration,
+            tabstop: expected.tabstop,
+            bufferLabel: expected.bufferLabel,
+            filetype: expected.filetype)
+
+        pendingByWindow.removeValue(forKey: window)
+        topologiesByWindow[window] = advanced
+        surface?.updateMinimapTopology(advanced)
         return true
     }
 
@@ -403,7 +462,7 @@ final class MinimapBridge {
                 source.utf8.count <= 64,
                 let priority = exactInt(fields["priority"]), priority >= 0,
                 let order = exactInt(fields["order"]), order >= 0,
-                let styleFields = Fields(fields["style"] ?? .nil),
+                let styleFields = decodeStyleFields(fields["style"]),
                 let style = decodeTextStyle(styleFields),
                 let foreground = optionalRGB(styleFields["fg"]),
                 let background = optionalRGB(styleFields["bg"]),
@@ -429,6 +488,19 @@ final class MinimapBridge {
                 style: style))
         }
         return decoded
+    }
+
+    /// Lua's empty table has no map/array type until MessagePack encoding, so
+    /// older provider chunks can carry a semantic empty style as `[]`. Keep
+    /// this compatibility exception local to styles: nonempty arrays and all
+    /// array-shaped envelopes, lines, or spans remain invalid.
+    private static func decodeStyleFields(_ value: Value?) -> Fields? {
+        guard let value else { return nil }
+        if case .array(let entries) = value {
+            guard entries.isEmpty else { return nil }
+            return Fields(.map([]))
+        }
+        return Fields(value)
     }
 
     private static func decodeTextStyle(_ fields: Fields) -> MinimapTextStyle? {

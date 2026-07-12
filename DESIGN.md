@@ -167,17 +167,26 @@ The minimap is deliberately separate from Neovim's `redraw` stream:
    normal windows and lightweight invalidations containing buffer identity,
    `changedtick`, line count, and highlight generation.
 2. SurfaceKit derives a centered display window from `win_viewport` and asks
-   for a sliding range with surrounding overscan. It never requests more than
-   384 lines; the Lua provider also enforces that bound.
-3. The provider returns ordered chunks of at most 16 lines per scheduled turn.
+   for a sliding range with surrounding overscan, echoing the topology's
+   `changedtick`, line count, and highlight generation as an expected identity
+   tuple. It never requests more than 384 lines; the Lua provider also enforces
+   that bound.
+3. Lua starts no content work unless that tuple still exactly matches. A request
+   overtaken by a file load, edit, or highlight change cancels older work and
+   immediately republishes current window topology so the fire-and-forget Swift
+   caller can retry with a fresh generation.
+4. The provider returns ordered chunks of at most 16 lines per scheduled turn.
    Text is UTF-8-safe and capped at 256 Unicode characters per line. Syntax
    source attempts receive about 1.5 ms before degrading from active
    Tree-sitter to legacy syntax and finally `Normal`.
-4. Swift accumulates chunks until the visible range is covered or the provider
+5. Swift accumulates chunks until the visible range is covered or the provider
    marks the request complete. A response must still match the request ID,
    grid/window/buffer identity, `changedtick`, line count, and highlight
    generation before it can replace displayed content.
-5. SurfaceKit rasterizes the accepted text and resolved foreground/style spans
+   As a compatibility defense, a same-request content header whose three model
+   fields are monotonically newer advances topology and retires the old request,
+   but its body is not installed; SurfaceKit requests the new identity instead.
+6. SurfaceKit rasterizes the accepted text and resolved foreground/style spans
    as real miniature Core Text glyphs off the main actor. The result becomes a
    clipped child layer of that grid, while viewport and cursor markers remain
    cheap main-actor layers driven by the same snapped scroll residual as the
@@ -496,9 +505,12 @@ residual, so their motion remains continuous with the exact row filmstrip.
 Clicking or dragging the minimap and dragging its scrollbar send a semantic
 zero-based target topline. The controller validates the window/buffer pair,
 activates the window on gesture begin, and applies `winrestview()` inside that
-window. It does not scroll native pixels ahead of Neovim. Wheel events over
-either accessory rejoin `InputHostView`'s single `ScrollAccumulator` and ordered
-`nvim_input_mouse` route.
+window. Because Neovim requires its cursor to remain in the rendered viewport,
+the command preserves an already-visible cursor or clamps it to the nearest
+requested viewport edge before restoring the exact topline. It does not scroll
+native pixels ahead of Neovim. Wheel events over either accessory rejoin
+`InputHostView`'s single `ScrollAccumulator` and ordered `nvim_input_mouse`
+route.
 
 The optional 12-point `NSScroller` is independent of the minimap. With a
 minimap it occupies the gutter's trailing edge; without one it overlays the

@@ -4,7 +4,10 @@
 package enum NvimInputCommand: Sendable, Equatable {
     /// Lua receives Neovim's zero-based UI `topline`, validates that the
     /// window still represents the expected buffer, then converts the line to
-    /// the one-based value accepted by `winrestview()`.
+    /// the one-based value accepted by `winrestview()`. Neovim requires its
+    /// cursor to remain in the rendered viewport: preserve it when visible,
+    /// otherwise clamp it to the nearest viewport edge before restoring the
+    /// exact requested top line.
     private static let viewportTargetLua = """
         local window, expected_buffer, topline, activate = ...
         if not vim.api.nvim_win_is_valid(window) then
@@ -20,7 +23,27 @@ package enum NvimInputCommand: Sendable, Equatable {
           if vim.api.nvim_get_current_buf() ~= expected_buffer then
             return false
           end
-          vim.fn.winrestview({ topline = topline + 1 })
+          local cursor = vim.api.nvim_win_get_cursor(window)
+          local line_count = vim.api.nvim_buf_line_count(expected_buffer)
+          local anchor = math.max(1, math.min(topline + 1, line_count))
+          local function set_cursor(line)
+            local text = vim.api.nvim_buf_get_lines(
+              expected_buffer, line - 1, line, false)[1] or ""
+            vim.api.nvim_win_set_cursor(
+              window, { line, math.min(cursor[2], #text) })
+          end
+
+          -- Anchor the cursor before restoring the view. Calling
+          -- winrestview() with an off-screen cursor is immediately clamped by
+          -- Neovim, before `w0`/`w$` can describe the requested viewport.
+          set_cursor(anchor)
+          local view = { topline = topline + 1 }
+          vim.fn.winrestview(view)
+          local first_visible = vim.fn.line("w0")
+          local last_visible = vim.fn.line("w$")
+          local target = math.max(first_visible, math.min(cursor[1], last_visible))
+          set_cursor(target)
+          vim.fn.winrestview(view)
           return true
         end)
         """

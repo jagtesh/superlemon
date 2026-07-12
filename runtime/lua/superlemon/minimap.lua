@@ -241,7 +241,10 @@ local function normalized_style(hl)
       style[key] = hl[key]
     end
   end
-  return style
+  -- MessagePack encodes a plain empty Lua table as [], but the bridge's style
+  -- field is a map. Preserve that wire type even for highlight groups that
+  -- deliberately resolve to no attributes.
+  return next(style) == nil and vim.empty_dict() or style
 end
 
 local function make_style_resolver(winid)
@@ -600,6 +603,7 @@ local function request_is_current(job)
     and api.nvim_win_get_buf(job.winid) == job.bufnr
     and api.nvim_buf_is_loaded(job.bufnr)
     and changedtick(job.bufnr) == job.changedtick
+    and line_count(job.bufnr) == job.line_count
     and highlight_generation == job.highlight_generation
 end
 
@@ -684,7 +688,8 @@ end
 
 --- Request a bounded zero-based, end-exclusive buffer range. The call merely
 --- validates and schedules work; `kind=content` notifications carry results.
----@param opts table {request_id,winid,bufnr,firstline,lastline,max_columns}
+---@param opts table {request_id,winid,bufnr,changedtick,line_count,
+---  highlight_generation,firstline,lastline,max_columns}
 ---@return boolean accepted
 function M.request(opts)
   if not active() or type(opts) ~= "table" then
@@ -705,37 +710,61 @@ function M.request(opts)
 
   local winid = finite_number(opts.winid)
   local bufnr = finite_number(opts.bufnr)
+  local expected_changedtick = finite_number(opts.changedtick)
+  local expected_line_count = finite_number(opts.line_count)
+  local expected_highlight_generation = finite_number(opts.highlight_generation)
   local firstline = finite_number(opts.firstline)
   local requested_lastline = finite_number(opts.lastline)
   local max_columns = finite_number(opts.max_columns)
-  if not winid or not bufnr or not firstline or not requested_lastline
-    or not max_columns or firstline < 0 or requested_lastline < firstline
+  if not winid or not bufnr or not expected_changedtick
+    or not expected_line_count or not expected_highlight_generation
+    or not firstline or not requested_lastline or not max_columns
+    or expected_changedtick < 0 or expected_line_count < 0
+    or expected_highlight_generation < 0
+    or firstline < 0 or requested_lastline < firstline
     or winid % 1 ~= 0 or bufnr % 1 ~= 0
+    or expected_changedtick % 1 ~= 0 or expected_line_count % 1 ~= 0
+    or expected_highlight_generation % 1 ~= 0
     or not is_normal_window(winid) or not api.nvim_buf_is_loaded(bufnr)
     or api.nvim_win_get_buf(winid) ~= bufnr
   then
     return false
   end
 
-  local line_count = api.nvim_buf_line_count(bufnr)
-  firstline = math.min(line_count, math.floor(firstline))
-  requested_lastline = math.min(line_count, math.floor(requested_lastline))
+  attach_buffer(bufnr)
+  local current_changedtick = changedtick(bufnr)
+  local current_line_count = line_count(bufnr)
+  local current_highlight_generation = highlight_generation
+  if current_changedtick ~= expected_changedtick
+    or current_line_count ~= expected_line_count
+    or current_highlight_generation ~= expected_highlight_generation
+  then
+    -- nvim_exec_lua is sent as a notification, so the caller cannot observe
+    -- this false return. Cancel older work and immediately republish the
+    -- authoritative tuple; SurfaceKit will issue a fresh generation.
+    request_serial = request_serial + 1
+    latest_by_window[winid] = request_serial
+    M.push_windows()
+    return false
+  end
+
+  firstline = math.min(current_line_count, math.floor(firstline))
+  requested_lastline = math.min(current_line_count, math.floor(requested_lastline))
   max_columns = math.max(1, math.min(MAX_COLUMNS, math.floor(max_columns)))
   local lastline = math.min(requested_lastline, firstline + MAX_REQUEST_LINES)
 
   request_serial = request_serial + 1
   local token = request_serial
   latest_by_window[winid] = token
-  attach_buffer(bufnr)
 
   local job = {
     token = token,
     request_id = request_id,
     winid = winid,
     bufnr = bufnr,
-    changedtick = changedtick(bufnr),
-    line_count = line_count,
-    highlight_generation = highlight_generation,
+    changedtick = current_changedtick,
+    line_count = current_line_count,
+    highlight_generation = current_highlight_generation,
     firstline = firstline,
     lastline = lastline,
     nextline = firstline,

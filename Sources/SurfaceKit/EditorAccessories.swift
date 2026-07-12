@@ -324,6 +324,12 @@ package enum GridAccessoryPolicy {
         return max(0, min(
             maximum, Int(floor(clickedLine - grabOffsetLines))))
     }
+
+    package static func scrollerPresentationValue(
+        authoritative: Double, current: Double, isUserTracking: Bool
+    ) -> Double {
+        isUserTracking ? current : max(0, min(1, authoritative))
+    }
 }
 
 // MARK: - Native miniature rasterizer
@@ -523,6 +529,7 @@ package enum MinimapRasterizer {
 private final class GridAccessoryScroller: NSScroller {
     var onTargetValue: ((Double, GridAccessoryGesturePhase) -> Void)?
     var onWheel: ((NSEvent) -> Void)?
+    private(set) var isUserTracking = false
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -539,9 +546,13 @@ private final class GridAccessoryScroller: NSScroller {
     override var acceptsFirstResponder: Bool { false }
 
     override func mouseDown(with event: NSEvent) {
+        isUserTracking = true
         onTargetValue?(Double(doubleValue), .began)
+        defer {
+            isUserTracking = false
+            onTargetValue?(Double(doubleValue), .ended)
+        }
         super.mouseDown(with: event)
-        onTargetValue?(Double(doubleValue), .ended)
     }
 
     override func scrollWheel(with event: NSEvent) {
@@ -1093,8 +1104,13 @@ private final class GridEditorAccessoryState {
         let maximum = max(0, viewport.lineCount - visible)
         interactionView.scroller.knobProportion = min(
             1, CGFloat(visible) / CGFloat(max(1, viewport.lineCount)))
-        interactionView.scroller.doubleValue = maximum == 0
+        let authoritativeValue = maximum == 0
             ? 0 : Double(clampedTop) / Double(maximum)
+        interactionView.scroller.doubleValue =
+            GridAccessoryPolicy.scrollerPresentationValue(
+                authoritative: authoritativeValue,
+                current: interactionView.scroller.doubleValue,
+                isUserTracking: interactionView.scroller.isUserTracking)
         interactionView.scroller.isEnabled = maximum > 0
     }
 
@@ -1103,8 +1119,17 @@ private final class GridEditorAccessoryState {
     ) {
         guard let displayRange, !displayRange.isEmpty, mapWidth > 0,
             interactionView.bounds.width > 0,
-            y >= 0, y <= interactionView.bounds.height
+            interactionView.bounds.height > 0
         else { return }
+        if phase == .began,
+            (y < interactionView.bounds.minY || y > interactionView.bounds.maxY)
+        { return }
+        // Once AppKit has captured a drag, continue targeting the nearest
+        // edge when the pointer leaves the gutter instead of dropping changed
+        // and mouse-up events (which also strands the grab offset).
+        let targetY = max(
+            interactionView.bounds.minY,
+            min(interactionView.bounds.maxY, y))
         // The trailing scroller owns its own hit area.
         if !interactionView.scroller.isHidden,
             y >= interactionView.scroller.frame.minY,
@@ -1116,17 +1141,21 @@ private final class GridEditorAccessoryState {
         let visibleLines = CGFloat(visibleViewportLineCount)
         if phase == .began {
             if !viewportLayer.isHidden,
-                y >= viewportLayer.frame.minY, y <= viewportLayer.frame.maxY
+                targetY >= viewportLayer.frame.minY,
+                targetY <= viewportLayer.frame.maxY
             {
                 minimapGrabOffsetLines = max(
-                    0, (y - viewportLayer.frame.minY) / max(1 / scale, pitch))
+                    0, (targetY - viewportLayer.frame.minY)
+                        / max(1 / scale, pitch))
             } else {
                 minimapGrabOffsetLines = visibleLines / 2
             }
         }
         let grabOffset = minimapGrabOffsetLines ?? visibleLines / 2
-        let clickedLine = CGFloat(displayRange.lowerBound)
-            + y / max(1 / scale, pitch)
+        let visualDisplayStart = CGFloat(displayRange.lowerBound)
+            + snappedDisplayRangeResidual(pitch: pitch)
+        let clickedLine = visualDisplayStart
+            + targetY / max(1 / scale, pitch)
         let total = topology?.totalLineCount ?? latestViewport?.lineCount ?? 0
         let target = GridAccessoryPolicy.targetTopline(
             clickedLine: clickedLine,

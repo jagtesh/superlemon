@@ -113,6 +113,21 @@ private func linePayload(
         ("spans", .array(spans)))
 }
 
+private func runtimeLinePayload(
+    _ line: Int,
+    text: String,
+    byteLength: Int,
+    truncated: Bool,
+    spans: [Value]
+) -> Value {
+    object(
+        ("line", .int(Int64(line))),
+        ("text", .string(text)),
+        ("byte_length", .int(Int64(byteLength))),
+        ("truncated", .bool(truncated)),
+        ("spans", .array(spans)))
+}
+
 private func spanPayload(
     start: Int,
     end: Int,
@@ -244,6 +259,9 @@ private func contentPayload(
         #expect(options["request_id"] == .string("42"))
         #expect(options["winid"] == .int(20))
         #expect(options["bufnr"] == .int(44))
+        #expect(options["changedtick"] == .int(7))
+        #expect(options["line_count"] == .int(10_000))
+        #expect(options["highlight_generation"] == .uint(3))
         #expect(options["firstline"] == .int(100))
         #expect(options["lastline"] == .int(484))
         #expect(options["max_columns"] == .int(256))
@@ -305,7 +323,7 @@ private func contentPayload(
         #expect(!harness.bridge.handlePayload(final), "completed identity must be retired")
     }
 
-    @Test func contentRejectsStaleWindowBufferAndModelGenerations() throws {
+    @Test func contentRejectsWrongIdentityAndNonMonotonicGenerations() throws {
         let harness = BridgeHarness()
         #expect(harness.bridge.handlePayload(windowsPayload([windowEntry(lineCount: 100)])))
         let topology = try #require(harness.bridge.topology(for: 20))
@@ -323,7 +341,7 @@ private func contentPayload(
         #expect(!harness.bridge.handlePayload(contentPayload(
             requestID: 61, topology: topology,
             firstLine: 0, lastLine: 1, complete: true, lines: lines,
-            changedTick: 8)))
+            changedTick: 6)))
         #expect(!harness.bridge.handlePayload(contentPayload(
             requestID: 61, topology: topology,
             firstLine: 0, lastLine: 1, complete: true, lines: lines,
@@ -331,7 +349,7 @@ private func contentPayload(
         #expect(!harness.bridge.handlePayload(contentPayload(
             requestID: 61, topology: topology,
             firstLine: 0, lastLine: 1, complete: true, lines: lines,
-            highlightGeneration: 4)))
+            highlightGeneration: 2)))
 
         // Rejections never consume the valid pending request.
         #expect(harness.bridge.handlePayload(contentPayload(
@@ -354,6 +372,59 @@ private func contentPayload(
         #expect(!harness.bridge.handlePayload(contentPayload(
             requestID: 62, topology: topology,
             firstLine: 0, lastLine: 1, complete: true, lines: lines)))
+    }
+
+    @Test func newerContentHeaderAdvancesTopologyAndForcesFreshIdentity() throws {
+        let harness = BridgeHarness()
+        #expect(harness.bridge.handlePayload(windowsPayload([windowEntry(
+            lineCount: 100)])))
+        let topology = try #require(harness.bridge.topology(for: 20))
+        harness.request(id: 63, topology: topology, range: 0..<1)
+
+        // This is the exact real-load race: Lua received the request after the
+        // displayed buffer advanced beyond the topology SurfaceKit used. The
+        // body must not install under the old identity, but its monotonic header
+        // is sufficient to refresh topology and retire request 63.
+        #expect(harness.bridge.handlePayload(contentPayload(
+            requestID: 63,
+            topology: topology,
+            firstLine: 0,
+            lastLine: 1,
+            complete: true,
+            lines: [linePayload(0, text: "new")],
+            changedTick: 8,
+            lineCount: 101,
+            highlightGeneration: 4)))
+
+        let advanced = try #require(harness.bridge.topology(for: 20))
+        #expect(advanced.changedTick == 8)
+        #expect(advanced.totalLineCount == 101)
+        #expect(advanced.highlightGeneration == 4)
+        #expect(advanced.tabstop == topology.tabstop)
+        #expect(advanced.bufferLabel == topology.bufferLabel)
+        #expect(advanced.filetype == topology.filetype)
+
+        #expect(!harness.bridge.handlePayload(contentPayload(
+            requestID: 63,
+            topology: topology,
+            firstLine: 0,
+            lastLine: 1,
+            complete: true,
+            lines: [linePayload(0)])), "old request must be retired")
+
+        harness.request(id: 64, topology: advanced, range: 0..<1)
+        let options = try #require(
+            harness.notifications.values.last?.params[1].arrayValue?.first)
+        #expect(options["changedtick"] == .int(8))
+        #expect(options["line_count"] == .int(101))
+        #expect(options["highlight_generation"] == .uint(4))
+        #expect(harness.bridge.handlePayload(contentPayload(
+            requestID: 64,
+            topology: advanced,
+            firstLine: 0,
+            lastLine: 1,
+            complete: true,
+            lines: [linePayload(0)])))
     }
 
     @Test func contentDecodesRGBTraitsAndReverseBackgroundSafely() throws {
@@ -433,6 +504,182 @@ private func contentPayload(
             lastLine: 1,
             complete: true,
             lines: [linePayload(0)])))
+    }
+
+    @Test func emptyLuaStyleArrayIsTheOnlyAcceptedArrayShapedStyle() throws {
+        let harness = BridgeHarness()
+        #expect(harness.bridge.handlePayload(windowsPayload([windowEntry(lineCount: 2)])))
+        let topology = try #require(harness.bridge.topology(for: 20))
+        harness.request(id: 72_001, topology: topology, range: 0..<1)
+
+        // A real legacy-syntax chunk can contain a resolved Normal span and a
+        // later semantic no-op style encoded as [] by Lua's ambiguous empty
+        // table. It must inherit without invalidating the entire 16-line chunk.
+        let normal = spanPayload(
+            start: 0,
+            end: 6,
+            style: object(("fg", .uint(0xD0D0D0))))
+        let emptyLegacy = spanPayload(
+            start: 5,
+            end: 6,
+            source: "legacy",
+            priority: 50,
+            order: 12,
+            style: .array([]))
+        #expect(harness.bridge.handlePayload(contentPayload(
+            requestID: 72_001,
+            topology: topology,
+            firstLine: 0,
+            lastLine: 1,
+            complete: true,
+            lines: [linePayload(
+                0, text: "value!", spans: [normal, emptyLegacy])])))
+
+        // The compatibility boundary is deliberately exact: a nonempty
+        // array is not a Lua empty dictionary and remains malformed.
+        harness.request(id: 72_002, topology: topology, range: 0..<1)
+        let malformed = spanPayload(
+            start: 0,
+            end: 1,
+            source: "legacy",
+            priority: 50,
+            order: 13,
+            style: .array([.bool(true)]))
+        #expect(!harness.bridge.handlePayload(contentPayload(
+            requestID: 72_002,
+            topology: topology,
+            firstLine: 0,
+            lastLine: 1,
+            complete: true,
+            lines: [linePayload(0, spans: [malformed])])))
+
+        // A malformed style does not consume the pending identity.
+        #expect(harness.bridge.handlePayload(contentPayload(
+            requestID: 72_002,
+            topology: topology,
+            firstLine: 0,
+            lastLine: 1,
+            complete: true,
+            lines: [linePayload(0)])))
+    }
+
+    @Test func exactRuntimeFixtureAcceptsTwentyFourSixteenLineChunks() throws {
+        let harness = BridgeHarness()
+        #expect(harness.bridge.handlePayload(windowsPayload([windowEntry(
+            lineCount: 384)])))
+        let topology = try #require(harness.bridge.topology(for: 20))
+        harness.request(
+            id: 73,
+            topology: topology,
+            range: 0..<384,
+            maxColumns: 256)
+
+        let normalStyle = object(
+            ("fg", .int(14_738_154)),
+            ("bg", .int(1_316_379)))
+        let fullStyle = object(
+            ("fg", .int(1_122_867)),
+            ("bg", .int(4_478_310)),
+            ("sp", .int(7_833_753)),
+            ("blend", .int(10)),
+            ("bold", .bool(true)),
+            ("italic", .bool(true)),
+            ("underline", .bool(true)),
+            ("undercurl", .bool(true)),
+            ("underdouble", .bool(true)),
+            ("underdotted", .bool(true)),
+            ("underdashed", .bool(true)),
+            ("strikethrough", .bool(true)),
+            ("reverse", .bool(true)),
+            ("standout", .bool(true)),
+            ("nocombine", .bool(true)))
+
+        for chunkIndex in 0..<24 {
+            let firstLine = chunkIndex * 16
+            let lastLine = firstLine + 16
+            var lines: [Value] = []
+            lines.reserveCapacity(16)
+            for lineNumber in firstLine..<lastLine {
+                let text: String
+                let byteLength: Int
+                let truncated: Bool
+                if lineNumber == 0 {
+                    text = "local emoji = '😀' -- fixture"
+                    byteLength = text.utf8.count
+                    truncated = false
+                } else if lineNumber == 17 {
+                    text = String(repeating: "😀", count: 256)
+                    byteLength = text.utf8.count + 400
+                    truncated = true
+                } else {
+                    text = String(format: "local value_%03d = %d", lineNumber + 1, lineNumber + 1)
+                    byteLength = text.utf8.count
+                    truncated = false
+                }
+
+                var spans = [spanPayload(
+                    start: 0,
+                    end: text.utf8.count,
+                    style: normalStyle)]
+                if lineNumber == 0 {
+                    spans.append(spanPayload(
+                        start: 0,
+                        end: 5,
+                        source: "extmark",
+                        priority: 220,
+                        order: 1_000_002,
+                        style: fullStyle))
+                }
+                if lineNumber == 357 {
+                    spans.append(spanPayload(
+                        start: max(0, text.utf8.count - 1),
+                        end: text.utf8.count,
+                        source: "legacy",
+                        priority: 50,
+                        order: 357,
+                        style: .array([])))
+                }
+                lines.append(runtimeLinePayload(
+                    lineNumber,
+                    text: text,
+                    byteLength: byteLength,
+                    truncated: truncated,
+                    spans: spans))
+            }
+
+            let payload = object(
+                ("kind", .string("content")),
+                ("request_id", .string("73")),
+                ("winid", .int(20)),
+                ("bufnr", .int(44)),
+                ("changedtick", .int(7)),
+                ("line_count", .int(384)),
+                ("highlight_generation", .int(3)),
+                ("firstline", .int(Int64(firstLine))),
+                ("lastline", .int(Int64(lastLine))),
+                ("complete", .bool(chunkIndex == 23)),
+                ("clamped", .bool(false)),
+                ("highlight_source", .string("treesitter")),
+                ("degraded", .string("legacy-budget")),
+                ("lines", .array(lines)))
+            #expect(harness.bridge.handlePayload(payload),
+                "runtime-shaped chunk \(chunkIndex) should decode")
+        }
+
+        // The provider's final `complete` chunk retires the request identity.
+        let replay = object(
+            ("kind", .string("content")),
+            ("request_id", .string("73")),
+            ("winid", .int(20)),
+            ("bufnr", .int(44)),
+            ("changedtick", .int(7)),
+            ("line_count", .int(384)),
+            ("highlight_generation", .int(3)),
+            ("firstline", .int(368)),
+            ("lastline", .int(384)),
+            ("complete", .bool(true)),
+            ("lines", .array([])))
+        #expect(!harness.bridge.handlePayload(replay))
     }
 
     @Test func malformedPayloadsAreRejectedWithoutDamagingPendingState() throws {

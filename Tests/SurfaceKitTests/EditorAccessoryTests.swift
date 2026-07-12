@@ -62,6 +62,39 @@ private struct AccessoryHarness {
     }
 }
 
+@MainActor
+private final class AccessoryRoutingHost: NSView {
+    let surface: GridSurfaceView
+
+    init(surface: GridSurfaceView) {
+        self.surface = surface
+        super.init(frame: surface.frame)
+        surface.frame = bounds
+        addSubview(surface)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("not supported") }
+
+    override var isFlipped: Bool { true }
+
+    /// Mirrors InputHostView's production routing without importing the
+    /// executable target into SurfaceKitTests.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard super.hitTest(point) != nil else { return nil }
+        let pointInSurface = surface.convert(point, from: self)
+        return surface.accessoryInteractionView(at: pointInSurface) ?? self
+    }
+
+    func mouseEvent(_ type: NSEvent.EventType, at point: NSPoint) -> NSEvent {
+        NSEvent.mouseEvent(
+            with: type, location: convert(point, to: nil),
+            modifierFlags: [], timestamp: 0,
+            windowNumber: window?.windowNumber ?? 0,
+            context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!
+    }
+}
+
 private func dominantRedPixelCount(_ image: CGImage) -> Int {
     let bytes = image.dataProvider!.data! as Data
     var count = 0
@@ -122,6 +155,15 @@ private func dominantRedPixelCount(_ image: CGImage) -> Int {
         #expect(GridAccessoryPolicy.targetTopline(
             clickedLine: 995, visibleLineCount: 40,
             grabOffsetLines: 7, totalLines: 1_000) == 960)
+    }
+
+    @Test func authoritativeScrollerUpdatesDoNotFightActiveTracking() {
+        #expect(GridAccessoryPolicy.scrollerPresentationValue(
+            authoritative: 0.75, current: 0.25,
+            isUserTracking: true) == 0.25)
+        #expect(GridAccessoryPolicy.scrollerPresentationValue(
+            authoritative: 0.75, current: 0.25,
+            isUserTracking: false) == 0.75)
     }
 }
 
@@ -203,6 +245,171 @@ private func dominantRedPixelCount(_ image: CGImage) -> Int {
         #expect(harness.view.cell(at: gutterPoint) == nil)
     }
 
+    @Test func hostHitRoutingDeliversClicksAndClampedOutsideDrags() {
+        let harness = AccessoryHarness()
+        var sizeRequest: GridAccessorySizeRequest?
+        harness.view.onGridAccessorySizeRequest = { sizeRequest = $0 }
+        harness.presentInitial()
+        harness.acknowledge(sizeRequest!)
+
+        let host = AccessoryRoutingHost(surface: harness.view)
+        let window = NSWindow(
+            contentRect: host.bounds, styleMask: .borderless,
+            backing: .buffered, defer: false)
+        window.contentView = host
+        guard let snapshot = harness.view.editorAccessoryDebugSnapshot(gridID: 2),
+            let interaction = snapshot.interactionFrame,
+            let viewport = snapshot.viewportFrame,
+            let display = snapshot.displayRange
+        else {
+            Issue.record("acknowledged interaction geometry missing")
+            return
+        }
+
+        var targets: [GridAccessoryViewportTargetRequest] = []
+        harness.view.onGridAccessoryViewportTargetRequest = { targets.append($0) }
+        let clickInSurface = NSPoint(
+            x: interaction.minX + 8,
+            y: interaction.minY + interaction.height * 0.8)
+        let clickInHost = host.convert(clickInSurface, from: harness.view)
+        guard let routed = host.hitTest(clickInHost), routed !== host else {
+            Issue.record("InputHost-style hit routing missed the minimap")
+            return
+        }
+        routed.mouseDown(with: host.mouseEvent(.leftMouseDown, at: clickInHost))
+        routed.mouseUp(with: host.mouseEvent(.leftMouseUp, at: clickInHost))
+
+        let pitch = GridAccessoryPolicy.linePitch(
+            scale: 2, minimapScale: harness.view.minimapScale,
+            minimapPitch: harness.view.minimapPitch)
+        let expectedClick = GridAccessoryPolicy.targetTopline(
+            clickedLine: CGFloat(display.lowerBound)
+                + interaction.height * 0.8 / pitch,
+            visibleLineCount: sizeRequest!.rows,
+            grabOffsetLines: CGFloat(sizeRequest!.rows) / 2,
+            totalLines: 2_000)
+        #expect(targets.first?.phase == .began)
+        #expect(targets.first?.targetTopline == expectedClick)
+        #expect(targets.last?.phase == .ended)
+
+        targets.removeAll()
+        let grabInSurface = NSPoint(
+            x: interaction.minX + 8,
+            y: interaction.minY + viewport.midY)
+        let grabInHost = host.convert(grabInSurface, from: harness.view)
+        guard let dragTarget = host.hitTest(grabInHost), dragTarget !== host else {
+            Issue.record("viewport marker drag was not routed to minimap")
+            return
+        }
+        dragTarget.mouseDown(with: host.mouseEvent(.leftMouseDown, at: grabInHost))
+        let belowGutter = NSPoint(
+            x: grabInHost.x, y: host.convert(
+                NSPoint(x: interaction.minX + 8, y: interaction.maxY + 100),
+                from: harness.view).y)
+        dragTarget.mouseDragged(with: host.mouseEvent(
+            .leftMouseDragged, at: belowGutter))
+        dragTarget.mouseUp(with: host.mouseEvent(.leftMouseUp, at: belowGutter))
+
+        #expect(targets.map(\.phase) == [.began, .changed, .ended])
+        #expect((targets.dropFirst().first?.targetTopline ?? 0)
+            > (targets.first?.targetTopline ?? 0),
+            "dragging beyond the gutter must continue toward the buffer end")
+        _ = window
+    }
+
+    @Test func topmostFloatBlocksTheUnderlyingGutterInteraction() {
+        let harness = AccessoryHarness()
+        var request: GridAccessorySizeRequest?
+        harness.view.onGridAccessorySizeRequest = { request = $0 }
+        harness.presentInitial()
+        harness.acknowledge(request!)
+        guard let interaction = harness.view.editorAccessoryDebugSnapshot(
+            gridID: 2)?.interactionFrame
+        else {
+            Issue.record("gutter missing")
+            return
+        }
+        let anchorCol = Double(Int(interaction.minX / harness.view.cellSize.width))
+        harness.view.present(accessoryFlush(harness.store, [
+            .gridResize(grid: 3, width: 8, height: 5),
+            .winFloatPos(
+                grid: 3, win: 30, anchor: "NW", anchorGrid: 1,
+                anchorRow: 2, anchorCol: anchorCol,
+                focusable: true, zIndex: 50),
+        ]))
+        guard let floatFrame = harness.view.rect(ofGrid: 3) else {
+            Issue.record("float frame missing")
+            return
+        }
+        let overlap = interaction.intersection(floatFrame)
+        #expect(!overlap.isNull && !overlap.isEmpty)
+        let coveredPoint = NSPoint(x: overlap.midX, y: overlap.midY)
+        #expect(harness.view.accessoryInteractionView(at: coveredPoint) == nil,
+                "a topmost float must own hits over the split gutter")
+
+        harness.view.present(accessoryFlush(harness.store, [.winHide(grid: 3)]))
+        #expect(harness.view.accessoryInteractionView(at: coveredPoint) != nil)
+    }
+
+    @Test func splitOwnershipAndAcknowledgementRemainIndependent() {
+        let view = GridSurfaceView(frame: .zero, font: accessoryFont)
+        let store = GridStore()
+        let outerCols = 100
+        let splitRows = 20
+        view.frame = CGRect(
+            x: 0, y: 0, width: CGFloat(outerCols) * view.cellSize.width,
+            height: CGFloat(splitRows * 2) * view.cellSize.height)
+        view.setMinimapTopologies([
+            MinimapBufferTopology(
+                windowHandle: 20, bufferHandle: 44, changedTick: 1,
+                totalLineCount: 2_000, highlightGeneration: 1),
+            MinimapBufferTopology(
+                windowHandle: 30, bufferHandle: 55, changedTick: 1,
+                totalLineCount: 3_000, highlightGeneration: 1),
+        ])
+        var requests: [GridAccessorySizeRequest] = []
+        view.onGridAccessorySizeRequest = { requests.append($0) }
+        view.present(accessoryFlush(store, [
+            .gridResize(grid: 1, width: outerCols, height: splitRows * 2),
+            .gridResize(grid: 2, width: outerCols, height: splitRows),
+            .winPos(
+                grid: 2, win: 20, startRow: 0, startCol: 0,
+                width: outerCols, height: splitRows),
+            .winViewport(
+                grid: 2, win: 20, topline: 0, botline: splitRows,
+                curline: 0, curcol: 0, lineCount: 2_000, scrollDelta: 0),
+            .gridResize(grid: 3, width: outerCols, height: splitRows),
+            .winPos(
+                grid: 3, win: 30, startRow: splitRows, startCol: 0,
+                width: outerCols, height: splitRows),
+            .winViewport(
+                grid: 3, win: 30, topline: 100, botline: 100 + splitRows,
+                curline: 100, curcol: 0, lineCount: 3_000, scrollDelta: 0),
+        ]))
+        let request2 = requests.first(where: { $0.gridID == 2 })!
+        let request3 = requests.first(where: { $0.gridID == 3 })!
+        view.present(accessoryFlush(store, [
+            .gridResize(grid: 2, width: request2.cols, height: request2.rows),
+        ]))
+        #expect(view.editorAccessoryDebugSnapshot(gridID: 2)?.ownership
+            == .owned(cols: request2.cols, rows: request2.rows))
+        #expect(view.editorAccessoryDebugSnapshot(gridID: 3)?.ownership
+            == .requesting(cols: request3.cols, rows: request3.rows))
+        #expect(view.editorAccessoryDebugSnapshot(gridID: 2)?.gutterFrame != nil)
+        #expect(view.editorAccessoryDebugSnapshot(gridID: 3)?.gutterFrame == nil)
+
+        view.present(accessoryFlush(store, [
+            .gridResize(grid: 3, width: request3.cols, height: request3.rows),
+        ]))
+        #expect(view.editorAccessoryDebugSnapshot(gridID: 2)?.gutterFrame != nil)
+        #expect(view.editorAccessoryDebugSnapshot(gridID: 3)?.gutterFrame != nil)
+
+        requests.removeAll()
+        view.showsMinimap = false
+        #expect(Set(requests.filter(\.releasesOwnership).map(\.gridID))
+            == Set([2, 3]))
+    }
+
     @Test func toplineZeroMarkerUsesTheVisualTopOfTheGutter() {
         let harness = AccessoryHarness()
         var request: GridAccessorySizeRequest?
@@ -280,6 +487,32 @@ private func dominantRedPixelCount(_ image: CGImage) -> Int {
         #expect(snapshot.scrollerIsVisible)
         #expect(abs(scroller.frame.width - 12) < 0.001)
         #expect(abs(scroller.frame.maxX - interaction.width) < 0.001)
+    }
+
+    @Test func nativeScrollerAutoHidesWhenTheViewportCoversTheBuffer() {
+        let harness = AccessoryHarness()
+        harness.view.showsNativeScrollbars = true
+        var request: GridAccessorySizeRequest?
+        harness.view.onGridAccessorySizeRequest = { request = $0 }
+        harness.presentInitial()
+        harness.acknowledge(request!)
+        harness.view.present(accessoryFlush(harness.store, [
+            .winViewport(
+                grid: 2, win: harness.windowHandle, topline: 0,
+                botline: request!.rows, curline: 0, curcol: 0,
+                lineCount: request!.rows, scrollDelta: 0),
+        ]))
+        #expect(harness.view.editorAccessoryDebugSnapshot(
+            gridID: 2)?.scrollerIsVisible == false)
+
+        harness.view.present(accessoryFlush(harness.store, [
+            .winViewport(
+                grid: 2, win: harness.windowHandle, topline: 0,
+                botline: request!.rows, curline: 0, curcol: 0,
+                lineCount: request!.rows + 1, scrollDelta: 0),
+        ]))
+        #expect(harness.view.editorAccessoryDebugSnapshot(
+            gridID: 2)?.scrollerIsVisible == true)
     }
 
     @Test func contentChunksAccumulateUntilVisibleCoverageOrCompletion() {
