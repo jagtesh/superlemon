@@ -8,12 +8,13 @@ The proof of concept:
 
 - launches and supervises `nvim --embed`;
 - keeps Neovim authoritative for the buffer, cursor, mode, mappings, and undo;
-- renders the current buffer, cursor, mode, and filename in a Shirei window;
+- attaches with `nvim_ui_attach` and renders Neovim's real line-grid screen,
+  including its command line, prompts, status text, and cursor;
 - forwards committed text, navigation keys, and Ctrl/Cmd letter chords; and
 - restarts Neovim with capped backoff if it exits unexpectedly.
 
-It intentionally does not yet implement line-grid rendering, highlighting,
-mouse input, multiple grids, native tabs, the file browser, or other Superlemon
+It intentionally does not yet implement highlighting, mouse input, multiple
+grids, native tabs, the file browser, or other Superlemon
 chrome. The purpose is to prove the shared process/input/UI loop on macOS,
 Windows, X11, and Wayland before investing in a complete port.
 

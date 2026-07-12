@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -29,7 +30,7 @@ func (s Snapshot) DisplayText() string {
 		return "Starting Neovim…"
 	}
 	lines := append([]string(nil), s.Lines...)
-	row := s.Row - 1
+	row := s.Row
 	if row >= 0 && row < len(lines) {
 		col := min(max(s.Col, 0), len(lines[row]))
 		lines[row] = lines[row][:col] + "▏" + lines[row][col:]
@@ -42,6 +43,40 @@ func (s Snapshot) DisplayText() string {
 		text += line
 	}
 	return text
+}
+
+type grid struct {
+	width, height int
+	rows          [][]string
+	cursorRow     int
+	cursorCol     int
+	title         string
+}
+
+func (g *grid) resize(width, height int) {
+	g.width, g.height = width, height
+	g.rows = make([][]string, height)
+	for row := range g.rows {
+		g.rows[row] = make([]string, width)
+		for col := range g.rows[row] {
+			g.rows[row][col] = " "
+		}
+	}
+}
+
+func (g *grid) clear() {
+	g.resize(g.width, g.height)
+}
+
+func (g *grid) snapshot() Snapshot {
+	lines := make([]string, len(g.rows))
+	for row, cells := range g.rows {
+		lines[row] = strings.TrimRight(strings.Join(cells, ""), " ")
+	}
+	return Snapshot{
+		Mode: "nvim", Row: g.cursorRow, Col: g.cursorCol,
+		Name: g.title, Lines: lines,
+	}
 }
 
 type Editor struct {
@@ -150,9 +185,12 @@ func (e *Editor) runSession() error {
 	go io.Copy(io.Discard, stderr)
 	go rpc.readLoop()
 
-	if err := e.refresh(rpc); err != nil {
+	if _, err := rpc.request("nvim_ui_attach", []any{
+		110, 36, map[string]any{"ext_linegrid": true, "rgb": true},
+	}); err != nil {
 		return err
 	}
+	screen := &grid{}
 	for {
 		select {
 		case <-e.stop:
@@ -161,6 +199,10 @@ func (e *Editor) runSession() error {
 			return nil
 		case err := <-rpc.failed:
 			return err
+		case notification := <-rpc.notifications:
+			if notification.method == "redraw" && applyRedraw(screen, notification.params) {
+				e.store(screen.snapshot())
+			}
 		case input := <-e.inputs:
 			if input == "" {
 				continue
@@ -168,51 +210,99 @@ func (e *Editor) runSession() error {
 			if _, err := rpc.request("nvim_input", []any{input}); err != nil {
 				return err
 			}
-			if err := e.refresh(rpc); err != nil {
-				return err
-			}
 		}
 	}
 }
 
-func (e *Editor) refresh(rpc *rpcClient) error {
-	const script = `
-local b = vim.api.nvim_get_current_buf()
-local c = vim.api.nvim_win_get_cursor(0)
-return {
-  vim.api.nvim_get_mode().mode,
-  c[1], c[2],
-  vim.api.nvim_buf_get_name(b),
-  vim.api.nvim_buf_get_lines(b, 0, -1, false),
-}`
-	value, err := rpc.request("nvim_exec_lua", []any{script, []any{}})
-	if err != nil {
-		return err
+func applyRedraw(screen *grid, params []any) bool {
+	changed := false
+	for _, rawEvent := range params {
+		event, ok := rawEvent.([]any)
+		if !ok || len(event) == 0 {
+			continue
+		}
+		name := stringValue(event[0])
+		// Zero-argument redraw events are encoded as only their event name.
+		if name == "flush" && len(event) == 1 {
+			changed = true
+			continue
+		}
+		for _, rawInvocation := range event[1:] {
+			invocation, _ := rawInvocation.([]any)
+			switch name {
+			case "grid_resize":
+				if len(invocation) >= 3 && intValue(invocation[0]) == 1 {
+					screen.resize(intValue(invocation[1]), intValue(invocation[2]))
+					changed = true
+				}
+			case "grid_clear":
+				if len(invocation) >= 1 && intValue(invocation[0]) == 1 {
+					screen.clear()
+					changed = true
+				}
+			case "grid_cursor_goto":
+				if len(invocation) >= 3 && intValue(invocation[0]) == 1 {
+					screen.cursorRow = intValue(invocation[1])
+					screen.cursorCol = intValue(invocation[2])
+					changed = true
+				}
+			case "grid_line":
+				applyGridLine(screen, invocation)
+				changed = true
+			case "set_title":
+				if len(invocation) >= 1 {
+					screen.title = stringValue(invocation[0])
+					changed = true
+				}
+			case "flush":
+				changed = true
+			}
+		}
 	}
-	parts, ok := value.([]any)
-	if !ok || len(parts) != 5 {
-		return fmt.Errorf("unexpected snapshot: %T", value)
+	return changed
+}
+
+func applyGridLine(screen *grid, invocation []any) {
+	if len(invocation) < 4 || intValue(invocation[0]) != 1 {
+		return
 	}
-	linesRaw, _ := parts[4].([]any)
-	lines := make([]string, 0, len(linesRaw))
-	for _, line := range linesRaw {
-		lines = append(lines, stringValue(line))
+	row, col := intValue(invocation[1]), intValue(invocation[2])
+	if row < 0 || row >= len(screen.rows) {
+		return
 	}
-	e.store(Snapshot{
-		Mode: stringValue(parts[0]), Row: intValue(parts[1]), Col: intValue(parts[2]),
-		Name: stringValue(parts[3]), Lines: lines,
-	})
-	return nil
+	cells, _ := invocation[3].([]any)
+	for _, rawCell := range cells {
+		cell, _ := rawCell.([]any)
+		if len(cell) == 0 {
+			continue
+		}
+		text, repeat := stringValue(cell[0]), 1
+		if len(cell) >= 3 {
+			repeat = max(1, intValue(cell[2]))
+		}
+		for range repeat {
+			if col >= 0 && col < len(screen.rows[row]) {
+				screen.rows[row][col] = text
+			}
+			col++
+		}
+	}
 }
 
 type rpcClient struct {
-	encoder *msgpack.Encoder
-	decoder *msgpack.Decoder
-	writes  sync.Mutex
-	mu      sync.Mutex
-	nextID  uint64
-	pending map[uint64]chan rpcResponse
-	failed  chan error
+	encoder       *msgpack.Encoder
+	decoder       *msgpack.Decoder
+	writes        sync.Mutex
+	mu            sync.Mutex
+	nextID        uint64
+	pending       map[uint64]chan rpcResponse
+	failed        chan error
+	notifications chan rpcNotification
+}
+
+type rpcNotification struct {
+	method string
+	params []any
 }
 
 type rpcResponse struct {
@@ -224,6 +314,7 @@ func newRPC(stdin io.Writer, stdout io.Reader) *rpcClient {
 	return &rpcClient{
 		encoder: msgpack.NewEncoder(stdin), decoder: msgpack.NewDecoder(bufio.NewReader(stdout)),
 		pending: make(map[uint64]chan rpcResponse), failed: make(chan error, 1),
+		notifications: make(chan rpcNotification, 256),
 	}
 }
 
@@ -251,6 +342,11 @@ func (r *rpcClient) readLoop() {
 		if err := r.decoder.Decode(&message); err != nil {
 			r.fail(err)
 			return
+		}
+		if len(message) == 3 && intValue(message[0]) == 2 {
+			params, _ := message[2].([]any)
+			r.notifications <- rpcNotification{method: stringValue(message[1]), params: params}
+			continue
 		}
 		if len(message) != 4 || intValue(message[0]) != 1 {
 			continue
