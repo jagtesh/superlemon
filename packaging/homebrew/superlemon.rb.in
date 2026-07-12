@@ -5,8 +5,8 @@ class Superlemon < Formula
   sha256 "@SOURCE_SHA256@"
   license "BSD-3-Clause"
 
-  depends_on macos: :sonoma
   depends_on xcode: ["16.0", :build]
+  depends_on macos: :sonoma
 
   resource "neovim" do
     on_arm do
