@@ -325,14 +325,17 @@ public final class GridSurfaceView: NSView {
 
     package func setMinimapTopologies(_ topologies: [MinimapBufferTopology]) {
         accessoryCoordinator.setTopologies(topologies)
+        refreshEditorAccessories()
     }
 
     package func updateMinimapTopology(_ topology: MinimapBufferTopology) {
         accessoryCoordinator.updateTopology(topology)
+        refreshEditorAccessories()
     }
 
     package func removeMinimapTopology(windowHandle: Int) {
         accessoryCoordinator.removeTopology(windowHandle: windowHandle)
+        refreshEditorAccessories()
     }
 
     package func provideMinimapContent(_ chunk: MinimapContentChunk) {
@@ -607,7 +610,7 @@ public final class GridSurfaceView: NSView {
         cursorCorrection.settle()
         cursorCorrectionActive = false
         updateCursorPresentation()
-        updateEditorAccessoryMotion()
+        settleEditorAccessoryMotion()
         pauseDisplayLink()
     }
 
@@ -623,7 +626,8 @@ public final class GridSurfaceView: NSView {
         link.add(to: .main, forMode: .common)
         animationDisplayLink = link
         if smoothViewports.values.contains(where: \.isActive)
-            || cursorCorrectionActive || scheduledDisplayPresentation != nil
+            || cursorCorrectionActive || accessoryCoordinator.hasActiveMotion
+            || scheduledDisplayPresentation != nil
         {
             resumeDisplayLink()
         }
@@ -735,7 +739,7 @@ public final class GridSurfaceView: NSView {
                 active = true
             }
         }
-        updateEditorAccessoryMotion()
+        active = advanceEditorAccessoryMotion(by: boundedElapsed) || active
         updateCursorPresentation()
         return active
             || smoothViewports.values.contains(where: \.isActive)
@@ -749,7 +753,8 @@ public final class GridSurfaceView: NSView {
 
     private var hasActiveAnimationWork: Bool {
         smoothViewports.values.contains(where: \.isActive)
-            || cursorCorrectionActive || scheduledDisplayPresentation != nil
+            || cursorCorrectionActive || accessoryCoordinator.hasActiveMotion
+            || scheduledDisplayPresentation != nil
     }
 
     /// Deterministic test hook that avoids annotating hot-path CALayers with
@@ -938,15 +943,28 @@ public final class GridSurfaceView: NSView {
             showsScrollbars: showsNativeScrollbars,
             minimapWidth: minimapWidth, minimapScale: minimapScale,
             minimapPitch: minimapPitch,
-            minimapMinEditorColumns: minimapMinEditorColumns)
+            minimapMinEditorColumns: minimapMinEditorColumns,
+            animatedGridIDs: Set(smoothViewports.compactMap {
+                $0.value.isActive ? $0.key : nil
+            }))
     }
 
-    private func updateEditorAccessoryMotion() {
-        accessoryCoordinator.updateResiduals(
-            smoothViewports.reduce(into: [Int: CGFloat]()) {
-                $0[$1.key] = cellSize.height > 0
-                    ? $1.value.snappedTranslationY / cellSize.height : 0
-            })
+    private func advanceEditorAccessoryMotion(
+        by elapsed: CFTimeInterval
+    ) -> Bool {
+        accessoryCoordinator.advanceMotion(
+            by: elapsed, residuals: editorAccessoryResiduals)
+    }
+
+    private func settleEditorAccessoryMotion() {
+        accessoryCoordinator.settleMotion(editorAccessoryResiduals)
+    }
+
+    private var editorAccessoryResiduals: [Int: CGFloat] {
+        smoothViewports.reduce(into: [Int: CGFloat]()) {
+            $0[$1.key] = cellSize.height > 0
+                ? $1.value.snappedTranslationY / cellSize.height : 0
+        }
     }
 
     /// Layer for a grid, created on demand. A grid that never appeared in

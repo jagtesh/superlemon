@@ -290,7 +290,7 @@ private struct FilmstripSlot {
 final class SmoothViewportState {
     /// At this width, three 60 ms row steps already overlap; denser wheel and
     /// key-repeat streams converge on a nearly flat, continuous velocity.
-    private static let motionEnvelopeDuration: CFTimeInterval = 0.180
+    static let motionEnvelopeDuration: CFTimeInterval = 0.180
 
     let gridID: Int
 

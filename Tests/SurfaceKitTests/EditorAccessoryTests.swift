@@ -110,7 +110,7 @@ private struct AccessoryHarness {
 
 @MainActor
 @Suite struct GridAccessoryLifecycleTests {
-    @Test func noTopologyNeverRequestsOrExposesABlankGutter() {
+    @Test func topologyPublishedAfterInitialFlushRequestsSizeImmediately() {
         let harness = AccessoryHarness()
         harness.view.removeMinimapTopology(windowHandle: harness.windowHandle)
         var requests: [GridAccessorySizeRequest] = []
@@ -119,6 +119,17 @@ private struct AccessoryHarness {
         #expect(requests.isEmpty)
         #expect(harness.view.editorAccessoryDebugSnapshot(
             gridID: 2)?.gutterFrame == nil)
+
+        harness.view.updateMinimapTopology(MinimapBufferTopology(
+            windowHandle: harness.windowHandle, bufferHandle: 44,
+            changedTick: 2, totalLineCount: 2_000,
+            highlightGeneration: 2))
+        #expect(requests.count == 1,
+                "publishing topology must re-evaluate the last flush")
+        #expect(requests[0].releasesOwnership == false)
+        #expect(harness.view.editorAccessoryDebugSnapshot(
+            gridID: 2)?.gutterFrame == nil,
+            "the gutter still waits for grid_resize acknowledgement")
     }
 
     @Test func publicGeometryConfigurationDrivesTheResizeContract() {
@@ -275,12 +286,29 @@ private struct AccessoryHarness {
         #expect(snapshot.pendingRange == request.lineRange,
                 "coverage may publish, but only complete terminates the request")
 
+        let tailStart = display.upperBound
+        let tailEnd = min(request.lineRange.upperBound, tailStart + 16)
+        let tailLines = (tailStart..<tailEnd).map {
+            MinimapLine(text: "tail \($0)")
+        }
+        harness.view.provideMinimapContent(MinimapContentChunk(
+            requestID: request.requestID, gridID: 2,
+            topology: request.topology, firstLine: tailStart,
+            lastLine: tailEnd, complete: false, lines: tailLines))
+        snapshot = harness.view.editorAccessoryDebugSnapshot(gridID: 2)!
+        #expect(snapshot.acceptedRange == display,
+                "tail chunks must not republish and restart CoreText work")
+        #expect(snapshot.accumulatedLineCount
+            == firstLines.count + secondLines.count + tailLines.count)
+
         harness.view.provideMinimapContent(MinimapContentChunk(
             requestID: request.requestID, gridID: 2,
             topology: request.topology, firstLine: request.lineRange.upperBound,
             lastLine: request.lineRange.upperBound, complete: true, lines: []))
         snapshot = harness.view.editorAccessoryDebugSnapshot(gridID: 2)!
         #expect(snapshot.pendingRange == nil)
+        #expect(snapshot.acceptedRange == request.lineRange,
+                "the final chunk publishes the complete prefetched window once")
     }
 
     @Test func minimapMarkersUseTheSameSnappedScrollResidual() {
@@ -310,6 +338,91 @@ private struct AccessoryHarness {
         let advanced = harness.view.editorAccessoryDebugSnapshot(gridID: 2)!
         #expect(advanced.viewportFrame?.minY != retargeted.viewportFrame?.minY)
         #expect(advanced.cursorFrame?.minY != retargeted.cursorFrame?.minY)
+    }
+
+    @Test func railEdgeShiftUsesAContinuousExactContentResidual() {
+        let harness = AccessoryHarness()
+        harness.view.minimapPitch = 6
+        var sizeRequest: GridAccessorySizeRequest?
+        var contentRequest: MinimapContentRangeRequest?
+        harness.view.onGridAccessorySizeRequest = { sizeRequest = $0 }
+        harness.view.onMinimapContentRangeRequest = { contentRequest = $0 }
+        harness.presentInitial()
+        harness.acknowledge(sizeRequest!)
+
+        guard let request = contentRequest else {
+            Issue.record("content request missing")
+            return
+        }
+        harness.view.provideMinimapContent(MinimapContentChunk(
+            requestID: request.requestID, gridID: 2,
+            topology: request.topology,
+            firstLine: request.lineRange.lowerBound,
+            lastLine: request.lineRange.upperBound, complete: true,
+            lines: request.lineRange.map { MinimapLine(text: "line \($0)") }))
+
+        guard let initialDisplay = harness.view.editorAccessoryDebugSnapshot(
+            gridID: 2)?.displayRange
+        else {
+            Issue.record("display range missing")
+            return
+        }
+        let rows = sizeRequest!.rows
+        let edgeTop = initialDisplay.upperBound - rows
+        harness.view.present(accessoryFlush(harness.store, [
+            .winViewport(
+                grid: 2, win: harness.windowHandle, topline: edgeTop,
+                botline: initialDisplay.upperBound, curline: edgeTop + 4,
+                curcol: 2, lineCount: 2_000, scrollDelta: 0),
+        ]))
+        guard let before = harness.view.editorAccessoryDebugSnapshot(gridID: 2),
+            let beforeContentY = before.contentFrame?.minY,
+            let beforeViewportY = before.viewportFrame?.minY
+        else {
+            Issue.record("settled minimap geometry missing")
+            return
+        }
+
+        harness.view.present(accessoryFlush(harness.store, [
+            .gridScroll(
+                grid: 2, top: 0, bottom: rows, left: 0,
+                right: sizeRequest!.cols, rows: 1, cols: 0),
+            .winViewport(
+                grid: 2, win: harness.windowHandle, topline: edgeTop + 1,
+                botline: initialDisplay.upperBound + 1,
+                curline: edgeTop + 5, curcol: 2,
+                lineCount: 2_000, scrollDelta: 1),
+        ]))
+        var snapshot = harness.view.editorAccessoryDebugSnapshot(gridID: 2)!
+        #expect(snapshot.displayRange?.lowerBound
+            == initialDisplay.lowerBound + 1)
+        #expect(abs(snapshot.displayRangeResidual + 1) < 0.001)
+        #expect(abs((snapshot.contentFrame?.minY ?? .infinity)
+            - beforeContentY) <= 0.001,
+            "the logical range rotation must not move pixels at insertion")
+        #expect(abs((snapshot.viewportFrame?.minY ?? .infinity)
+            - beforeViewportY) <= 0.5)
+
+        var previousContentY = beforeContentY
+        for _ in 0..<60 where !harness.view.animationsAreIdle {
+            _ = harness.view.advanceAnimations(
+                by: 1.0 / 120.0,
+                nominalDisplayPeriod: 1.0 / 120.0)
+            snapshot = harness.view.editorAccessoryDebugSnapshot(gridID: 2)!
+            let contentY = snapshot.contentFrame!.minY
+            #expect(contentY <= previousContentY + 0.001,
+                    "edge content must settle monotonically without sawteeth")
+            #expect(abs(snapshot.viewportFrame!.minY - beforeViewportY) <= 0.5,
+                    "the viewport marker stays pinned while its rail tracks")
+            previousContentY = contentY
+        }
+
+        let pitch = GridAccessoryPolicy.linePitch(
+            scale: 2, minimapScale: harness.view.minimapScale,
+            minimapPitch: harness.view.minimapPitch)
+        #expect(harness.view.animationsAreIdle)
+        #expect(abs(previousContentY - (beforeContentY - pitch)) <= 0.001)
+        #expect(abs(snapshot.displayRangeResidual) <= 0.001)
     }
 }
 

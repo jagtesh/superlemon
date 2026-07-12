@@ -227,6 +227,8 @@ package struct GridAccessoryDebugSnapshot {
     package var minimapImage: CGImage?
     package var acceptedRange: Range<Int>?
     package var accumulatedLineCount: Int
+    package var contentFrame: CGRect?
+    package var displayRangeResidual: CGFloat
     package var viewportFrame: CGRect?
     package var cursorFrame: CGRect?
     package var scrollerIsVisible: Bool
@@ -627,10 +629,12 @@ private final class GridEditorAccessoryState {
     var dispatchedContentRequestID: UInt64?
     var accumulatedRequestID: UInt64?
     var accumulatedLines: [Int: MinimapLine] = [:]
+    var publishedVisibleCoverageForRequest = false
     var acceptedChunk: MinimapAcceptedChunk?
     var displayRange: Range<Int>?
     var latestViewport: Viewport?
     var latestResidual: CGFloat = 0
+    var displayRangeMotion = ContinuousScrollEnvelope()
     var minimapGrabOffsetLines: CGFloat?
     var gutterFrameInGrid: CGRect?
     var interactionFrameInSurface: CGRect?
@@ -713,9 +717,12 @@ private final class GridEditorAccessoryState {
         dispatchedContentRequestID = nil
         accumulatedRequestID = nil
         accumulatedLines.removeAll()
+        publishedVisibleCoverageForRequest = false
+        displayRangeMotion.settle()
     }
 
     func hidePresentation() {
+        displayRangeMotion.settle()
         minimapLayer.isHidden = true
         interactionView.isHidden = true
         gutterFrameInGrid = nil
@@ -798,6 +805,7 @@ private final class GridEditorAccessoryState {
         dispatchedContentRequestID = nil
         accumulatedRequestID = nil
         accumulatedLines.removeAll()
+        publishedVisibleCoverageForRequest = false
         acceptedChunk = nil
         displayRange = nil
         contentLayer.contents = nil
@@ -826,8 +834,16 @@ private final class GridEditorAccessoryState {
             else { continue }
             accumulatedLines[lineNumber] = line
         }
-        let published = publishAccumulatedContentIfReady(
-            allowIncompleteCoverage: chunk.complete)
+        let published: Bool
+        if chunk.complete {
+            published = publishAccumulatedContentIfReady(
+                allowIncompleteCoverage: true)
+        } else if !publishedVisibleCoverageForRequest {
+            published = publishAccumulatedContentIfReady()
+            publishedVisibleCoverageForRequest = published
+        } else {
+            published = false
+        }
         if chunk.complete {
             self.pendingContentRequest = nil
             dispatchedContentRequestID = nil
@@ -842,6 +858,7 @@ private final class GridEditorAccessoryState {
         dispatchedContentRequestID = nil
         accumulatedRequestID = request.requestID
         accumulatedLines.removeAll(keepingCapacity: true)
+        publishedVisibleCoverageForRequest = false
     }
 
     /// Chunks are accumulated until the currently visible range is complete,
@@ -863,6 +880,14 @@ private final class GridEditorAccessoryState {
         } ?? request.lineRange.upperBound
         guard visibleLower < visibleUpper else { return false }
         let visible = visibleLower..<visibleUpper
+        if !allowIncompleteCoverage,
+            let acceptedChunk,
+            acceptedChunk.payload.requestID == request.requestID,
+            acceptedChunk.payload.lineRange.lowerBound <= visible.lowerBound,
+            acceptedChunk.payload.lineRange.upperBound >= visible.upperBound
+        {
+            return false
+        }
         let covered = visible.allSatisfy { accumulatedLines[$0] != nil }
         guard covered || allowIncompleteCoverage else { return false }
         var lower = allowIncompleteCoverage
@@ -918,6 +943,7 @@ private final class GridEditorAccessoryState {
         acceptedChunk.foregroundRGB = foregroundRGB
         acceptedChunk.fontName = fontName
         self.acceptedChunk = acceptedChunk
+        positionContentLayer()
 
         renderTask?.cancel()
         renderSerial &+= 1
@@ -948,18 +974,48 @@ private final class GridEditorAccessoryState {
         positionContentLayer()
     }
 
+    var hasDisplayRangeMotion: Bool { displayRangeMotion.isActive }
+
+    func retargetDisplayRange(by rows: Int, animate: Bool) {
+        guard rows != 0 else { return }
+        guard animate, abs(rows) <= 4 else {
+            displayRangeMotion.settle()
+            return
+        }
+        displayRangeMotion.add(
+            positionOffset: -CGFloat(rows),
+            duration: SmoothViewportState.motionEnvelopeDuration)
+    }
+
+    @discardableResult
+    func advanceDisplayRangeMotion(by elapsed: CFTimeInterval) -> Bool {
+        guard displayRangeMotion.isActive else { return false }
+        displayRangeMotion.advance(by: elapsed)
+        updateMotionLayers()
+        return displayRangeMotion.isActive
+    }
+
+    func settleDisplayRangeMotion() {
+        displayRangeMotion.settle()
+        updateMotionLayers()
+    }
+
     func positionContentLayer() {
         guard let acceptedChunk, let displayRange else { return }
         let pitch = GridAccessoryPolicy.linePitch(
             scale: scale, minimapScale: minimapScale,
             minimapPitch: minimapPitch)
-        let y = -CGFloat(displayRange.lowerBound - acceptedChunk.payload.startLine) * pitch
+        let settledY = -CGFloat(
+            displayRange.lowerBound - acceptedChunk.payload.startLine) * pitch
+        let y = snapToPhysicalPixel(
+            settledY - displayRangeMotion.position * pitch)
         contentLayer.frame = CGRect(
             x: 0, y: y, width: mapWidth,
             height: CGFloat(max(1, acceptedChunk.payload.lines.count)) * pitch)
     }
 
     func updateMotionLayers() {
+        positionContentLayer()
         guard !minimapLayer.isHidden, let displayRange, let viewport = latestViewport else {
             viewportLayer.isHidden = true
             cursorLayer.isHidden = true
@@ -968,8 +1024,10 @@ private final class GridEditorAccessoryState {
         let pitch = GridAccessoryPolicy.linePitch(
             scale: scale, minimapScale: minimapScale,
             minimapPitch: minimapPitch)
+        let visualDisplayStart = CGFloat(displayRange.lowerBound)
+            + snappedDisplayRangeResidual(pitch: pitch)
         let visualTop = CGFloat(viewport.topline) + latestResidual
-        let y = (visualTop - CGFloat(displayRange.lowerBound)) * pitch
+        let y = snapToPhysicalPixel((visualTop - visualDisplayStart) * pitch)
         let visibleLines = max(1, min(viewport.lineCount, viewport.botline)
             - min(viewport.lineCount, viewport.topline))
         viewportLayer.frame = CGRect(
@@ -977,11 +1035,21 @@ private final class GridEditorAccessoryState {
             height: max(2 / scale, CGFloat(visibleLines) * pitch))
         viewportLayer.isHidden = false
 
-        let cursorY = (CGFloat(viewport.curline) + latestResidual
-            - CGFloat(displayRange.lowerBound)) * pitch
+        let cursorY = snapToPhysicalPixel(
+            (CGFloat(viewport.curline) + latestResidual
+                - visualDisplayStart) * pitch)
         cursorLayer.frame = CGRect(
             x: 0, y: cursorY, width: mapWidth, height: 1 / scale)
         cursorLayer.isHidden = cursorY < 0 || cursorY > minimapLayer.bounds.height
+    }
+
+    private func snappedDisplayRangeResidual(pitch: CGFloat) -> CGFloat {
+        guard pitch > 0 else { return 0 }
+        return snapToPhysicalPixel(displayRangeMotion.position * pitch) / pitch
+    }
+
+    private func snapToPhysicalPixel(_ value: CGFloat) -> CGFloat {
+        (value * scale).rounded() / max(1, scale)
     }
 
     func updateScroller() {
@@ -1143,7 +1211,8 @@ final class GridAccessoryCoordinator {
         editorFontSize: CGFloat,
         showsMinimap: Bool, showsScrollbars: Bool,
         minimapWidth: CGFloat, minimapScale: CGFloat,
-        minimapPitch: CGFloat, minimapMinEditorColumns: Int
+        minimapPitch: CGFloat, minimapMinEditorColumns: Int,
+        animatedGridIDs: Set<Int>
     ) {
         guard let hostView else { return }
         lastFrames = frames
@@ -1290,7 +1359,9 @@ final class GridAccessoryCoordinator {
                 scale: scale, fontName: fontName,
                 minimapScale: minimapScale, minimapPitch: minimapPitch,
                 editorFontSize: editorFontSize)
-            refreshContent(for: state)
+            refreshContent(
+                for: state,
+                animateRangeShift: animatedGridIDs.contains(frame.gridID))
         }
 
         // Hidden grids keep Neovim storage but not native interaction views.
@@ -1309,16 +1380,31 @@ final class GridAccessoryCoordinator {
         }
     }
 
-    func updateResiduals(_ residuals: [Int: CGFloat]) {
+    @discardableResult
+    func advanceMotion(
+        by elapsed: CFTimeInterval, residuals: [Int: CGFloat]
+    ) -> Bool {
+        var active = false
         for (gridID, state) in states {
             state.latestResidual = residuals[gridID] ?? 0
-            state.updateMotionLayers()
+            if state.hasDisplayRangeMotion {
+                active = state.advanceDisplayRangeMotion(by: elapsed) || active
+            } else {
+                state.updateMotionLayers()
+            }
+        }
+        return active
+    }
+
+    func settleMotion(_ residuals: [Int: CGFloat]) {
+        for (gridID, state) in states {
+            state.latestResidual = residuals[gridID] ?? 0
+            state.settleDisplayRangeMotion()
         }
     }
 
-    func retryAllRequests() {
-        retrySizeRequests()
-        retryContentRequests()
+    var hasActiveMotion: Bool {
+        states.values.contains(where: \.hasDisplayRangeMotion)
     }
 
     func interactionView(at point: NSPoint) -> NSView? {
@@ -1328,15 +1414,6 @@ final class GridAccessoryCoordinator {
         else { return nil }
         let pointInInteraction = state.interactionView.convert(point, from: hostView)
         return state.interactionView.hitTest(pointInInteraction)
-    }
-
-    func containsAcknowledgedGutter(gridID: Int, point: NSPoint) -> Bool {
-        guard let state = states[gridID],
-            case .owned = state.ownership,
-            let frame = state.interactionFrameInSurface,
-            state.gutterFrameInGrid != nil
-        else { return false }
-        return frame.contains(point)
     }
 
     func debugSnapshot(gridID: Int) -> GridAccessoryDebugSnapshot? {
@@ -1351,6 +1428,8 @@ final class GridAccessoryCoordinator {
             minimapImage: state.renderedImage,
             acceptedRange: state.acceptedChunk?.payload.lineRange,
             accumulatedLineCount: state.accumulatedLines.count,
+            contentFrame: state.acceptedChunk == nil ? nil : state.contentLayer.frame,
+            displayRangeResidual: state.displayRangeMotion.position,
             viewportFrame: state.viewportLayer.isHidden ? nil : state.viewportLayer.frame,
             cursorFrame: state.cursorLayer.isHidden ? nil : state.cursorLayer.frame,
             scrollerIsVisible: !state.interactionView.scroller.isHidden,
@@ -1362,7 +1441,10 @@ final class GridAccessoryCoordinator {
         states[gridID]?.interactionView.scroller
     }
 
-    private func refreshContent(for state: GridEditorAccessoryState) {
+    private func refreshContent(
+        for state: GridEditorAccessoryState,
+        animateRangeShift: Bool = false
+    ) {
         guard !state.minimapLayer.isHidden, state.minimapLayer.bounds.height > 0,
             let viewport = state.latestViewport
         else { return }
@@ -1376,6 +1458,7 @@ final class GridAccessoryCoordinator {
         // represented. Once it reaches an edge, shift only by the minimum
         // lines needed to retain it; never re-center by half a rail.
         let display: Range<Int>
+        var trackedShift = 0
         if let existing = state.displayRange,
             existing.count == centeredDisplay.count,
             existing.lowerBound >= 0, existing.upperBound <= total
@@ -1388,9 +1471,13 @@ final class GridAccessoryCoordinator {
             }
             lower = max(0, min(lower, total - existing.count))
             display = lower..<(lower + existing.count)
+            trackedShift = lower - existing.lowerBound
         } else {
             display = centeredDisplay
+            state.settleDisplayRangeMotion()
         }
+        state.retargetDisplayRange(
+            by: trackedShift, animate: animateRangeShift)
         state.displayRange = display
         state.positionContentLayer()
         state.updateMotionLayers()
