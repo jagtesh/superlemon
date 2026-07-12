@@ -286,20 +286,49 @@ package enum GridAccessoryPolicy {
         return max(1, (points * backingScale).rounded()) / backingScale
     }
 
+    package static func railCapacity(
+        railHeight: CGFloat, scale: CGFloat,
+        minimapScale: CGFloat = defaultMinimapScale,
+        minimapPitch: CGFloat = defaultMinimapPitch
+    ) -> Int {
+        min(maximumChunkLines, max(1, Int(floor(
+            railHeight / linePitch(
+                scale: scale, minimapScale: minimapScale,
+                minimapPitch: minimapPitch)))))
+    }
+
+    /// Fractional first document line at the visual top of the rail. The
+    /// window's progress through the document mirrors the viewport's, so the
+    /// indicator sweeps the full rail and reaches the rail ends exactly at
+    /// the document ends — the map a scrollbar can invert.
+    package static func windowOrigin(
+        totalLines: Int, capacity: Int,
+        visualTopline: CGFloat, visibleLineCount: Int
+    ) -> CGFloat {
+        let count = max(1, capacity)
+        guard totalLines > count else { return 0 }
+        let visible = max(1, visibleLineCount)
+        let maximumTopline = CGFloat(max(1, totalLines - visible))
+        let ratio = max(0, min(1, visualTopline / maximumTopline))
+        return ratio * CGFloat(totalLines - count)
+    }
+
     package static func displayRange(
-        totalLines: Int, viewportTopline: Int,
+        totalLines: Int, viewportTopline: Int, visibleLineCount: Int,
         railHeight: CGFloat, scale: CGFloat,
         minimapScale: CGFloat = defaultMinimapScale,
         minimapPitch: CGFloat = defaultMinimapPitch
     ) -> Range<Int> {
         guard totalLines > 0 else { return 0..<0 }
-        let capacity = min(maximumChunkLines, max(1, Int(floor(
-            railHeight / linePitch(
-                scale: scale, minimapScale: minimapScale,
-                minimapPitch: minimapPitch)))))
+        let capacity = railCapacity(
+            railHeight: railHeight, scale: scale,
+            minimapScale: minimapScale, minimapPitch: minimapPitch)
         let count = min(totalLines, capacity)
-        let centered = viewportTopline - count / 2
-        let start = max(0, min(centered, totalLines - count))
+        let origin = Int(windowOrigin(
+            totalLines: totalLines, capacity: capacity,
+            visualTopline: CGFloat(viewportTopline),
+            visibleLineCount: visibleLineCount).rounded(.down))
+        let start = max(0, min(origin, totalLines - count))
         return start..<(start + count)
     }
 
@@ -315,14 +344,38 @@ package enum GridAccessoryPolicy {
         return start..<(start + count)
     }
 
+    /// The minimap's catch-up clock. The grid's motion envelope is clamped
+    /// to one screenful of filmstrip history and settles entirely on far
+    /// jumps — hard constraints of row reuse that do not apply to the
+    /// proportional window, which is pure geometry. Tracking the
+    /// authoritative topline with a critically damped spring instead stays
+    /// velocity-continuous across any jump size or cadence, so sustained far
+    /// scrolling cannot strobe, while short scrolls keep the same time scale
+    /// as the grid's envelope.
+    package static let minimapCatchUpSmoothing: CFTimeInterval = 0.18
+
+    /// Catch-up sweeps beyond this many lines jump-cut instead: past two
+    /// railfuls a sweep reads as noise and outruns content coverage.
+    package static func maximumTrackedCatchUpLines(capacity: Int) -> Int {
+        max(96, capacity * 2)
+    }
+
+    /// Inverts the proportional window map in rail space: one rail-length
+    /// drag traverses the whole document, exactly like a scrollbar. `railY`
+    /// is the pointer offset from the rail top in points; the grab offset is
+    /// the grabbed position inside the indicator, in rail lines.
     package static func targetTopline(
-        clickedLine: CGFloat, visibleLineCount: Int,
-        grabOffsetLines: CGFloat, totalLines: Int
+        railY: CGFloat, pitch: CGFloat, grabOffsetLines: CGFloat,
+        totalLines: Int, visibleLineCount: Int, capacity: Int
     ) -> Int {
         let visible = max(1, visibleLineCount)
         let maximum = max(0, totalLines - visible)
-        return max(0, min(
-            maximum, Int(floor(clickedLine - grabOffsetLines))))
+        guard maximum > 0, pitch > 0 else { return 0 }
+        let trackLines = CGFloat(max(
+            1, min(totalLines, max(1, capacity)) - visible))
+        let ratio = (railY / pitch - grabOffsetLines) / trackLines
+        let clamped = max(0, min(1, ratio))
+        return max(0, min(maximum, Int((clamped * CGFloat(maximum)).rounded())))
     }
 
     package static func scrollerPresentationValue(
@@ -648,9 +701,10 @@ private final class GridEditorAccessoryState {
     var acceptedChunk: MinimapAcceptedChunk?
     var displayRange: Range<Int>?
     var latestViewport: Viewport?
-    var latestResidual: CGFloat = 0
-    var displayRangeMotion = ContinuousScrollEnvelope()
     var minimapGrabOffsetLines: CGFloat?
+    private var presentedSpring = CriticalDampedSpring(
+        animationLength: GridAccessoryPolicy.minimapCatchUpSmoothing)
+    private var presentedTarget: CGFloat?
     var gutterFrameInGrid: CGRect?
     var interactionFrameInSurface: CGRect?
     var mapWidth: CGFloat = 0
@@ -738,11 +792,9 @@ private final class GridEditorAccessoryState {
         accumulatedRequestID = nil
         accumulatedLines.removeAll()
         publishedVisibleCoverageForRequest = false
-        displayRangeMotion.settle()
     }
 
     func hidePresentation() {
-        displayRangeMotion.settle()
         minimapLayer.isHidden = true
         interactionView.isHidden = true
         gutterFrameInGrid = nil
@@ -1001,30 +1053,78 @@ private final class GridEditorAccessoryState {
         positionContentLayer()
     }
 
-    var hasDisplayRangeMotion: Bool { displayRangeMotion.isActive }
+    /// The smoothed topline the minimap presents. The window, the viewport
+    /// indicator, and the cursor marker all derive from this one clock.
+    var presentedTopline: CGFloat? {
+        presentedTarget.map { $0 + presentedSpring.position }
+    }
 
-    func retargetDisplayRange(by rows: Int, animate: Bool) {
-        guard rows != 0 else { return }
-        guard animate, abs(rows) <= 4 else {
-            displayRangeMotion.settle()
+    var hasPresentedMotion: Bool {
+        presentedTarget != nil && !presentedSpring.isSettled
+    }
+
+    /// Repoints the catch-up spring at the latest authoritative topline while
+    /// keeping the presented position (and its velocity) continuous. Beyond
+    /// the tracked catch-up limit the window jump-cuts instead of sweeping.
+    func retargetPresentedTopline() {
+        guard let viewport = latestViewport else {
+            presentedTarget = nil
+            presentedSpring.settle()
             return
         }
-        displayRangeMotion.add(
-            positionOffset: -CGFloat(rows),
-            duration: SmoothViewportState.motionEnvelopeDuration)
+        let target = CGFloat(max(0, min(viewport.lineCount, viewport.topline)))
+        guard let previous = presentedTopline else {
+            presentedTarget = target
+            presentedSpring.settle()
+            return
+        }
+        guard target != presentedTarget else { return }
+        let capacity = GridAccessoryPolicy.railCapacity(
+            railHeight: minimapLayer.bounds.height, scale: scale,
+            minimapScale: minimapScale, minimapPitch: minimapPitch)
+        let limit = CGFloat(
+            GridAccessoryPolicy.maximumTrackedCatchUpLines(capacity: capacity))
+        presentedTarget = target
+        if abs(previous - target) > limit {
+            presentedSpring.settle()
+        } else {
+            presentedSpring.position = previous - target
+        }
     }
 
     @discardableResult
-    func advanceDisplayRangeMotion(by elapsed: CFTimeInterval) -> Bool {
-        guard displayRangeMotion.isActive else { return false }
-        displayRangeMotion.advance(by: elapsed)
-        updateMotionLayers()
-        return displayRangeMotion.isActive
+    func advancePresentedTopline(by elapsed: CFTimeInterval) -> Bool {
+        guard hasPresentedMotion else { return false }
+        presentedSpring.advance(by: elapsed)
+        return hasPresentedMotion
     }
 
-    func settleDisplayRangeMotion() {
-        displayRangeMotion.settle()
-        updateMotionLayers()
+    func settlePresentedTopline() {
+        presentedSpring.settle()
+    }
+
+    /// Fractional first document line at the visual top of the rail, derived
+    /// from the presented topline.
+    func minimapWindowOrigin() -> CGFloat? {
+        guard let viewport = latestViewport, minimapLayer.bounds.height > 0
+        else { return nil }
+        let total = topology?.totalLineCount ?? viewport.lineCount
+        guard total > 0 else { return nil }
+        let capacity = GridAccessoryPolicy.railCapacity(
+            railHeight: minimapLayer.bounds.height, scale: scale,
+            minimapScale: minimapScale, minimapPitch: minimapPitch)
+        let clampedTop = CGFloat(max(0, min(viewport.lineCount, viewport.topline)))
+        return GridAccessoryPolicy.windowOrigin(
+            totalLines: total, capacity: capacity,
+            visualTopline: presentedTopline ?? clampedTop,
+            visibleLineCount: visibleViewportLineCount)
+    }
+
+    /// How far the smoothed visual window origin leads the published integer
+    /// display range. Diagnostic only.
+    var displayRangeLead: CGFloat {
+        guard let displayRange, let origin = minimapWindowOrigin() else { return 0 }
+        return origin - CGFloat(displayRange.lowerBound)
     }
 
     func presentedMinimapImage() -> CGImage? {
@@ -1040,14 +1140,12 @@ private final class GridEditorAccessoryState {
     }
 
     func positionContentLayer() {
-        guard let acceptedChunk, let displayRange else { return }
+        guard let acceptedChunk, let origin = minimapWindowOrigin() else { return }
         let pitch = GridAccessoryPolicy.linePitch(
             scale: scale, minimapScale: minimapScale,
             minimapPitch: minimapPitch)
-        let settledY = -CGFloat(
-            displayRange.lowerBound - acceptedChunk.payload.startLine) * pitch
         let y = snapToPhysicalPixel(
-            settledY - displayRangeMotion.position * pitch)
+            -(origin - CGFloat(acceptedChunk.payload.startLine)) * pitch)
         contentLayer.frame = CGRect(
             x: 0, y: y, width: mapWidth,
             height: CGFloat(max(1, acceptedChunk.payload.lines.count)) * pitch)
@@ -1055,7 +1153,9 @@ private final class GridEditorAccessoryState {
 
     func updateMotionLayers() {
         positionContentLayer()
-        guard !minimapLayer.isHidden, let displayRange, let viewport = latestViewport else {
+        guard !minimapLayer.isHidden, let viewport = latestViewport,
+            let origin = minimapWindowOrigin()
+        else {
             viewportLayer.isHidden = true
             cursorLayer.isHidden = true
             return
@@ -1063,10 +1163,9 @@ private final class GridEditorAccessoryState {
         let pitch = GridAccessoryPolicy.linePitch(
             scale: scale, minimapScale: minimapScale,
             minimapPitch: minimapPitch)
-        let visualDisplayStart = CGFloat(displayRange.lowerBound)
-            + snappedDisplayRangeResidual(pitch: pitch)
-        let visualTop = CGFloat(viewport.topline) + latestResidual
-        let y = snapToPhysicalPixel((visualTop - visualDisplayStart) * pitch)
+        let clampedTop = CGFloat(max(0, min(viewport.lineCount, viewport.topline)))
+        let visualTop = presentedTopline ?? clampedTop
+        let y = snapToPhysicalPixel((visualTop - origin) * pitch)
         let visibleLines = max(1, min(viewport.lineCount, viewport.botline)
             - min(viewport.lineCount, viewport.topline))
         viewportLayer.frame = CGRect(
@@ -1075,16 +1174,10 @@ private final class GridEditorAccessoryState {
         viewportLayer.isHidden = false
 
         let cursorY = snapToPhysicalPixel(
-            (CGFloat(viewport.curline) + latestResidual
-                - visualDisplayStart) * pitch)
+            (CGFloat(viewport.curline) + visualTop - clampedTop - origin) * pitch)
         cursorLayer.frame = CGRect(
             x: 0, y: cursorY, width: mapWidth, height: 1 / scale)
         cursorLayer.isHidden = cursorY < 0 || cursorY > minimapLayer.bounds.height
-    }
-
-    private func snappedDisplayRangeResidual(pitch: CGFloat) -> CGFloat {
-        guard pitch > 0 else { return 0 }
-        return snapToPhysicalPixel(displayRangeMotion.position * pitch) / pitch
     }
 
     private func snapToPhysicalPixel(_ value: CGFloat) -> CGFloat {
@@ -1117,7 +1210,7 @@ private final class GridEditorAccessoryState {
     private func emitMinimapTarget(
         at y: CGFloat, phase: GridAccessoryGesturePhase
     ) {
-        guard let displayRange, !displayRange.isEmpty, mapWidth > 0,
+        guard mapWidth > 0, let viewport = latestViewport,
             interactionView.bounds.width > 0,
             interactionView.bounds.height > 0
         else { return }
@@ -1126,41 +1219,43 @@ private final class GridEditorAccessoryState {
         { return }
         // Once AppKit has captured a drag, continue targeting the nearest
         // edge when the pointer leaves the gutter instead of dropping changed
-        // and mouse-up events (which also strands the grab offset).
+        // and mouse-up events (which also strands the grab offset). A drag
+        // clamped past the rail end therefore rests at the document end.
         let targetY = max(
             interactionView.bounds.minY,
             min(interactionView.bounds.maxY, y))
-        // The trailing scroller owns its own hit area.
-        if !interactionView.scroller.isHidden,
-            y >= interactionView.scroller.frame.minY,
-            interactionView.scroller.frame.width == interactionView.bounds.width
-        { return }
-        let pitch = GridAccessoryPolicy.linePitch(
+        let pitch = max(1 / scale, GridAccessoryPolicy.linePitch(
             scale: scale, minimapScale: minimapScale,
-            minimapPitch: minimapPitch)
+            minimapPitch: minimapPitch))
         let visibleLines = CGFloat(visibleViewportLineCount)
+        var grabbedIndicator = false
         if phase == .began {
             if !viewportLayer.isHidden,
                 targetY >= viewportLayer.frame.minY,
                 targetY <= viewportLayer.frame.maxY
             {
+                grabbedIndicator = true
                 minimapGrabOffsetLines = max(
-                    0, (targetY - viewportLayer.frame.minY)
-                        / max(1 / scale, pitch))
+                    0, (targetY - viewportLayer.frame.minY) / pitch)
             } else {
                 minimapGrabOffsetLines = visibleLines / 2
             }
         }
         let grabOffset = minimapGrabOffsetLines ?? visibleLines / 2
-        let visualDisplayStart = CGFloat(displayRange.lowerBound)
-            + snappedDisplayRangeResidual(pitch: pitch)
-        let clickedLine = visualDisplayStart
-            + targetY / max(1 / scale, pitch)
-        let total = topology?.totalLineCount ?? latestViewport?.lineCount ?? 0
-        let target = GridAccessoryPolicy.targetTopline(
-            clickedLine: clickedLine,
-            visibleLineCount: visibleViewportLineCount,
-            grabOffsetLines: grabOffset, totalLines: total)
+        let total = topology?.totalLineCount ?? viewport.lineCount
+        let clampedTop = max(0, min(viewport.lineCount, viewport.topline))
+        let capacity = GridAccessoryPolicy.railCapacity(
+            railHeight: minimapLayer.bounds.height, scale: scale,
+            minimapScale: minimapScale, minimapPitch: minimapPitch)
+        // Grabbing the indicator must not jump the view; the drag scrubs
+        // from the exact current position.
+        let target = grabbedIndicator
+            ? clampedTop
+            : GridAccessoryPolicy.targetTopline(
+                railY: targetY, pitch: pitch, grabOffsetLines: grabOffset,
+                totalLines: total,
+                visibleLineCount: visibleViewportLineCount,
+                capacity: capacity)
         onViewportTarget?(GridAccessoryViewportTargetRequest(
             gridID: gridID, windowHandle: windowHandle,
             bufferHandle: topology?.bufferHandle,
@@ -1263,13 +1358,12 @@ final class GridAccessoryCoordinator {
 
     func sync(
         flush: FlushResult, frames: [ResolvedGridFrame],
-        gridLayers: [Int: CALayer], residuals: [Int: CGFloat],
+        gridLayers: [Int: CALayer],
         cellSize: CGSize, scale: CGFloat, fontName: String,
         editorFontSize: CGFloat,
         showsMinimap: Bool, showsScrollbars: Bool,
         minimapWidth: CGFloat, minimapScale: CGFloat,
-        minimapPitch: CGFloat, minimapMinEditorColumns: Int,
-        animatedGridIDs: Set<Int>
+        minimapPitch: CGFloat, minimapMinEditorColumns: Int
     ) {
         guard let hostView else { return }
         lastFrames = frames
@@ -1308,7 +1402,7 @@ final class GridAccessoryCoordinator {
                 self?.onWheelRequest?(request)
             }
             state.latestViewport = viewport
-            state.latestResidual = residuals[frame.gridID] ?? 0
+            state.retargetPresentedTopline()
             state.applyTopology(topologies[windowHandle])
 
             let margins = grid.viewportMargins ?? ViewportMargins(
@@ -1416,9 +1510,7 @@ final class GridAccessoryCoordinator {
                 scale: scale, fontName: fontName,
                 minimapScale: minimapScale, minimapPitch: minimapPitch,
                 editorFontSize: editorFontSize)
-            refreshContent(
-                for: state,
-                animateRangeShift: animatedGridIDs.contains(frame.gridID))
+            refreshContent(for: state)
         }
 
         // Hidden grids keep Neovim storage but not native interaction views.
@@ -1437,31 +1529,27 @@ final class GridAccessoryCoordinator {
         }
     }
 
+    /// Advance every catch-up spring to the latest display target. A state
+    /// whose spring settled this frame still relayouts once to land exactly.
     @discardableResult
-    func advanceMotion(
-        by elapsed: CFTimeInterval, residuals: [Int: CGFloat]
-    ) -> Bool {
+    func advanceMotion(by elapsed: CFTimeInterval) -> Bool {
         var active = false
-        for (gridID, state) in states {
-            state.latestResidual = residuals[gridID] ?? 0
-            if state.hasDisplayRangeMotion {
-                active = state.advanceDisplayRangeMotion(by: elapsed) || active
-            } else {
-                state.updateMotionLayers()
-            }
+        for state in states.values where state.hasPresentedMotion {
+            active = state.advancePresentedTopline(by: elapsed) || active
+            state.updateMotionLayers()
         }
         return active
     }
 
-    func settleMotion(_ residuals: [Int: CGFloat]) {
-        for (gridID, state) in states {
-            state.latestResidual = residuals[gridID] ?? 0
-            state.settleDisplayRangeMotion()
+    func settleMotion() {
+        for state in states.values where state.hasPresentedMotion {
+            state.settlePresentedTopline()
+            state.updateMotionLayers()
         }
     }
 
     var hasActiveMotion: Bool {
-        states.values.contains(where: \.hasDisplayRangeMotion)
+        states.values.contains(where: \.hasPresentedMotion)
     }
 
     func interactionView(at point: NSPoint) -> NSView? {
@@ -1486,7 +1574,7 @@ final class GridAccessoryCoordinator {
             acceptedRange: state.acceptedChunk?.payload.lineRange,
             accumulatedLineCount: state.accumulatedLines.count,
             contentFrame: state.acceptedChunk == nil ? nil : state.contentLayer.frame,
-            displayRangeResidual: state.displayRangeMotion.position,
+            displayRangeResidual: state.displayRangeLead,
             renderGeneration: state.renderSerial,
             renderIsInFlight: state.renderTask != nil,
             contentLayerHasContents: state.contentLayer.contents != nil,
@@ -1506,45 +1594,21 @@ final class GridAccessoryCoordinator {
         states[gridID]?.presentedMinimapImage()
     }
 
-    private func refreshContent(
-        for state: GridEditorAccessoryState,
-        animateRangeShift: Bool = false
-    ) {
+    private func refreshContent(for state: GridEditorAccessoryState) {
         guard !state.minimapLayer.isHidden, state.minimapLayer.bounds.height > 0,
             let viewport = state.latestViewport
         else { return }
         let total = state.topology?.totalLineCount ?? viewport.lineCount
-        let centeredDisplay = GridAccessoryPolicy.displayRange(
-            totalLines: total, viewportTopline: viewport.topline,
+        let clampedTop = max(0, min(viewport.lineCount, viewport.topline))
+        let clampedBottom = max(
+            clampedTop, min(viewport.lineCount, viewport.botline))
+        let display = GridAccessoryPolicy.displayRange(
+            totalLines: total, viewportTopline: clampedTop,
+            visibleLineCount: max(1, clampedBottom - clampedTop),
             railHeight: state.minimapLayer.bounds.height, scale: state.scale,
             minimapScale: state.minimapScale,
             minimapPitch: state.minimapPitch)
-        // Keep the semantic window fixed while the authoritative viewport is
-        // represented. Once it reaches an edge, shift only by the minimum
-        // lines needed to retain it; never re-center by half a rail.
-        let display: Range<Int>
-        var trackedShift = 0
-        if let existing = state.displayRange,
-            existing.count == centeredDisplay.count,
-            existing.lowerBound >= 0, existing.upperBound <= total
-        {
-            var lower = existing.lowerBound
-            if viewport.topline < existing.lowerBound {
-                lower = viewport.topline
-            } else if viewport.botline > existing.upperBound {
-                lower += viewport.botline - existing.upperBound
-            }
-            lower = max(0, min(lower, total - existing.count))
-            display = lower..<(lower + existing.count)
-            trackedShift = lower - existing.lowerBound
-        } else {
-            display = centeredDisplay
-            state.settleDisplayRangeMotion()
-        }
-        state.retargetDisplayRange(
-            by: trackedShift, animate: animateRangeShift)
         state.displayRange = display
-        state.positionContentLayer()
         state.updateMotionLayers()
 
         if state.publishAccumulatedContentIfReady() {

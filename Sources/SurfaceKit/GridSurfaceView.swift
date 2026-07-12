@@ -596,7 +596,9 @@ public final class GridSurfaceView: NSView {
         authoritativeCursorGrid = flush.cursor.grid
         updateCursorPresentation()
 
-        if motionStarted || cursorCorrectionActive {
+        if motionStarted || cursorCorrectionActive
+            || accessoryCoordinator.hasActiveMotion
+        {
             resumeDisplayLink()
         }
     }
@@ -615,7 +617,7 @@ public final class GridSurfaceView: NSView {
         cursorCorrection.settle()
         cursorCorrectionActive = false
         updateCursorPresentation()
-        settleEditorAccessoryMotion()
+        accessoryCoordinator.settleMotion()
         pauseDisplayLink()
     }
 
@@ -744,7 +746,7 @@ public final class GridSurfaceView: NSView {
                 active = true
             }
         }
-        active = advanceEditorAccessoryMotion(by: boundedElapsed) || active
+        active = accessoryCoordinator.advanceMotion(by: boundedElapsed) || active
         updateCursorPresentation()
         return active
             || smoothViewports.values.contains(where: \.isActive)
@@ -935,40 +937,18 @@ public final class GridSurfaceView: NSView {
     private func syncEditorAccessories(
         flush: FlushResult, frames: [ResolvedGridFrame]
     ) {
-        let residuals = smoothViewports.reduce(into: [Int: CGFloat]()) {
-            $0[$1.key] = cellSize.height > 0
-                ? $1.value.snappedTranslationY / cellSize.height : 0
-        }
         accessoryCoordinator.sync(
             flush: flush, frames: frames, gridLayers: gridLayers,
-            residuals: residuals, cellSize: cellSize, scale: scale,
+            cellSize: cellSize, scale: scale,
             fontName: CTFontCopyPostScriptName(fonts.regular) as String,
             editorFontSize: fontSpec.size,
             showsMinimap: showsMinimap,
             showsScrollbars: showsNativeScrollbars,
             minimapWidth: minimapWidth, minimapScale: minimapScale,
             minimapPitch: minimapPitch,
-            minimapMinEditorColumns: minimapMinEditorColumns,
-            animatedGridIDs: Set(smoothViewports.compactMap {
-                $0.value.isActive ? $0.key : nil
-            }))
-    }
-
-    private func advanceEditorAccessoryMotion(
-        by elapsed: CFTimeInterval
-    ) -> Bool {
-        accessoryCoordinator.advanceMotion(
-            by: elapsed, residuals: editorAccessoryResiduals)
-    }
-
-    private func settleEditorAccessoryMotion() {
-        accessoryCoordinator.settleMotion(editorAccessoryResiduals)
-    }
-
-    private var editorAccessoryResiduals: [Int: CGFloat] {
-        smoothViewports.reduce(into: [Int: CGFloat]()) {
-            $0[$1.key] = cellSize.height > 0
-                ? $1.value.snappedTranslationY / cellSize.height : 0
+            minimapMinEditorColumns: minimapMinEditorColumns)
+        if reducedMotion || scrollMotionStyle == .immediate {
+            accessoryCoordinator.settleMotion()
         }
     }
 

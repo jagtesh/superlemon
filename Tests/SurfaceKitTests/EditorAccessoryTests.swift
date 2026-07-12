@@ -60,6 +60,15 @@ private struct AccessoryHarness {
             .gridResize(grid: 2, width: request.cols, height: request.rows),
         ]))
     }
+
+    /// Drains the minimap catch-up spring (and any grid motion) so
+    /// end-state assertions observe settled geometry.
+    func settleAccessoryMotion() {
+        for _ in 0..<600 where !view.animationsAreIdle {
+            _ = view.advanceAnimations(
+                by: 1.0 / 120.0, nominalDisplayPeriod: 1.0 / 120.0)
+        }
+    }
 }
 
 @MainActor
@@ -135,7 +144,7 @@ private func dominantRedPixelCount(_ image: CGImage) -> Int {
     @Test func requestedRangeIsSlidingAndBounded() {
         let display = GridAccessoryPolicy.displayRange(
             totalLines: 100_000, viewportTopline: 50_000,
-            railHeight: 600, scale: 2)
+            visibleLineCount: 40, railHeight: 600, scale: 2)
         let request = GridAccessoryPolicy.requestedRange(
             totalLines: 100_000, displayRange: display)
         #expect(request.count <= GridAccessoryPolicy.maximumChunkLines)
@@ -145,16 +154,45 @@ private func dominantRedPixelCount(_ image: CGImage) -> Int {
         #expect(request.upperBound < 100_000)
     }
 
-    @Test func sublimeTargetingCentersClicksAndPreservesDragGrabOffset() {
+    @Test func proportionalWindowSweepsTheRailWithTheViewport() {
+        #expect(GridAccessoryPolicy.windowOrigin(
+            totalLines: 10_000, capacity: 200,
+            visualTopline: 0, visibleLineCount: 40) == 0)
+        #expect(GridAccessoryPolicy.windowOrigin(
+            totalLines: 10_000, capacity: 200,
+            visualTopline: 9_960, visibleLineCount: 40) == 9_800)
+        let middle = GridAccessoryPolicy.windowOrigin(
+            totalLines: 10_000, capacity: 200,
+            visualTopline: 4_980, visibleLineCount: 40)
+        #expect(abs(middle - 4_900) < 0.001)
+        #expect(GridAccessoryPolicy.windowOrigin(
+            totalLines: 150, capacity: 200,
+            visualTopline: 100, visibleLineCount: 40) == 0,
+            "a document that fits the rail never slides")
+    }
+
+    @Test func proportionalTargetingSpansTheWholeDocument() {
+        // Rail: 200-line capacity at pitch 3; a 1,000-line document with 40
+        // visible lines. The 160-line indicator track maps onto the 960
+        // possible topline positions.
         #expect(GridAccessoryPolicy.targetTopline(
-            clickedLine: 500, visibleLineCount: 40,
-            grabOffsetLines: 20, totalLines: 1_000) == 480)
+            railY: 0, pitch: 3, grabOffsetLines: 0,
+            totalLines: 1_000, visibleLineCount: 40, capacity: 200) == 0)
         #expect(GridAccessoryPolicy.targetTopline(
-            clickedLine: 500, visibleLineCount: 40,
-            grabOffsetLines: 7, totalLines: 1_000) == 493)
+            railY: 480, pitch: 3, grabOffsetLines: 0,
+            totalLines: 1_000, visibleLineCount: 40, capacity: 200) == 960,
+            "the rail end maps to the document end")
         #expect(GridAccessoryPolicy.targetTopline(
-            clickedLine: 995, visibleLineCount: 40,
-            grabOffsetLines: 7, totalLines: 1_000) == 960)
+            railY: 240, pitch: 3, grabOffsetLines: 0,
+            totalLines: 1_000, visibleLineCount: 40, capacity: 200) == 480)
+        #expect(GridAccessoryPolicy.targetTopline(
+            railY: 240, pitch: 3, grabOffsetLines: 20,
+            totalLines: 1_000, visibleLineCount: 40, capacity: 200) == 360,
+            "the grab offset shifts the map by lines inside the indicator")
+        #expect(GridAccessoryPolicy.targetTopline(
+            railY: 300, pitch: 3, grabOffsetLines: 0,
+            totalLines: 150, visibleLineCount: 40, capacity: 200) == 100,
+            "a document that fits the rail keeps the identity map")
     }
 
     @Test func authoritativeScrollerUpdatesDoNotFightActiveTracking() {
@@ -282,12 +320,16 @@ private func dominantRedPixelCount(_ image: CGImage) -> Int {
         let pitch = GridAccessoryPolicy.linePitch(
             scale: 2, minimapScale: harness.view.minimapScale,
             minimapPitch: harness.view.minimapPitch)
+        let capacity = GridAccessoryPolicy.railCapacity(
+            railHeight: interaction.height, scale: 2,
+            minimapScale: harness.view.minimapScale,
+            minimapPitch: harness.view.minimapPitch)
         let expectedClick = GridAccessoryPolicy.targetTopline(
-            clickedLine: CGFloat(display.lowerBound)
-                + interaction.height * 0.8 / pitch,
-            visibleLineCount: sizeRequest!.rows,
+            railY: interaction.height * 0.8, pitch: pitch,
             grabOffsetLines: CGFloat(sizeRequest!.rows) / 2,
-            totalLines: 2_000)
+            totalLines: 2_000, visibleLineCount: sizeRequest!.rows,
+            capacity: capacity)
+        _ = display
         #expect(targets.first?.phase == .began)
         #expect(targets.first?.targetTopline == expectedClick)
         #expect(targets.last?.phase == .ended)
@@ -311,9 +353,11 @@ private func dominantRedPixelCount(_ image: CGImage) -> Int {
         dragTarget.mouseUp(with: host.mouseEvent(.leftMouseUp, at: belowGutter))
 
         #expect(targets.map(\.phase) == [.began, .changed, .ended])
-        #expect((targets.dropFirst().first?.targetTopline ?? 0)
-            > (targets.first?.targetTopline ?? 0),
-            "dragging beyond the gutter must continue toward the buffer end")
+        #expect(targets.first?.targetTopline == 100,
+            "grabbing the viewport indicator must not jump the view")
+        #expect(targets.dropFirst().first?.targetTopline
+            == 2_000 - sizeRequest!.rows,
+            "a drag clamped past the rail end must reach the document end")
         _ = window
     }
 
@@ -422,6 +466,7 @@ private func dominantRedPixelCount(_ image: CGImage) -> Int {
                 botline: request!.rows, curline: 0, curcol: 0,
                 lineCount: 2_000, scrollDelta: 0),
         ]))
+        harness.settleAccessoryMotion()
 
         guard let snapshot = harness.view.editorAccessoryDebugSnapshot(gridID: 2)
         else {
@@ -654,7 +699,7 @@ private func dominantRedPixelCount(_ image: CGImage) -> Int {
                 "the visible gutter crop must present colored glyph pixels")
     }
 
-    @Test func minimapMarkersUseTheSameSnappedScrollResidual() {
+    @Test func minimapWindowTracksAuthoritativeStepsContinuously() {
         let harness = AccessoryHarness()
         var request: GridAccessorySizeRequest?
         harness.view.onGridAccessorySizeRequest = { request = $0 }
@@ -674,98 +719,151 @@ private func dominantRedPixelCount(_ image: CGImage) -> Int {
         let retargeted = harness.view.editorAccessoryDebugSnapshot(gridID: 2)!
         #expect(abs((before.viewportFrame?.minY ?? 0)
             - (retargeted.viewportFrame?.minY ?? 0)) <= 0.5,
-            "authoritative row advance plus -1 residual must be visually continuous")
+            "an authoritative row advance must be visually continuous")
+        let beforeOrigin = CGFloat(before.displayRange?.lowerBound ?? 0)
+            + before.displayRangeResidual
+        let retargetedOrigin = CGFloat(retargeted.displayRange?.lowerBound ?? 0)
+            + retargeted.displayRangeResidual
+        #expect(abs(retargetedOrigin - beforeOrigin) < 0.01,
+            "the rail window must be stationary at insertion, like the grid")
 
         _ = harness.view.advanceAnimations(
             by: 0.08, nominalDisplayPeriod: 1.0 / 60.0)
         let advanced = harness.view.editorAccessoryDebugSnapshot(gridID: 2)!
-        #expect(advanced.viewportFrame?.minY != retargeted.viewportFrame?.minY)
-        #expect(advanced.cursorFrame?.minY != retargeted.cursorFrame?.minY)
+        let advancedOrigin = CGFloat(advanced.displayRange?.lowerBound ?? 0)
+            + advanced.displayRangeResidual
+        #expect(advancedOrigin > retargetedOrigin,
+            "catch-up decay slides the window toward the authoritative position")
     }
 
-    @Test func railEdgeShiftUsesAContinuousExactContentResidual() {
+    @Test func farJumpsSweepContinuouslyAndTeleportsCut() {
         let harness = AccessoryHarness()
-        harness.view.minimapPitch = 6
-        var sizeRequest: GridAccessorySizeRequest?
-        var contentRequest: MinimapContentRangeRequest?
-        harness.view.onGridAccessorySizeRequest = { sizeRequest = $0 }
-        harness.view.onMinimapContentRangeRequest = { contentRequest = $0 }
+        var request: GridAccessorySizeRequest?
+        harness.view.onGridAccessorySizeRequest = { request = $0 }
         harness.presentInitial()
-        harness.acknowledge(sizeRequest!)
-
-        guard let request = contentRequest else {
-            Issue.record("content request missing")
+        harness.acknowledge(request!)
+        let rows = request!.rows
+        guard let interaction = harness.view.editorAccessoryDebugSnapshot(
+            gridID: 2)?.interactionFrame
+        else {
+            Issue.record("interaction geometry missing")
             return
         }
-        harness.view.provideMinimapContent(MinimapContentChunk(
-            requestID: request.requestID, gridID: 2,
-            topology: request.topology,
-            firstLine: request.lineRange.lowerBound,
-            lastLine: request.lineRange.upperBound, complete: true,
-            lines: request.lineRange.map { MinimapLine(text: "line \($0)") }))
+        let capacity = GridAccessoryPolicy.railCapacity(
+            railHeight: interaction.height, scale: 2,
+            minimapScale: harness.view.minimapScale,
+            minimapPitch: harness.view.minimapPitch)
 
-        guard let initialDisplay = harness.view.editorAccessoryDebugSnapshot(
-            gridID: 2)?.displayRange
+        func origin() -> CGFloat {
+            let snapshot = harness.view.editorAccessoryDebugSnapshot(gridID: 2)!
+            return CGFloat(snapshot.displayRange?.lowerBound ?? 0)
+                + snapshot.displayRangeResidual
+        }
+
+        // A ctrl-f-sized jump stays within the tracked catch-up limit: the
+        // window is continuous at the flush and sweeps monotonically after.
+        let before = origin()
+        harness.view.present(accessoryFlush(harness.store, [
+            .winViewport(
+                grid: 2, win: harness.windowHandle, topline: 250,
+                botline: 250 + rows, curline: 250, curcol: 0,
+                lineCount: 2_000, scrollDelta: 0),
+        ]))
+        #expect(abs(origin() - before) < 0.01,
+            "a tracked far jump must not teleport the window")
+
+        var previous = origin()
+        for _ in 0..<600 where !harness.view.animationsAreIdle {
+            _ = harness.view.advanceAnimations(
+                by: 1.0 / 120.0, nominalDisplayPeriod: 1.0 / 120.0)
+            let current = origin()
+            #expect(current >= previous - 0.001,
+                "the catch-up sweep must be monotonic — no ease-out strobing")
+            previous = current
+        }
+        let target = GridAccessoryPolicy.windowOrigin(
+            totalLines: 2_000, capacity: capacity,
+            visualTopline: 250, visibleLineCount: rows)
+        #expect(abs(previous - target) < 0.1,
+            "the sweep must land exactly on the authoritative position")
+
+        // A teleport beyond the tracked limit cuts immediately.
+        harness.view.present(accessoryFlush(harness.store, [
+            .winViewport(
+                grid: 2, win: harness.windowHandle, topline: 1_800,
+                botline: 1_800 + rows, curline: 1_800, curcol: 0,
+                lineCount: 2_000, scrollDelta: 0),
+        ]))
+        let cutTarget = GridAccessoryPolicy.windowOrigin(
+            totalLines: 2_000, capacity: capacity,
+            visualTopline: 1_800, visibleLineCount: rows)
+        #expect(abs(origin() - cutTarget) < 0.01,
+            "a teleport beyond the catch-up limit must jump-cut")
+    }
+
+    @Test func proportionalWindowMapsRailEndsToDocumentEnds() {
+        let harness = AccessoryHarness()
+        var sizeRequest: GridAccessorySizeRequest?
+        harness.view.onGridAccessorySizeRequest = { sizeRequest = $0 }
+        harness.presentInitial()
+        harness.acknowledge(sizeRequest!)
+        guard let interaction = harness.view.editorAccessoryDebugSnapshot(
+            gridID: 2)?.interactionFrame
         else {
-            Issue.record("display range missing")
+            Issue.record("acknowledged interaction geometry missing")
             return
         }
         let rows = sizeRequest!.rows
-        let edgeTop = initialDisplay.upperBound - rows
-        harness.view.present(accessoryFlush(harness.store, [
-            .winViewport(
-                grid: 2, win: harness.windowHandle, topline: edgeTop,
-                botline: initialDisplay.upperBound, curline: edgeTop + 4,
-                curcol: 2, lineCount: 2_000, scrollDelta: 0),
-        ]))
-        guard let before = harness.view.editorAccessoryDebugSnapshot(gridID: 2),
-            let beforeContentY = before.contentFrame?.minY,
-            let beforeViewportY = before.viewportFrame?.minY
-        else {
-            Issue.record("settled minimap geometry missing")
-            return
-        }
-
-        harness.view.present(accessoryFlush(harness.store, [
-            .gridScroll(
-                grid: 2, top: 0, bottom: rows, left: 0,
-                right: sizeRequest!.cols, rows: 1, cols: 0),
-            .winViewport(
-                grid: 2, win: harness.windowHandle, topline: edgeTop + 1,
-                botline: initialDisplay.upperBound + 1,
-                curline: edgeTop + 5, curcol: 2,
-                lineCount: 2_000, scrollDelta: 1),
-        ]))
-        var snapshot = harness.view.editorAccessoryDebugSnapshot(gridID: 2)!
-        #expect(snapshot.displayRange?.lowerBound
-            == initialDisplay.lowerBound + 1)
-        #expect(abs(snapshot.displayRangeResidual + 1) < 0.001)
-        #expect(abs((snapshot.contentFrame?.minY ?? .infinity)
-            - beforeContentY) <= 0.001,
-            "the logical range rotation must not move pixels at insertion")
-        #expect(abs((snapshot.viewportFrame?.minY ?? .infinity)
-            - beforeViewportY) <= 0.5)
-
-        var previousContentY = beforeContentY
-        for _ in 0..<60 where !harness.view.animationsAreIdle {
-            _ = harness.view.advanceAnimations(
-                by: 1.0 / 120.0,
-                nominalDisplayPeriod: 1.0 / 120.0)
-            snapshot = harness.view.editorAccessoryDebugSnapshot(gridID: 2)!
-            let contentY = snapshot.contentFrame!.minY
-            #expect(contentY <= previousContentY + 0.001,
-                    "edge content must settle monotonically without sawteeth")
-            #expect(abs(snapshot.viewportFrame!.minY - beforeViewportY) <= 0.5,
-                    "the viewport marker stays pinned while its rail tracks")
-            previousContentY = contentY
-        }
-
         let pitch = GridAccessoryPolicy.linePitch(
             scale: 2, minimapScale: harness.view.minimapScale,
             minimapPitch: harness.view.minimapPitch)
-        #expect(harness.view.animationsAreIdle)
-        #expect(abs(previousContentY - (beforeContentY - pitch)) <= 0.001)
-        #expect(abs(snapshot.displayRangeResidual) <= 0.001)
+        let capacity = GridAccessoryPolicy.railCapacity(
+            railHeight: interaction.height, scale: 2,
+            minimapScale: harness.view.minimapScale,
+            minimapPitch: harness.view.minimapPitch)
+
+        harness.view.present(accessoryFlush(harness.store, [
+            .winViewport(
+                grid: 2, win: harness.windowHandle, topline: 0,
+                botline: rows, curline: 0, curcol: 0,
+                lineCount: 2_000, scrollDelta: 0),
+        ]))
+        harness.settleAccessoryMotion()
+        let top = harness.view.editorAccessoryDebugSnapshot(gridID: 2)!
+        #expect(top.displayRange?.lowerBound == 0)
+        #expect(top.viewportFrame?.minY == 0,
+            "the document start pins the indicator to the rail top")
+
+        harness.view.present(accessoryFlush(harness.store, [
+            .winViewport(
+                grid: 2, win: harness.windowHandle, topline: 990,
+                botline: 990 + rows, curline: 995, curcol: 0,
+                lineCount: 2_000, scrollDelta: 0),
+        ]))
+        harness.settleAccessoryMotion()
+        let middle = harness.view.editorAccessoryDebugSnapshot(gridID: 2)!
+        let expectedOrigin = Int(
+            (CGFloat(990) / CGFloat(2_000 - rows)
+                * CGFloat(2_000 - capacity)).rounded(.down))
+        #expect(middle.displayRange?.lowerBound == expectedOrigin,
+            "the window position is proportional to the document position")
+
+        harness.view.present(accessoryFlush(harness.store, [
+            .winViewport(
+                grid: 2, win: harness.windowHandle, topline: 2_000 - rows,
+                botline: 2_000, curline: 1_999, curcol: 0,
+                lineCount: 2_000, scrollDelta: 0),
+        ]))
+        harness.settleAccessoryMotion()
+        let end = harness.view.editorAccessoryDebugSnapshot(gridID: 2)!
+        #expect(end.displayRange?.upperBound == 2_000)
+        guard let indicator = end.viewportFrame else {
+            Issue.record("end-of-document indicator missing")
+            return
+        }
+        #expect(abs(indicator.maxY - CGFloat(capacity) * pitch) <= 0.5,
+            "the document end pins the indicator to the rail's content end")
+        #expect(indicator.maxY <= interaction.height + 0.5)
     }
 }
 
