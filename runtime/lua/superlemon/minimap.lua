@@ -131,6 +131,7 @@ local function visible_windows()
         winid = winid,
         bufnr = bufnr,
         buftype = vim.bo[bufnr].buftype,
+        buffer_name = api.nvim_buf_get_name(bufnr),
         filetype = vim.bo[bufnr].filetype,
         tabstop = vim.bo[bufnr].tabstop,
         changedtick = changedtick(bufnr),

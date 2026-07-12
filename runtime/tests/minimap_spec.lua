@@ -83,6 +83,8 @@ H.ok(normal_entry ~= nil, "windows payload includes current normal window")
 H.eq(normal_entry and normal_entry.bufnr, bufnr, "window payload includes buffer identity")
 H.eq(normal_entry and normal_entry.filetype, "minimap-test", "window payload includes filetype")
 H.eq(normal_entry and normal_entry.tabstop, 3, "window payload includes tabstop")
+H.eq(normal_entry and normal_entry.buffer_name, vim.api.nvim_buf_get_name(bufnr),
+  "window payload includes the native buffer label source")
 H.eq(normal_entry and normal_entry.changedtick, vim.api.nvim_buf_get_changedtick(bufnr),
   "window payload includes changedtick")
 H.eq(normal_entry and normal_entry.line_count, 3, "window payload includes line count")

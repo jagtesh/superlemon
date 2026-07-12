@@ -32,6 +32,7 @@ H.eq(settings.payload(), {
   minimap_width = 88,
   minimap_scale = 0.20,
   minimap_pitch = 2.0,
+  minimap_min_editor_columns = 40,
 }, "renderer settings have stable defaults")
 
 -- Requiring or pushing the module without the GUI remains inert.
@@ -46,6 +47,7 @@ vim.g.superlemon_force_glyph_fallback = false
 vim.g.superlemon_minimap_width = 104
 vim.g.superlemon_minimap_scale = 0.25
 vim.g.superlemon_minimap_pitch = 2.5
+vim.g.superlemon_minimap_min_editor_columns = 52
 
 require("superlemon").setup(7)
 
@@ -66,20 +68,25 @@ H.eq(pushed[1].args[1], {
   minimap_width = 104,
   minimap_scale = 0.25,
   minimap_pitch = 2.5,
+  minimap_min_editor_columns = 52,
 }, "setup sends every configured renderer setting")
 
 -- Unsafe numeric values are clamped or replaced before crossing the wire.
 vim.g.superlemon_minimap_width = 999
 vim.g.superlemon_minimap_scale = 0 / 0
 vim.g.superlemon_minimap_pitch = -4
+vim.g.superlemon_minimap_min_editor_columns = 999
 H.eq(settings.payload().minimap_width, 160, "minimap width clamps to supported maximum")
 H.eq(settings.payload().minimap_scale, 0.20, "NaN minimap scale returns to default")
 H.eq(settings.payload().minimap_pitch, 1.0, "minimap pitch clamps to supported minimum")
+H.eq(settings.payload().minimap_min_editor_columns, 120,
+  "minimap editor-width threshold clamps to supported maximum")
 
 -- Restore the configured snapshot before the repeated-setup assertion.
 vim.g.superlemon_minimap_width = 104
 vim.g.superlemon_minimap_scale = 0.25
 vim.g.superlemon_minimap_pitch = 2.5
+vim.g.superlemon_minimap_min_editor_columns = 52
 
 -- A repeated setup is safe and emits one fresh, complete snapshot.
 require("superlemon").setup(7)

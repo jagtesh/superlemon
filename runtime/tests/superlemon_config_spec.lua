@@ -23,6 +23,8 @@ H.eq(vim.g.superlemon_force_glyph_fallback, 0, "glyph fallback setting explicit"
 H.eq(vim.g.superlemon_minimap_width, 88, "minimap width setting explicit")
 H.eq(vim.g.superlemon_minimap_scale, 0.20, "minimap scale setting explicit")
 H.eq(vim.g.superlemon_minimap_pitch, 2.0, "minimap pitch setting explicit")
+H.eq(vim.g.superlemon_minimap_min_editor_columns, 40,
+  "minimap editor-width threshold setting explicit")
 
 H.eq(vim.o.mousescroll, "ver:1,hor:1", "one-cell native scrolling configured")
 H.eq(vim.o.laststatus, 0, "native statusbar reclaims the statusline row")

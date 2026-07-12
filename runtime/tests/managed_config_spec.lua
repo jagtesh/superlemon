@@ -24,6 +24,8 @@ H.eq(vim.g.superlemon_powerline_glyphs, 0, "Powerline synthesis opt-in by defaul
 H.eq(vim.g.superlemon_minimap_width, 88, "managed minimap width is stable")
 H.eq(vim.g.superlemon_minimap_scale, 0.20, "managed minimap scale is stable")
 H.eq(vim.g.superlemon_minimap_pitch, 2.0, "managed minimap pitch is stable")
+H.eq(vim.g.superlemon_minimap_min_editor_columns, 40,
+  "managed minimap editor-width threshold is stable")
 H.eq(vim.o.laststatus, 0, "in-grid statusline released")
 H.eq(vim.o.mousescroll, "ver:1,hor:1", "native scrolling advances one cell per wheel step")
 
