@@ -64,6 +64,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         return controller.handleTerminationRequest()
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        controller?.stop()
+    }
+
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool {
         true
     }

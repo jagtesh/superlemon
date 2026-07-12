@@ -44,6 +44,10 @@ final class NvimController {
     private var uiTask: Task<Void, Never>?
     private var lifecycleTask: Task<Void, Never>?
     private var notificationTask: Task<Void, Never>?
+    private var restartTask: Task<Void, Never>?
+    private var restartAttempt = 0
+    private var sessionStartedAt: ContinuousClock.Instant?
+    private var stopRequested = false
     private(set) var channelID: Int?
 
     private var attached = false
@@ -125,6 +129,11 @@ final class NvimController {
 
     /// Spawn nvim, handshake, attach the UI, and start the consumption loops.
     func start() async {
+        await launchSession(isRestart: false)
+    }
+
+    private func launchSession(isRestart: Bool) async {
+        guard session == nil, !stopRequested else { return }
         do {
             let binary = await Self.resolveNvimBinary()
             // Debug facility: SUPERLEMON_LISTEN=<path> exposes the embedded
@@ -158,6 +167,8 @@ final class NvimController {
             )
             let session = NvimSession(configuration: configuration)
             self.session = session
+            sessionExited = false
+            sessionStartedAt = .now
 
             // Start consuming before any bytes flow so nothing is dropped.
             consumeUIEvents(from: session)
@@ -194,7 +205,16 @@ final class NvimController {
             sendResizeIfNeeded()
             await bootstrapRuntimePlugin(session)
         } catch {
-            handleStartupFailure(error)
+            if let session {
+                await session.terminate()
+            }
+            clearSessionState()
+            if isRestart, !stopRequested, !terminationPending {
+                NSLog("superlemon: Neovim restart failed: \(error)")
+                scheduleRestart()
+            } else {
+                handleStartupFailure(error)
+            }
         }
     }
 
@@ -532,36 +552,73 @@ final class NvimController {
                 guard let self else { return }
                 switch event {
                 case .exited(let exitCode, let stderrTail):
-                    self.handleSessionExit(code: exitCode, stderrTail: stderrTail)
+                    self.handleSessionExit(session, code: exitCode, stderrTail: stderrTail)
                 }
             }
         }
     }
 
-    private func handleSessionExit(code: Int32, stderrTail: String) {
+    private func handleSessionExit(_ exitedSession: NvimSession, code: Int32, stderrTail: String) {
+        guard session === exitedSession else { return }
         sessionExited = true
         resetInputQueue()
         if let exitHandler {
             exitHandler(code, stderrTail)
             return
         }
-        if code != 0 {
-            let alert = NSAlert()
-            alert.alertStyle = .critical
-            alert.messageText = "Neovim exited unexpectedly (code \(code))"
-            alert.informativeText =
-                stderrTail.isEmpty
-                ? "No stderr output was captured."
-                : String(stderrTail.suffix(2000))
-            alert.addButton(withTitle: "Quit")
-            alert.runModal()
-        }
-        window?.close()
+        clearSessionState()
         if terminationPending {
             terminationPending = false
+            window?.close()
             NSApp.reply(toApplicationShouldTerminate: true)
+        } else if stopRequested {
+            window?.close()
         } else {
-            NSApp.terminate(nil)  // sessionExited → applicationShouldTerminate says .terminateNow
+            if let started = sessionStartedAt,
+                started.duration(to: .now) >= .seconds(30)
+            {
+                restartAttempt = 0
+            }
+            let detail = stderrTail.isEmpty ? "" : ": \(String(stderrTail.suffix(500)))"
+            NSLog("superlemon: Neovim exited with code \(code)\(detail); restarting")
+            window?.title = "Superlemon — Restarting Neovim…"
+            scheduleRestart()
+        }
+    }
+
+    private func scheduleRestart() {
+        guard restartTask == nil, !stopRequested, !terminationPending else { return }
+        let delay = min(5.0, 0.25 * pow(2.0, Double(restartAttempt)))
+        restartAttempt += 1
+        restartTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard !Task.isCancelled, let self else { return }
+            self.restartTask = nil
+            await self.launchSession(isRestart: true)
+        }
+    }
+
+    private func clearSessionState() {
+        uiTask?.cancel()
+        notificationTask?.cancel()
+        uiTask = nil
+        notificationTask = nil
+        session = nil
+        channelID = nil
+        attached = false
+        inputReady = false
+    }
+
+    /// Final process-ownership backstop. The normal app quit path first asks
+    /// Neovim to exit cleanly; this prevents a restart and terminates any
+    /// remaining child when AppKit is already shutting down.
+    func stop() {
+        stopRequested = true
+        restartTask?.cancel()
+        restartTask = nil
+        resetInputQueue()
+        if let session {
+            Task { await session.terminate() }
         }
     }
 
