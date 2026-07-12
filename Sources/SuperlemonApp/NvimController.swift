@@ -20,9 +20,6 @@ final class NvimController {
     /// Wave-3 chrome (ChromeKit + ShellKit); nil in smoke mode.
     var chrome: WorkspaceChrome?
 
-    /// The live editor FontSpec (Settings placeholders/refresh).
-    var currentFontSpec: FontSpec? { surface?.fontSpec }
-
     /// UserDefaults key for the App-menu "Use Superlemon Config" switch.
     static let managedConfigDefaultsKey = "UseSuperlemonManagedConfig"
 
@@ -31,9 +28,6 @@ final class NvimController {
 
     /// Called once, on the first flushed frame (smoke-mode hook).
     var onFirstFlush: ((FlushResult) -> Void)?
-    /// Fired after any editor font change (guifont, Settings, ⌘±) so the
-    /// Settings window can stay in sync while open.
-    var fontDidChange: (() -> Void)?
     /// Overrides default exit handling (close window / alert / terminate).
     var exitHandler: ((Int32, String) -> Void)?
     /// Overrides default startup-failure handling (alert + terminate).
@@ -55,6 +49,37 @@ final class NvimController {
     private var lastGuifont: String?
     private var lastLinespace: CGFloat = 0
     private var lastBackground: NvimKit.RGBColor?
+
+    /// Rendering preferences originate in superlemon.vim and arrive through
+    /// the runtime's `superlemon.settings` notification. Defaults match a
+    /// pristine FontSpec so the first grid can render before bootstrap.
+    private struct RenderingSettings: Equatable {
+        var powerlineGlyphs = false
+        var ligatures = true
+        var useSymbolFont = false
+        var forceGlyphFallback = false
+
+        init() {}
+
+        init(payload: Value) {
+            powerlineGlyphs = payload["powerline_glyphs"]?.boolValue ?? false
+            ligatures = payload["ligatures"]?.boolValue ?? true
+            useSymbolFont = payload["use_symbol_font"]?.boolValue ?? false
+            forceGlyphFallback = payload["force_glyph_fallback"]?.boolValue ?? false
+        }
+
+        func apply(to spec: inout FontSpec) {
+            spec.powerlineGlyphs = powerlineGlyphs
+            spec.ligatures = ligatures
+            spec.useSymbolFont = useSymbolFont
+            spec.forceSynthesis = forceGlyphFallback
+        }
+    }
+
+    private var renderingSettings = RenderingSettings()
+    /// Font name/size/spacing derived only from Neovim's guifont/linespace.
+    /// Command-0 returns to this value after temporary native zooming.
+    private var configuredFontSpec = FontSpec()
 
     private var terminationPending = false
     private var quitRequestInFlight = false
@@ -155,7 +180,7 @@ final class NvimController {
                     .string(
                         "local path, chan = ...\n"
                             + "vim.opt.runtimepath:prepend(path)\n"
-                            + Self.startupChromeLua()
+                            + "require('superlemon.settings').source_user_config()\n"
                             + "require('superlemon').setup(chan)"),
                     .array([.string(runtime.path), .int(Int64(channelID))]),
                 ])
@@ -164,64 +189,13 @@ final class NvimController {
         }
     }
 
-    /// Settings ▸ "On startup": inject the user's explicit chrome choices as
-    /// g: vars AFTER their config loaded, BEFORE plugin setup reads them.
-    /// Injected ONLY when the user has actually chosen (keys present) —
-    /// untouched settings leave the config in charge (faithfulness).
-    static func startupChromeLua() -> String {
-        let defaults = UserDefaults.standard
-        guard let mode = defaults.string(forKey: "StartupChromeMode") else { return "" }
-        let tabs: Bool
-        let bar: Bool
-        let adopt: Bool
-        let hideTabline: Bool
-        if mode == "combined" {
-            let on = defaults.bool(forKey: "StartupChromeCombinedOn")
-            (tabs, bar, adopt, hideTabline) = (on, on, on, on)
-        } else {
-            tabs = defaults.bool(forKey: "StartupNativeTabs")
-            bar = defaults.bool(forKey: "StartupNativeBar")
-            adopt = defaults.bool(forKey: "StartupAdoptStatusline")
-            hideTabline = defaults.bool(forKey: "StartupHideTabline")
-        }
-        func lua(_ name: String, _ on: Bool) -> String {
-            "vim.g.superlemon_\(name) = \(on ? 1 : 0)\n"
-        }
-        return lua("native_tabs", tabs) + lua("native_statusbar", bar)
-            + lua("adopt_statusline", adopt) + lua("hide_tabline", hideTabline)
-    }
-
-    /// Settings ▸ Appearance: applied immediately (and picked up by every
-    /// future FontSpec build).
-    func applyRenderingOptions() {
-        guard let surface else { return }
-        var spec = surface.fontSpec
-        Self.applyDefaults(to: &spec)
-        // The native bar synthesizes the same glyphs in harvested segments.
-        chrome?.statusBar.synthesizePowerline =
-            spec.powerlineGlyphs && (spec.useSymbolFont || spec.forceSynthesis)
-        guard spec != surface.fontSpec else { return }
-        let metricsChanged =
-            spec.size != surface.fontSpec.size || spec.name != surface.fontSpec.name
-        surface.setFont(spec)
-        if metricsChanged { sendResizeIfNeeded(force: true) }
-        fontDidChange?()
-    }
-
-    /// Settings -> FontSpec. The editor font/size override (when set) beats
-    /// guifont; empty follows the config.
-    static func applyDefaults(to spec: inout FontSpec) {
-        let defaults = UserDefaults.standard
-        if let name = defaults.string(forKey: "EditorFontName"), !name.isEmpty {
-            spec.name = name
-        }
-        let size = defaults.double(forKey: "EditorFontSize")
-        if size >= 6, size <= 72 { spec.size = size }
-        spec.powerlineGlyphs = defaults.bool(forKey: "PowerlineGlyphs")
-        spec.ligatures = defaults.object(forKey: "Ligatures") == nil
-            ? true : defaults.bool(forKey: "Ligatures")
-        spec.useSymbolFont = defaults.bool(forKey: "UseSymbolFont")
-        spec.forceSynthesis = defaults.bool(forKey: "ForceGlyphFallback")
+    /// Apply the renderer half of superlemon.vim. Neovim remains authoritative
+    /// for font name/size/spacing through guifont and linespace.
+    func applyRuntimeSettings(_ payload: Value) {
+        renderingSettings = RenderingSettings(payload: payload)
+        var spec = configuredFontSpec
+        renderingSettings.apply(to: &spec)
+        applyFontSpec(spec)
     }
 
     /// The runtime/ directory: env override → repo-relative to the executable
@@ -449,11 +423,23 @@ final class NvimController {
                 }
             }
         }
-        Self.applyDefaults(to: &spec)  // Settings overrides beat guifont
+        configuredFontSpec = spec
+        renderingSettings.apply(to: &spec)
+        applyFontSpec(spec)
+    }
+
+    /// Install one fully resolved font spec and keep the native statusline's
+    /// Powerline synthesis policy in lockstep with the grid renderer.
+    private func applyFontSpec(_ spec: FontSpec) {
+        guard let surface else { return }
+        chrome?.statusBar.synthesizePowerline =
+            spec.powerlineGlyphs && (spec.useSymbolFont || spec.forceSynthesis)
         guard spec != surface.fontSpec else { return }
+        let metricsChanged =
+            spec.size != surface.fontSpec.size || spec.name != surface.fontSpec.name
+                || spec.linespace != surface.fontSpec.linespace
         surface.setFont(spec)
-        sendResizeIfNeeded(force: true)
-        fontDidChange?()
+        if metricsChanged { sendResizeIfNeeded(force: true) }
     }
 
     // MARK: - Consumption loop: lifecycle
@@ -751,18 +737,16 @@ final class NvimController {
         pendingInputCommands.removeAll(keepingCapacity: false)
     }
 
-    /// ⌘= / ⌘- / ⌘0 via superlemon.font: bump the guifont size or reset.
+    /// ⌘= / ⌘- / ⌘0 via superlemon.font: temporary native zoom. Reset returns
+    /// to the guifont/linespace values from the active Neovim configuration.
     func bumpFont(delta: Int) {
         guard let surface else { return }
-        var spec = surface.fontSpec
-        spec.size = delta == 0 ? 13 : max(6, min(72, spec.size + CGFloat(delta)))
-        guard spec != surface.fontSpec else { return }
-        // Persist the zoom FIRST — otherwise the stored size override (or a
-        // later guifont/Settings pass) reverts the bump instantly.
-        UserDefaults.standard.set(Double(spec.size), forKey: "EditorFontSize")
-        surface.setFont(spec)
-        sendResizeIfNeeded(force: true)
-        fontDidChange?()
+        var spec = delta == 0 ? configuredFontSpec : surface.fontSpec
+        renderingSettings.apply(to: &spec)
+        if delta != 0 {
+            spec.size = max(6, min(72, spec.size + CGFloat(delta)))
+        }
+        applyFontSpec(spec)
     }
 
     /// Native tab strip: switch to a buffer (CONTRACT.md superlemon.buffers).
@@ -815,6 +799,29 @@ final class NvimController {
                     .string("vim.cmd.drop(vim.fn.fnameescape(...))"),
                     .array([.string(absolutePath)]),
                 ])
+        }
+    }
+
+    /// Create a durable user-owned settings file from the bundled annotated
+    /// template on first use, then open it in Neovim. The managed init sources
+    /// `$XDG_CONFIG_HOME/superlemon/init.vim` after the bundled baseline.
+    func openSuperlemonConfig(templatePath: String) {
+        guard let session else { return }
+        Task {
+            do {
+                _ = try await session.request(
+                    "nvim_exec_lua",
+                    [
+                        .string(
+                            "local template = ...\n"
+                                + "local target = require('superlemon.settings').ensure_user_config(template)\n"
+                                + "vim.cmd.drop(vim.fn.fnameescape(target))\n"
+                                + "return target"),
+                        .array([.string(templatePath)]),
+                    ])
+            } catch {
+                NSLog("superlemon: could not open user settings: \(error)")
+            }
         }
     }
 

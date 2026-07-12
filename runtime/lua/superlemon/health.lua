@@ -31,6 +31,10 @@ function M.check()
   local keymaps = require("superlemon.keymaps")
   if keymaps.installed > 0 then
     health.ok(("%d default <D-...> keymaps installed"):format(keymaps.installed))
+  elseif vim.g.superlemon_default_keymaps == 0
+    or vim.g.superlemon_default_keymaps == false
+  then
+    health.info("default keymaps disabled by g:superlemon_default_keymaps")
   else
     health.info("no default keymaps installed (setup() not run, or user maps cover them all)")
   end

@@ -5,7 +5,9 @@
 -- bufferline plugins) never loads. This is the fully-native experience —
 -- Superlemon's chrome replaces the in-grid equivalents.
 --
--- Deliberately small: sensible defaults, native chrome on, nothing exotic.
+-- Deliberately small: ordinary editor defaults and one example plugin.
+-- Superlemon-specific behavior lives in the annotated sibling
+-- `superlemon.vim`, which is sourced at the end of this file.
 
 vim.opt.termguicolors = true
 vim.opt.number = true
@@ -16,23 +18,6 @@ vim.opt.smartcase = true
 vim.opt.splitright = true
 vim.opt.splitbelow = true
 vim.opt.updatetime = 250
--- Native trackpads already provide acceleration and momentum. One logical
--- wheel step should therefore advance one grid cell; Neovim's terminal-first
--- default of three rows makes precise input visibly jump in chunks.
-vim.opt.mousescroll = "ver:1,hor:1"
-
--- Native chrome (see runtime/CONTRACT.md `superlemon.chrome`):
--- buffer tabs in the titlebar band, powerline bar + command input at the
--- bottom. The superlemon runtime plugin reads these at setup.
-vim.g.superlemon_native_tabs = 1
-vim.g.superlemon_native_statusbar = 1
-
--- THIS config (and only this config) releases the in-grid rows the native
--- bar replaces — the runtime plugin never touches these options, so a user
--- config keeps its own statusline/cmdline untouched (CONTRACT.md).
-vim.opt.laststatus = 0
-vim.opt.cmdheight = 0
-vim.opt.showmode = false
 
 -- Ships with nvim; calm and readable in both appearances.
 vim.cmd.colorscheme("habamax")
@@ -52,66 +37,21 @@ pcall(function()
   require("nvim-surround").setup()
 end)
 
----------------------------------------------------------------------------
--- Statusline (powerline-style) ────────────────────────────────────────────
---
--- This is a PLAIN vim 'statusline' (:h 'statusline') — even though
--- laststatus=0 hides it in the grid, the native bar harvests whatever it
--- evaluates to (nvim_eval_statusline; CONTRACT.md superlemon.statusline).
--- CUSTOMIZE IT LIKE ANY VIMRC: edit the highlight colors, reorder the
--- segments, add your own %{} items — the native bar follows live.
----------------------------------------------------------------------------
+-- Source the managed Superlemon settings by absolute path. The bundled
+-- runtime is added to 'runtimepath' only after Neovim starts, so :runtime
+-- cannot locate this sibling during init processing.
+local init_path = debug.getinfo(1, "S").source:sub(2)
+local superlemon_config = vim.fs.joinpath(vim.fs.dirname(init_path), "superlemon.vim")
+vim.cmd("source " .. vim.fn.fnameescape(superlemon_config))
 
-local hl = vim.api.nvim_set_hl
--- Mode badge colors (mirrors the classic airline scheme + NORTHSTAR caps).
-hl(0, "SLModeNormal", { fg = "#FFFFFF", bg = "#004DC8", bold = true })
-hl(0, "SLModeInsert", { fg = "#1B2023", bg = "#ADC694", bold = true })
-hl(0, "SLModeVisual", { fg = "#FFFFFF", bg = "#8E24AA", bold = true })
-hl(0, "SLModeReplace", { fg = "#FFFFFF", bg = "#C42B1C", bold = true })
-hl(0, "SLModeCommand", { fg = "#1B2023", bg = "#E0B268", bold = true })
-hl(0, "SLGit", { fg = "#CDD2D7", bg = "#4A4A49" })
-hl(0, "SLFile", { fg = "#CDD2D7", bg = "#373736" })
-hl(0, "SLInfo", { fg = "#A6ABB0", bg = "#2B2B2A" })
-hl(0, "SLPos", { fg = "#FFFFFF", bg = "#005A37", bold = true })
-
-local MODE_NAMES = {
-  n = "NORMAL", i = "INSERT", v = "VISUAL", V = "V-LINE", ["\22"] = "V-BLOCK",
-  c = "COMMAND", R = "REPLACE", s = "SELECT", S = "S-LINE", t = "TERMINAL",
-}
-local MODE_GROUPS = {
-  n = "SLModeNormal", i = "SLModeInsert", v = "SLModeVisual",
-  V = "SLModeVisual", ["\22"] = "SLModeVisual", c = "SLModeCommand",
-  R = "SLModeReplace", t = "SLModeInsert",
-}
-
--- Mode badge: name and color react to the current mode. (`mode` argument
--- is for testing; it defaults to the live mode.)
-function _G.superlemon_sl_mode(mode)
-  mode = mode or vim.fn.mode()
-  local key = mode:sub(1, 1)
-  local group = MODE_GROUPS[key] or "SLModeNormal"
-  local name = MODE_NAMES[key] or mode:upper()
-  return "%#" .. group .. "# " .. name .. " "
+-- Personal Superlemon overrides live in their own XDG config directory.
+-- Source them second so every value there wins over the bundled baseline.
+local config_home = vim.env.XDG_CONFIG_HOME
+if config_home == nil or config_home == "" then
+  config_home = vim.fs.joinpath(vim.uv.os_homedir(), ".config")
 end
-
--- Git branch segment (data from the superlemon plugin's cached provider;
--- empty outside a repository).
-function _G.superlemon_sl_git()
-  local ok, status = pcall(require, "superlemon.status")
-  local branch = ok and status.branch_for(vim.fn.getcwd()) or ""
-  if branch == "" then
-    return ""
-  end
-  return "%#SLGit# ⎇ " .. branch .. " "
+local user_superlemon_config = vim.fs.joinpath(config_home, "superlemon", "init.vim")
+if vim.fn.filereadable(user_superlemon_config) == 1 then
+  vim.cmd("source " .. vim.fn.fnameescape(user_superlemon_config))
+  vim.g.superlemon_user_config_loaded = user_superlemon_config
 end
-
-vim.o.statusline = table.concat({
-  "%{%v:lua.superlemon_sl_mode()%}",
-  "%{%v:lua.superlemon_sl_git()%}",
-  "%#SLFile# %f %m%r ",
-  "%=",  -- ── right side ──
-  "%#SLInfo# %{&filetype == '' ? 'text' : &filetype} ",
-  "%#SLInfo# %{&fileencoding == '' ? &encoding : &fileencoding}[%{&fileformat}] ",
-  "%#SLInfo# %p%% ",
-  "%#SLPos# ln:%l/%L ≡ :%c ",
-})

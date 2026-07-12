@@ -9,8 +9,8 @@
 -- FAITHFULNESS RULE: this module never touches user options. Turning native
 -- chrome on does NOT hide an in-grid statusline/bufferline the user's config
 -- draws — resolving the duplication (laststatus/cmdheight/plugins) belongs
--- to whichever init is loaded. Superlemon's own managed config
--- (runtime/config/init.lua) makes those choices for the fully-native look.
+-- to whichever init is loaded. Superlemon's annotated managed settings
+-- (runtime/config/superlemon.vim) make those choices for the native look.
 
 local M = {}
 

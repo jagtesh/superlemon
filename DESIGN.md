@@ -496,10 +496,13 @@ A small Lua plugin shipped in the app bundle and prepended to
   (`UNUserNotificationCenter`), opening URLs. Plugin authors get Mac
   integration without Superlemon knowing about their plugin.
 - Session autosave for crash recovery (§3).
-- Option-key policy, ligature toggle, cursor-animation toggle as
-  `vim.g.superlemon_*` variables — *all GUI settings live in nvim config*,
-  versioned with the user's dotfiles. The native Settings window is a thin
-  editor over the same variables.
+- Superlemon-facing Neovim options and `vim.g.superlemon_*` variables are
+  collected and explained in `runtime/config/superlemon.vim`. The managed init
+  loads that baseline first, then the primary user override at
+  `$XDG_CONFIG_HOME/superlemon/init.vim`. The Settings window creates that
+  user-owned file from the annotated template and opens it for editing. When
+  a user-selected Neovim init bypasses the managed baseline, the runtime still
+  sources the personal Superlemon init once before bridge setup.
 
 ---
 

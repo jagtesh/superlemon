@@ -38,6 +38,15 @@ end
 function M.setup()
   M.installed = 0
 
+  -- The managed superlemon.vim documents every shortcut and exposes one
+  -- master opt-out. A user config that does not define the variable retains
+  -- the historical default: install only currently-unmapped Command chords.
+  if vim.g.superlemon_default_keymaps == 0
+    or vim.g.superlemon_default_keymaps == false
+  then
+    return
+  end
+
   local bump_up = function() M.font_bump(1) end
   local bump_down = function() M.font_bump(-1) end
   local bump_reset = function() M.font_bump(0) end

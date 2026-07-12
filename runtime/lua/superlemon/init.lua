@@ -37,7 +37,8 @@ function M.setup(channel)
   require("superlemon.git").setup(group)
   require("superlemon.ui").setup()
 
-  -- Seed the GUI with the current state right away.
+  -- Seed the GUI with the current configuration and editor state right away.
+  require("superlemon.settings").push()
   require("superlemon.status").push()
 end
 

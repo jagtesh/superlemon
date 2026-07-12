@@ -262,6 +262,11 @@ Same window shell, Editor pane selected (pencil icon `#1186FF`):
 - **Line Spacing:** tick-marked slider + "1.0x".
 - **Use Ligatures** checkbox (checked; gray check style, not accent-tinted).
 
+Superlemon adopts this pane's spacing and native presentation, but not its
+second preference store. Its implementation selects the Neovim init and opens
+`$XDG_CONFIG_HOME/superlemon/init.vim`; font, ligature, and chrome values live
+there so file configuration remains authoritative.
+
 ### 4.7 `image-viewer.png` — image file viewer (light)
 
 Selecting an image file in the tree opens a **native image viewer occupying the
@@ -339,6 +344,7 @@ Ownership per DESIGN.md's package split:
 | Editor grid, gutter, cursor, line highlight | **SurfaceKit / GridKit** | already specified (§5–6) |
 | Status bar (mode badge, chips) | **ChromeKit** | feeds off `ext_messages` ruler/showmode + runtime-plugin state (git branch, line/col) |
 | Context menus (native metrics) | **ChromeKit** primitives, invoked by ShellKit sidebar | plain `NSMenu` is sufficient |
+| Settings window (General/Editor) | **ShellKit** | chooses the Neovim init and creates/opens `$XDG_CONFIG_HOME/superlemon/init.vim`; no duplicate native preference values |
 | Image viewer + metadata bar | **ShellKit** (new; see deltas) | bypasses nvim for binary files |
 | Markdown preview pane | **ShellKit/ChromeKit** (new; see deltas) | WKWebView-or-native render with GitHub CSS, refresh control |
 | Scrim + palette materials | **ChromeKit** | borderless key `NSPanel` + 30 % black overlay view over content region |
@@ -369,13 +375,11 @@ Flagging explicitly, as required:
    branch, line/col, project name, and mode pushed from the runtime plugin;
    DESIGN §8 only sketches a "slim native status bar". Also adopt the
    light/dark chip contrast flip (§6.3).
-7. **Settings scope grows.** DESIGN §9 says all GUI settings live in nvim config
-   (System/Light/Dark) *independent of colorscheme luminance* (DESIGN §8 derives
-   appearance from the colorscheme — reconcile these), Neovim binary
-   path + verify UX (aligns with §3 binary discovery), file-association
-   registration, and a native font/size/line-spacing/ligature override with an
-   explicit "defer to guifont" toggle (DESIGN currently assumes guifont is the
-   only source of truth).
+   controls, but Superlemon deliberately keeps font, spacing, ligatures, and
+   chrome in `$XDG_CONFIG_HOME/superlemon/init.vim`. The native window chooses
+   the Neovim init and opens that annotated file; it does not create a second
+   source of truth. Neovim binary verification and file associations can remain
+   native because they are needed before Neovim starts.
 8. **Trial/licensing surface.** The "Trial — 14 days remaining" titlebar pill
    implies licensing UI — absent from DESIGN.md; note for productization.
 9. **Flat-opaque chrome, not vibrancy-first.** DESIGN.md leans on

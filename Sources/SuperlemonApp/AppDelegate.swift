@@ -23,12 +23,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     @objc private func showSettings(_ sender: Any?) {
         guard let controller else { return }
         if settings == nil {
-            let settings = SettingsWindowController(controller: controller)
-            settings.onEditManagedConfig = { [weak controller] in
+            let settings = SettingsWindowController()
+            settings.onEditSuperlemonConfig = { [weak controller] in
                 if let managed = NvimController.runtimeDirectory()?
-                    .appendingPathComponent("config/init.lua")
+                    .appendingPathComponent("config/superlemon.vim")
                 {
-                    controller?.openFile(managed.path)
+                    controller?.openSuperlemonConfig(templatePath: managed.path)
                 }
             }
             settings.onRelaunch = { [weak self] in self?.relaunch() }
@@ -155,7 +155,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
         controller.window = window
         controller.surface = surface
-        controller.fontDidChange = { [weak self] in self?.settings?.refresh() }
         chrome.attach(window: window, surface: surface)
         chrome.restoreFocus = { [weak window, weak host] in
             window?.makeFirstResponder(host)

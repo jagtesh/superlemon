@@ -2,6 +2,7 @@
 -- evaluates into harvestable, correctly-colored segments.
 local H = dofile(vim.fs.dirname(arg[0]) .. "/helpers.lua")
 H.setup_rtp()
+vim.env.XDG_CONFIG_HOME = H.tmpdir() -- never read the developer's real override
 
 local calls = H.stub_gui()
 
@@ -11,6 +12,13 @@ require("superlemon").setup(1)
 
 H.ok(vim.o.statusline ~= "", "managed config defines a statusline")
 H.eq(vim.g.superlemon_native_tabs, 1, "native tabs on by default")
+H.eq(vim.g.superlemon_native_statusbar, 1, "native statusbar on by default")
+H.eq(vim.g.superlemon_adopt_statusline, 1, "native statusbar adopts the statusline")
+H.eq(vim.g.superlemon_hide_tabline, 0, "managed config keeps distinct tabpages visible")
+H.eq(vim.g.superlemon_native_ui, 1, "native vim.ui pickers on by default")
+H.eq(vim.g.superlemon_default_keymaps, 1, "macOS keymap defaults on by default")
+H.eq(vim.g.superlemon_ligatures, 1, "renderer ligatures on by default")
+H.eq(vim.g.superlemon_powerline_glyphs, 0, "Powerline synthesis opt-in by default")
 H.eq(vim.o.laststatus, 0, "in-grid statusline released")
 H.eq(vim.o.mousescroll, "ver:1,hor:1", "native scrolling advances one cell per wheel step")
 

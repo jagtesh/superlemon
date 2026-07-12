@@ -71,7 +71,6 @@ final class WorkspaceChrome {
         self.window = window
         self.surface = surface
         toasts.attach(to: window)
-        statusBar.synthesizePowerline = UserDefaults.standard.bool(forKey: "PowerlineGlyphs")
         sidebar.setRoot(projectRoot)
         statusBar.render(StatusModel(project: projectRoot.lastPathComponent), dark: isDark)
         Task { await fileIndex.refresh() }
@@ -91,6 +90,9 @@ final class WorkspaceChrome {
         case "superlemon.font":
             let delta = params.first?["delta"]?.intValue ?? 0
             controller.bumpFont(delta: delta)
+        case "superlemon.settings":
+            guard let payload = params.first, payload.mapValue != nil else { return }
+            controller.applyRuntimeSettings(payload)
         case "superlemon.chrome":
             guard let payload = params.first else { return }
             nativeTabs = payload["native_tabs"]?.boolValue ?? false

@@ -56,8 +56,32 @@ is the single source of truth; the GUI only reflects notifications.
 Turning native chrome on shows the GUI's tabs/bar and nothing else — if the
 loaded config draws its own statusline/bufferline, both appear until the user
 resolves it in their config (`laststatus=0`, disabling the plugin, etc.).
-Superlemon's managed config (runtime/config/init.lua) makes those choices for
-the fully-native experience; a user config is never modified.
+Superlemon's internal init sources the annotated bundled baseline
+`runtime/config/superlemon.vim`, then sources the primary personal override at
+`$XDG_CONFIG_HOME/superlemon/init.vim` (normally
+`~/.config/superlemon/init.vim`) when present. Thus the home-directory file
+wins setting-by-setting without modifying the bundled runtime. When a custom
+or user Neovim init bypasses the internal managed init, runtime bootstrap still
+sources the personal Superlemon init once before `setup()`.
+
+### `superlemon.settings`
+One complete renderer-settings map, pushed at every `setup()`:
+
+```lua
+{
+  powerline_glyphs = false,
+  ligatures = true,
+  use_symbol_font = false,
+  force_glyph_fallback = false,
+}
+```
+
+Values come from `g:superlemon_powerline_glyphs`,
+`g:superlemon_ligatures`, `g:superlemon_use_symbol_font`, and
+`g:superlemon_force_glyph_fallback`. Each accepts `1`/`true` for enabled and
+`0`/`false` for disabled. Ligatures default to enabled when unset; the other
+three settings default to disabled. The complete snapshot lets the GUI apply
+configuration atomically without retaining values from an earlier setup.
 
 ### `superlemon.buffers`
 One map argument; pushed (debounced ~50 ms) on BufAdd/BufDelete/BufEnter/
@@ -187,7 +211,8 @@ and `*`. `lines` is a list of strings, `regtype` "v"/"V"/"b".
   which rpcnotifies `superlemon.font` with `{delta = n}`). Use
   `vim.keymap.set` with `{silent = true}`; do NOT pass `unique` — user config
   loaded before us must win, so guard each with
-  `vim.fn.maparg(lhs, mode) == ""`.
+  `vim.fn.maparg(lhs, mode) == ""`. Set
+  `g:superlemon_default_keymaps = 0` to disable every default at once.
 - Sidebar file operations use `:edit`/`:drop` via `nvim_command` (GUI side).
 
 ### `superlemon.font`
