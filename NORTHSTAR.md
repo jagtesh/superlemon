@@ -12,9 +12,6 @@ not a claim about the current build and it is not a milestone plan. Read
 [`DESIGN.md`](DESIGN.md) for the implemented architecture, boundaries, and open
 work.
 
-original palette and proportions. They do not define Superlemon's product model;
-§10 records exactly how they are used as reference material.
-
 ---
 
 ## 1. The experience we are building
@@ -732,32 +729,3 @@ Performance should be continuously measured at input write, RPC decode, model
 apply, row raster, transaction commit, display presentation, and memory growth.
 The northstar is not “usually smooth”; it is the absence of identifiable hitches
 in deterministic 60 Hz and ProMotion stress scenarios.
-
----
-
-## 10. Visual-reference provenance
-
-
-- `dark-mode.png`
-- `quick-open.png`
-- `tabs.png`
-- `file-context-menu.png`
-- `settings-general.png`
-- `settings-editor.png`
-- `image-viewer.png`
-
-The full-window captures are approximately @1×; the preferences and context-menu
-crops are approximately @2×. Colors in §2 were sampled or adapted from those
-images, and several geometry values in §8 began as measurements from them.
-
-Superlemon adopts the references' calm opaque chrome, generous sidebar, native
-palette, workspace cards, utility views, and Powerline-aware status language.
-It intentionally replaces their ambiguous tab semantics with three explicit
-concepts: buffers in the strip, Neovim tabpages inside the editor, and workspace
-windows in overview. It also leaves product licensing UI out of the visual
-northstar; licensing and distribution policy belong to product decisions, while
-About Superlemon carries the BSD 3-Clause notice and editor acknowledgements.
-
-The reference application's product name is not Superlemon's identity. Its
-screenshots are evidence for taste and proportion; the contract above defines
-the Superlemon destination.
