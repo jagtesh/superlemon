@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Runs every *_spec.lua in this directory under headless nvim.
-# Usage: bash runtime/tests/run.sh   (exits 0 iff all specs pass)
+# Runs runtime specs under headless nvim.
+# Usage:
+#   bash runtime/tests/run.sh                    # every spec
+#   bash runtime/tests/run.sh minimap_spec.lua   # focused spec(s)
 set -u
 
 NVIM="${NVIM:-/opt/homebrew/bin/nvim}"
@@ -12,7 +14,24 @@ dir="$(cd "$(dirname "$0")" && pwd)"
 failed=0
 total=0
 
-for spec in "$dir"/*_spec.lua; do
+if [ "$#" -gt 0 ]; then
+  specs=()
+  for requested in "$@"; do
+    case "$requested" in
+      /*) candidate="$requested" ;;
+      *) candidate="$dir/$requested" ;;
+    esac
+    if [ ! -f "$candidate" ]; then
+      echo "missing runtime spec: $candidate" >&2
+      exit 2
+    fi
+    specs+=("$candidate")
+  done
+else
+  specs=("$dir"/*_spec.lua)
+fi
+
+for spec in "${specs[@]}"; do
   total=$((total + 1))
   name="$(basename "$spec")"
   echo "== ${name}"

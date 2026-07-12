@@ -29,6 +29,9 @@ H.eq(settings.payload(), {
   ligatures = true,
   use_symbol_font = false,
   force_glyph_fallback = false,
+  minimap_width = 88,
+  minimap_scale = 0.20,
+  minimap_pitch = 2.0,
 }, "renderer settings have stable defaults")
 
 -- Requiring or pushing the module without the GUI remains inert.
@@ -40,6 +43,9 @@ vim.g.superlemon_powerline_glyphs = 1
 vim.g.superlemon_ligatures = 0
 vim.g.superlemon_use_symbol_font = true
 vim.g.superlemon_force_glyph_fallback = false
+vim.g.superlemon_minimap_width = 104
+vim.g.superlemon_minimap_scale = 0.25
+vim.g.superlemon_minimap_pitch = 2.5
 
 require("superlemon").setup(7)
 
@@ -57,7 +63,23 @@ H.eq(pushed[1].args[1], {
   ligatures = false,
   use_symbol_font = true,
   force_glyph_fallback = false,
+  minimap_width = 104,
+  minimap_scale = 0.25,
+  minimap_pitch = 2.5,
 }, "setup sends every configured renderer setting")
+
+-- Unsafe numeric values are clamped or replaced before crossing the wire.
+vim.g.superlemon_minimap_width = 999
+vim.g.superlemon_minimap_scale = 0 / 0
+vim.g.superlemon_minimap_pitch = -4
+H.eq(settings.payload().minimap_width, 160, "minimap width clamps to supported maximum")
+H.eq(settings.payload().minimap_scale, 0.20, "NaN minimap scale returns to default")
+H.eq(settings.payload().minimap_pitch, 1.0, "minimap pitch clamps to supported minimum")
+
+-- Restore the configured snapshot before the repeated-setup assertion.
+vim.g.superlemon_minimap_width = 104
+vim.g.superlemon_minimap_scale = 0.25
+vim.g.superlemon_minimap_pitch = 2.5
 
 -- A repeated setup is safe and emits one fresh, complete snapshot.
 require("superlemon").setup(7)

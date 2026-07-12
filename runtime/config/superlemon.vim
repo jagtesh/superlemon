@@ -44,6 +44,15 @@ let g:superlemon_adopt_statusline = 1
 " equivalent. Set to 1 if your tabline/bufferline duplicates the native strip.
 let g:superlemon_hide_tabline = 0
 
+" Show a syntax-colored native minimap inside every sufficiently wide Neovim
+" split. Narrow splits hide it automatically instead of covering useful text.
+let g:superlemon_native_minimap = 1
+
+" Keep the independent native overlay scrollbar hidden by default while the
+" minimap provides document position. This can be enabled with or without the
+" minimap.
+let g:superlemon_native_scrollbars = 0
+
 " Reclaim the grid rows replaced by native controls. `laststatus=0` hides the
 " in-grid statusline, `cmdheight=0` lets the externalized command line use no
 " permanent row, and `noshowmode` avoids duplicating the native mode badge.
@@ -111,6 +120,13 @@ let g:superlemon_use_symbol_font = 0
 " when the active font claims native support. Usually useful only for testing
 " or working around a broken font.
 let g:superlemon_force_glyph_fallback = 0
+
+" Native minimap geometry. Width and pitch are points; scale multiplies the
+" editor font size for the Core Text miniature. Runtime settings clamp unsafe
+" overrides before sending them to the GUI.
+let g:superlemon_minimap_width = 88
+let g:superlemon_minimap_scale = 0.20
+let g:superlemon_minimap_pitch = 2.0
 
 " ---------------------------------------------------------------------------
 " Native status bar appearance and contents

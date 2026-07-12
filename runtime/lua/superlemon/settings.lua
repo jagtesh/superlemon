@@ -59,6 +59,23 @@ local function boolean_setting(value, default)
   return value == 1 or value == true
 end
 
+--- Keep public numeric rendering preferences finite and inside the native
+--- renderer's supported range. Invalid values fall back to the documented
+--- default instead of crossing the wire as NaN/Inf or an unusable size.
+---@param value any
+---@param default number
+---@param minimum number
+---@param maximum number
+---@return number
+local function number_setting(value, default, minimum, maximum)
+  if type(value) ~= "number" or value ~= value
+    or value == math.huge or value == -math.huge
+  then
+    return default
+  end
+  return math.max(minimum, math.min(maximum, value))
+end
+
 --- Return the complete renderer-settings payload. Keeping this pure makes the
 --- defaults explicit and lets the GUI replace its whole settings snapshot.
 ---@return table
@@ -68,6 +85,9 @@ function M.payload()
     ligatures = boolean_setting(vim.g.superlemon_ligatures, true),
     use_symbol_font = boolean_setting(vim.g.superlemon_use_symbol_font, false),
     force_glyph_fallback = boolean_setting(vim.g.superlemon_force_glyph_fallback, false),
+    minimap_width = number_setting(vim.g.superlemon_minimap_width, 88, 48, 160),
+    minimap_scale = number_setting(vim.g.superlemon_minimap_scale, 0.20, 0.10, 0.50),
+    minimap_pitch = number_setting(vim.g.superlemon_minimap_pitch, 2.0, 1.0, 6.0),
   }
 end
 

@@ -23,8 +23,8 @@ array. `channel_id` comes from `nvim_get_api_info`.
 `require("superlemon")` has no side effects. `setup(channel)` rejects invalid
 channels, stores a valid one in `g:superlemon_channel`, stays inert when no UI
 is attached, and may be called again safely. Active setup installs status,
-clipboard, keymap, chrome, git, and native-UI adapters, then pushes initial
-settings and status.
+clipboard, keymap, chrome, minimap, git, and native-UI adapters, then pushes
+initial settings and status.
 
 ### Configuration source order
 
@@ -48,9 +48,9 @@ bootstrap still sources that personal file once. The marker
 `g:superlemon_user_config_loaded` prevents duplicate sourcing.
 
 Settings creates the personal file from the bundled annotated template only
-when it does not already exist. Editor, scrolling, native chrome, native UI,
-keymap, statusline, and renderer preferences live in these Vim files rather
-than a parallel native preference store.
+when it does not already exist. Editor, scrolling, native chrome, minimap,
+native UI, keymap, statusline, and renderer preferences live in these Vim
+files rather than a parallel native preference store.
 
 ## Neovim to GUI notifications
 
@@ -89,21 +89,30 @@ native status bar is disabled.
 One complete map, pushed during setup and after an actual toggle change:
 
 ```lua
-{ native_tabs = true, native_statusbar = true }
+{
+  native_tabs = true,
+  native_statusbar = true,
+  native_minimap = true,
+  native_scrollbars = false,
+}
 ```
 
 Initial state comes from `g:superlemon_native_tabs` and
-`g:superlemon_native_statusbar` (`1`/`true` means enabled). Later changes go
-through:
+`g:superlemon_native_statusbar` (`1`/`true` means enabled), plus
+`g:superlemon_native_minimap` (default enabled) and
+`g:superlemon_native_scrollbars` (default disabled). Later changes go through:
 
 ```vim
 :SuperlemonChrome tabs on|off|toggle
 :SuperlemonChrome statusbar on|off|toggle
+:SuperlemonChrome minimap on|off|toggle
+:SuperlemonChrome scrollbars on|off|toggle
 ```
 
-or `require("superlemon").chrome_toggle("tabs" | "statusbar")`. View-menu
-items call that API and wait for the notification; Neovim is the source of
-truth.
+or `require("superlemon").chrome_toggle(part)`. View-menu items call that API
+and wait for the notification; Neovim is the source of truth. Minimap and
+scrollbar state are independent. Disabling the minimap also cancels its
+pending runtime content generations and clears its window-topology payload.
 
 Native-statusbar adopt mode is enabled unless
 `g:superlemon_adopt_statusline` is `0`/`false`. While adopted, the runtime saves
@@ -126,6 +135,9 @@ One complete renderer-settings map, pushed at every setup:
   ligatures = true,
   use_symbol_font = false,
   force_glyph_fallback = false,
+  minimap_width = 88,
+  minimap_scale = 0.20,
+  minimap_pitch = 2.0,
 }
 ```
 
@@ -137,10 +149,155 @@ Values come from:
 | `ligatures` | `g:superlemon_ligatures` | true |
 | `use_symbol_font` | `g:superlemon_use_symbol_font` | false |
 | `force_glyph_fallback` | `g:superlemon_force_glyph_fallback` | false |
+| `minimap_width` | `g:superlemon_minimap_width` | 88 pt |
+| `minimap_scale` | `g:superlemon_minimap_scale` | 0.20 |
+| `minimap_pitch` | `g:superlemon_minimap_pitch` | 2.0 pt |
 
-Each accepts `1`/`true` or `0`/`false`. The complete snapshot replaces native
-renderer state atomically. Neovim's standard `guifont` and `linespace` remain
-authoritative for font name, size, and spacing.
+Boolean values accept `1`/`true` or `0`/`false`. The complete snapshot replaces
+native renderer state atomically. Numeric minimap values must be finite; width
+clamps to 48...160, scale to 0.10...0.50, and pitch to 1...6 before crossing
+the wire. Neovim's standard `guifont` and `linespace` remain authoritative for
+font name, size, and spacing.
+
+### `superlemon.minimap`
+
+One map argument with a required `kind`. The provider is active only while
+`native_minimap` is enabled. It reports data; SurfaceKit/AppKit owns every
+pixel, layer, clipping decision, and interaction.
+
+#### `kind = "windows"`
+
+The complete set of visible normal windows in the current tabpage. Floating,
+hidden-tab, and external windows are not included:
+
+```lua
+{
+  kind = "windows",
+  windows = {
+    {
+      winid = 1000,
+      bufnr = 3,
+      buftype = "",
+      filetype = "swift",
+      tabstop = 4,
+      changedtick = 27,
+      line_count = 640,
+      highlight_generation = 3,
+    },
+  },
+}
+```
+
+Setup pushes this immediately. Window/buffer/tab/filetype changes schedule a
+fresh complete snapshot with about 20 ms debounce. Every listed buffer receives
+one lightweight `nvim_buf_attach(..., false, callbacks)` subscription.
+
+#### `kind = "invalidate"`
+
+Buffer-attach callbacks invalidate native content/style caches without sending
+the replacement text themselves:
+
+```lua
+{
+  kind = "invalidate",
+  bufnr = 3,
+  changedtick = 27,
+  line_count = 640,
+  highlight_generation = 3,
+  firstline = 10,
+  lastline = 12,       -- old end, zero-based and exclusive
+  new_lastline = 15,   -- new end, zero-based and exclusive
+  reload = true?,
+  detached = true?,
+}
+```
+
+A reload/detach uses `firstline=0`, `lastline=-1`, and `new_lastline=-1`.
+Highlight-affecting events use the same range plus `highlights=true`, bump
+`highlight_generation`, cancel older content work, and repush window topology.
+
+#### `kind = "content"`
+
+Results from `request()` arrive in ordered, cooperative chunks:
+
+```lua
+{
+  kind = "content",
+  request_id = 91,
+  winid = 1000,
+  bufnr = 3,
+  changedtick = 27,
+  line_count = 640,
+  highlight_generation = 3,
+  firstline = 128,
+  lastline = 144,
+  complete = false,
+  clamped = false,
+  highlight_source = "treesitter" | "legacy" | "normal",
+  degraded = "treesitter-budget" | "legacy-budget" |
+             "extmark-cap" | "extmark-error" | nil,
+  lines = {
+    {
+      line = 128,
+      text = "func example()",
+      byte_length = 14,
+      truncated = false,
+      spans = {
+        {
+          start_col = 0, end_col = 4, -- UTF-8 bytes, end-exclusive
+          source = "normal" | "treesitter" | "legacy" | "extmark",
+          priority = 100,
+          order = 7,
+          style = {
+            fg = 0xC586C0, bg = 0x1E1E1E, sp = 0xFF0000,
+            bold = true, italic = false, underline = false,
+          },
+        },
+      },
+    },
+  },
+}
+```
+
+Every nonempty line includes a priority-zero `Normal` span. Tree-sitter is used
+only when an already-active highlighter can be safely feature-detected; the
+provider never starts a parser. Active highlighter queries/injections are
+bounded by time and span count. Otherwise legacy `synID()` runs inside the
+requested window, then plain `Normal` is the final fallback. Persistent
+text-range extmarks overlay any base source with their priority and stack
+order. Ephemeral decoration-provider output, virtual text/lines, match/search
+state, conceal, and pixels are intentionally outside this checkpoint.
+
+Content requests are zero-based and end-exclusive:
+
+```lua
+return require("superlemon.minimap").request({
+  request_id = 91,
+  winid = 1000,
+  bufnr = 3,
+  firstline = 128,
+  lastline = 512,
+  max_columns = 120,
+})
+```
+
+The call returns `true` only after validating that the enabled provider has the
+normal window, that the window still displays the supplied loaded buffer, and
+that the range is well formed. It then returns immediately. Results use at
+most 16 lines per scheduled turn. A request is capped to 384 lines and 256
+Unicode characters per line; partial reads and UTF-8-safe truncation prevent a
+pathological line from becoming a pathological payload. Each syntax source
+attempt receives about 1.5 ms and bounded capture/extmark counts.
+
+Only the newest request generation for a window may notify. Each scheduled
+chunk revalidates window/buffer identity and `changedtick`; edits, buffer
+switches, minimap disablement, or a replacement request silently retire stale
+work.
+
+`ColorScheme`, `Syntax`, `FileType`, `LspTokenUpdate`, `DiagnosticChanged`, and
+relevant option changes advance the highlight generation. Buffer invalidations
+always include current line count and highlight generation; reload/detach and
+topology changes also schedule a fresh windows snapshot.
 
 ### `superlemon.buffers`
 
@@ -381,8 +538,10 @@ never replaces an existing user provider.
 
 ## GUI to Neovim
 
-The GUI uses standard Neovim RPC methods and Lua entry points; there are no
-custom GUI-to-Neovim notification methods.
+The GUI uses standard Neovim RPC methods and Lua entry points. Minimap content
+uses the asynchronous `require("superlemon.minimap").request({...})` entry point
+documented above; it returns an acceptance boolean and never returns content in
+the request response.
 
 ### Input
 
@@ -443,8 +602,8 @@ wipe matching open Neovim buffers.
 
 - Merely requiring the plugin under terminal Neovim has no side effects.
 - Active bridge setup stores its channel in `g:superlemon_channel`.
-- Setup/status/chrome/git autocmds live in augroup `superlemon`, cleared on
-  re-setup. The active preview-buffer watcher uses `superlemon_preview`.
+- Setup/status/chrome/minimap/git autocmds live in augroup `superlemon`, cleared
+  on re-setup. The active preview-buffer watcher uses `superlemon_preview`.
 - Runtime notifications are nonblocking. The runtime initiates `rpcrequest`
   only for the clipboard provider, which Neovim itself calls synchronously.
 - Missing GUI state makes component APIs no-op rather than fail terminal use.
@@ -467,6 +626,7 @@ bash runtime/tests/run.sh
 
 The suite covers setup idempotence and health, status cadence and branch
 resolution, configuration precedence, renderer settings, chrome/adopt mode,
-buffer and preview semantics, evaluated statuslines, keymap ownership and Save
-As, clipboard/user-provider behavior, git parsing and stale-result suppression,
-and the canonical `superlemon.ui` transport/callback lifecycle.
+bounded minimap topology/content/invalidation behavior, buffer and preview
+semantics, evaluated statuslines, keymap ownership and Save As,
+clipboard/user-provider behavior, git parsing and stale-result suppression, and
+the canonical `superlemon.ui` transport/callback lifecycle.

@@ -23,7 +23,12 @@ require("superlemon").setup(1)
 
 local chrome = last_notify("superlemon.chrome")
 H.ok(chrome ~= nil, "chrome state pushed at setup")
-H.eq(chrome, { native_tabs = false, native_statusbar = true }, "g: vars seed the state")
+H.eq(chrome, {
+  native_tabs = false,
+  native_statusbar = true,
+  native_minimap = true,
+  native_scrollbars = false,
+}, "g: vars and native map/scrollbar defaults seed the state")
 
 -- Adopt-by-default (CONTRACT.md): the native bar RELOCATES the statusline
 -- (laststatus=0 while on, restored exactly when off); cmdheight is never
@@ -77,6 +82,14 @@ H.ok(vim.tbl_contains(names, "d.txt"), "latest buffer present after debounce")
 -- chrome_toggle entry point used by the GUI menu.
 require("superlemon").chrome_toggle("tabs")
 H.eq(last_notify("superlemon.chrome").native_tabs, false, "chrome_toggle flips tabs off")
+
+-- Minimap and scrollbar state is independently Neovim-owned.
+vim.cmd("SuperlemonChrome minimap off")
+H.eq(last_notify("superlemon.chrome").native_minimap, false, "minimap off state pushed")
+vim.cmd("SuperlemonChrome scrollbars on")
+H.eq(last_notify("superlemon.chrome").native_scrollbars, true, "scrollbars on state pushed")
+require("superlemon").chrome_toggle("minimap")
+H.eq(last_notify("superlemon.chrome").native_minimap, true, "chrome_toggle flips minimap on")
 
 -- Re-setup stays idempotent with the chrome module in play.
 require("superlemon").setup(1)

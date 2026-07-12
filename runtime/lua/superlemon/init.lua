@@ -34,6 +34,9 @@ function M.setup(channel)
   require("superlemon.clipboard").setup()
   require("superlemon.keymaps").setup()
   require("superlemon.chrome").setup(group)
+  require("superlemon.minimap").setup(
+    group, require("superlemon.chrome").state().native_minimap
+  )
   require("superlemon.git").setup(group)
   require("superlemon.ui").setup()
 
@@ -44,7 +47,7 @@ end
 
 --- GUI menu entry point (View ▸ Native Tabs / Native Status Bar): the menu
 --- is an affordance; this module's state is the truth (CONTRACT.md).
----@param part '"tabs"'|'"statusbar"'
+---@param part '"tabs"'|'"statusbar"'|'"minimap"'|'"scrollbars"'
 function M.chrome_toggle(part)
   require("superlemon.chrome").toggle(part)
 end

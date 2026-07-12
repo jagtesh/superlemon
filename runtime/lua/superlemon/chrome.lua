@@ -2,8 +2,8 @@
 -- `superlemon.chrome` / `superlemon.buffers`).
 --
 -- nvim is the single source of truth for whether the GUI shows native buffer
--- tabs and the native status bar: g:superlemon_native_tabs /
--- g:superlemon_native_statusbar seed the state, :SuperlemonChrome flips it,
+-- tabs, status bar, per-window minimaps, and scrollbars: their corresponding
+-- g:superlemon_native_* globals seed the state, :SuperlemonChrome flips it,
 -- and the GUI merely reflects `superlemon.chrome` notifications.
 --
 -- Native-statusbar adoption is the one deliberate option bridge: by default
@@ -18,6 +18,8 @@ local M = {}
 local state = {
   native_tabs = false,
   native_statusbar = false,
+  native_minimap = true,
+  native_scrollbars = false,
 }
 
 local buffer_timer
@@ -55,6 +57,8 @@ local function push_chrome()
   vim.rpcnotify(vim.g.superlemon_channel, "superlemon.chrome", {
     native_tabs = state.native_tabs,
     native_statusbar = state.native_statusbar,
+    native_minimap = state.native_minimap,
+    native_scrollbars = state.native_scrollbars,
   })
 end
 
@@ -102,7 +106,7 @@ local function schedule_buffers()
   buffer_timer:start(50, 0, vim.schedule_wrap(push_buffers))
 end
 
----@param part '"tabs"'|'"statusbar"'
+---@param part '"tabs"'|'"statusbar"'|'"minimap"'|'"scrollbars"'
 ---@param on boolean
 function M.set(part, on)
   if part == "tabs" then
@@ -124,6 +128,19 @@ function M.set(part, on)
         require("superlemon.statusline").push() -- seed the harvested segments
       end)
     end
+  elseif part == "minimap" then
+    if state.native_minimap == on then
+      return
+    end
+    state.native_minimap = on
+    pcall(function()
+      require("superlemon.minimap").set_enabled(on)
+    end)
+  elseif part == "scrollbars" then
+    if state.native_scrollbars == on then
+      return
+    end
+    state.native_scrollbars = on
   else
     return
   end
@@ -131,26 +148,40 @@ function M.set(part, on)
 end
 
 
----@param part '"tabs"'|'"statusbar"'
+---@param part '"tabs"'|'"statusbar"'|'"minimap"'|'"scrollbars"'
 function M.toggle(part)
   if part == "tabs" then
     M.set(part, not state.native_tabs)
   elseif part == "statusbar" then
     M.set(part, not state.native_statusbar)
+  elseif part == "minimap" then
+    M.set(part, not state.native_minimap)
+  elseif part == "scrollbars" then
+    M.set(part, not state.native_scrollbars)
   end
 end
 
 --- Current toggle state (health checks and tests).
 function M.state()
-  return { native_tabs = state.native_tabs, native_statusbar = state.native_statusbar }
+  return {
+    native_tabs = state.native_tabs,
+    native_statusbar = state.native_statusbar,
+    native_minimap = state.native_minimap,
+    native_scrollbars = state.native_scrollbars,
+  }
 end
 
 function M.setup(group)
-  local function truthy(v)
+  local function truthy(v, default)
+    if v == nil or v == vim.NIL then
+      return default == true
+    end
     return v == 1 or v == true
   end
   state.native_tabs = truthy(vim.g.superlemon_native_tabs)
   state.native_statusbar = truthy(vim.g.superlemon_native_statusbar)
+  state.native_minimap = truthy(vim.g.superlemon_native_minimap, true)
+  state.native_scrollbars = truthy(vim.g.superlemon_native_scrollbars, false)
   apply_adopt_statusline()
   -- Startup-only (explicit user choice in Settings or config): hide the
   -- editor's own tab line (airline/bufferline tabs) — the native strip
@@ -174,9 +205,9 @@ function M.setup(group)
   end, {
     nargs = "+",
     complete = function()
-      return { "tabs", "statusbar" }
+      return { "tabs", "statusbar", "minimap", "scrollbars" }
     end,
-    desc = "Toggle Superlemon native chrome (tabs|statusbar) (on|off|toggle)",
+    desc = "Toggle Superlemon native chrome (tabs|statusbar|minimap|scrollbars) (on|off|toggle)",
   })
 
   push_chrome()

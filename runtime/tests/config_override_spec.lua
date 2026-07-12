@@ -11,6 +11,8 @@ vim.fn.mkdir(override_dir, "p")
 vim.fn.writefile({
   'let g:superlemon_native_tabs = 0',
   'let g:superlemon_powerline_glyphs = 1',
+  'let g:superlemon_native_minimap = 0',
+  'let g:superlemon_minimap_width = 112',
   'set mousescroll=ver:7,hor:5',
   'let g:superlemon_override_marker = "home-init"',
   'let g:superlemon_override_sources = get(g:, "superlemon_override_sources", 0) + 1',
@@ -21,6 +23,8 @@ dofile(H.root() .. "/config/init.lua")
 H.eq(vim.g.superlemon_override_marker, "home-init", "XDG Superlemon init is sourced")
 H.eq(vim.g.superlemon_native_tabs, 0, "home init overrides a bundled chrome value")
 H.eq(vim.g.superlemon_powerline_glyphs, 1, "home init overrides a renderer value")
+H.eq(vim.g.superlemon_native_minimap, 0, "home init overrides the minimap toggle")
+H.eq(vim.g.superlemon_minimap_width, 112, "home init overrides minimap geometry")
 H.eq(vim.o.mousescroll, "ver:7,hor:5", "home init overrides a native option")
 H.eq(vim.g.superlemon_native_statusbar, 1, "unmentioned bundled defaults remain")
 H.eq(vim.g.superlemon_ligatures, 1, "unmentioned renderer defaults remain")
