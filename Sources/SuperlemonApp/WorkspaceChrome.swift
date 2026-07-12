@@ -21,18 +21,23 @@ final class WorkspaceChrome {
     let sidebar = FileTreeSidebarView()
     let quickOpen = QuickOpenPanelController()
     let tabStrip = BufferTabStripView()
-    let fileIndex: FileIndex
+    private(set) var fileIndex: FileIndex
 
     /// Native-chrome toggles, mirrored from nvim (`superlemon.chrome` —
     /// nvim is the source of truth). The app delegate resizes the layout.
     var onChromeModeChange: ((_ nativeTabs: Bool, _ nativeStatusbar: Bool) -> Void)?
+    /// The default Neovim save mapping requests the native sheet for an
+    /// unnamed buffer. AppDelegate supplies the document-panel presentation.
+    var onSaveAsRequested: (() -> Void)?
     private(set) var nativeTabs = false
     private(set) var nativeStatusbar = false
 
     private unowned let controller: NvimController
     private weak var window: NSWindow?
     private weak var surface: GridSurfaceView?
-    private let projectRoot: URL
+    private(set) var projectRoot: URL
+    /// Invalidates quick-open work started against an earlier project root.
+    private var fileIndexGeneration = 0
     private var confirmAlertShowing = false
     /// Identity of the last-presented popup menu: selection changes preserve
     /// it; anything else forces a re-anchor (see syncChrome).
@@ -76,6 +81,35 @@ final class WorkspaceChrome {
         Task { await fileIndex.refresh() }
     }
 
+    /// Re-roots all native workspace chrome after Neovim changes directory.
+    /// Existing buffers remain owned by Neovim; only project-scoped native
+    /// state (tree, quick-open index, decorations, and status metadata) is
+    /// replaced here.
+    func setProjectRoot(_ root: URL) {
+        let root = root.standardizedFileURL
+
+        // A palette must not outlive the index or relative-path root that
+        // produced its rows. Plugin palettes get their normal close callback;
+        // the built-in palette simply dismisses and restores editor focus.
+        uiRouter.closePaletteSession()
+        quickOpen.close()
+
+        fileIndexGeneration &+= 1
+        projectRoot = root
+        fileIndex = FileIndex(root: root)
+
+        sidebar.setGitStatus([:])
+        uiRouter.setProjectRoot(root)
+        sidebar.setRoot(root)
+
+        var status = statusBar.model
+        status.project = root.lastPathComponent
+        statusBar.render(status, dark: isDark)
+
+        let index = fileIndex
+        Task { await index.refresh() }
+    }
+
     // MARK: - Redraw / notification entry points (called by NvimController)
 
     func apply(_ batch: RedrawBatch) {
@@ -90,6 +124,8 @@ final class WorkspaceChrome {
         case "superlemon.font":
             let delta = params.first?["delta"]?.intValue ?? 0
             controller.bumpFont(delta: delta)
+        case "superlemon.save_as":
+            onSaveAsRequested?()
         case "superlemon.settings":
             guard let payload = params.first, payload.mapValue != nil else { return }
             controller.applyRuntimeSettings(payload)
@@ -331,9 +367,12 @@ final class WorkspaceChrome {
     private func wireShell() {
         quickOpen.onQueryChange = { [weak self] query in
             guard let self else { return }
+            let index = self.fileIndex
+            let generation = self.fileIndexGeneration
             Task {
-                let results = await self.fileIndex.query(query)
-                let total = await self.fileIndex.count()
+                let results = await index.query(query)
+                let total = await index.count()
+                guard generation == self.fileIndexGeneration else { return }
                 self.quickOpen.display(
                     results: results.map { QuickOpenResult(path: $0.path, positions: $0.positions) },
                     totalCount: total)

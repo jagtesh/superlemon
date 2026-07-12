@@ -78,6 +78,10 @@ function M.refresh()
 end
 
 local function refresh_debounced()
+  -- Invalidate an in-flight command immediately. DirChanged waits for the
+  -- debounce before starting the next command; without this bump, an old
+  -- cwd's result can land during that window and be applied to the new root.
+  generation = generation + 1
   if not timer then
     timer = vim.uv.new_timer()
   end

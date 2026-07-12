@@ -21,7 +21,7 @@ final class UIComponentRouter {
 
     private unowned let chrome: WorkspaceChrome
     private unowned let controller: NvimController
-    private let projectRoot: URL
+    private var projectRoot: URL
     private let logger = Logger(subsystem: "com.superlemon.app", category: "ui")
 
     /// Namespace-isolated sidebar state; composition rule (sorted by
@@ -31,7 +31,16 @@ final class UIComponentRouter {
     init(chrome: WorkspaceChrome, controller: NvimController, projectRoot: URL) {
         self.chrome = chrome
         self.controller = controller
-        self.projectRoot = projectRoot
+        self.projectRoot = projectRoot.standardizedFileURL
+    }
+
+    /// Updates the base used to resolve cwd-relative component paths. Native
+    /// sidebar decorations belong to the old workspace and are discarded;
+    /// plugins can republish them for the new root.
+    func setProjectRoot(_ root: URL) {
+        projectRoot = root.standardizedFileURL
+        sidebarDecorations = SidebarDecorationStore()
+        pushSidebarDecorations()
     }
 
     // MARK: - Entry point

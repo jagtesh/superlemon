@@ -802,6 +802,75 @@ final class NvimController {
         }
     }
 
+    /// Change Neovim's global working directory, then re-root the native
+    /// sidebar and quick-open index to the same folder. Neovim performs the
+    /// change so `DirChanged` autocmds and user configuration still run.
+    func openFolder(_ absolutePath: String) {
+        guard let session else { return }
+        let root = URL(fileURLWithPath: absolutePath, isDirectory: true).standardizedFileURL
+        Task {
+            do {
+                let currentDirectory = try await session.request(
+                    "nvim_exec_lua",
+                    [
+                        .string(
+                            "local path = ...\n"
+                                + "vim.api.nvim_set_current_dir(path)\n"
+                                + "return vim.fn.getcwd()"),
+                        .array([.string(root.path)]),
+                    ])
+                // Use Neovim's canonical cwd (not the panel's possibly
+                // symlinked URL) so relative native paths resolve identically.
+                let authoritativeRoot = currentDirectory.stringValue
+                    .map { URL(fileURLWithPath: $0, isDirectory: true) }
+                    ?? root
+                chrome?.setProjectRoot(authoritativeRoot)
+            } catch {
+                presentInfoAlert(
+                    "Couldn’t open folder",
+                    detail: String(describing: error))
+            }
+        }
+    }
+
+    /// Absolute name of the current buffer, or nil for an unnamed/special
+    /// buffer. Used only to seed the native Save As panel; Neovim remains
+    /// responsible for writing and renaming the buffer.
+    func currentBufferPath() async -> String? {
+        guard let session else { return nil }
+        guard
+            let name = try? await session.request(
+                "nvim_buf_get_name", [.int(0)]),
+            let path = name.stringValue,
+            !path.isEmpty,
+            !path.contains("://")
+        else { return nil }
+        return path
+    }
+
+    /// Save the current buffer under a new name. NSSavePanel has already
+    /// confirmed replacement, hence `bang = true`; routing the operation
+    /// through `nvim_cmd` preserves encoding, autocmds, undo, and buffer state.
+    func saveFile(as absolutePath: String) {
+        guard let session else { return }
+        Task {
+            do {
+                _ = try await session.request(
+                    "nvim_exec_lua",
+                    [
+                        .string(
+                            "vim.api.nvim_cmd({ cmd = 'saveas', args = { ... }, bang = true }, {})"
+                        ),
+                        .array([.string(absolutePath)]),
+                    ])
+            } catch {
+                presentInfoAlert(
+                    "Couldn’t save file",
+                    detail: String(describing: error))
+            }
+        }
+    }
+
     /// Create a durable user-owned settings file from the bundled annotated
     /// template on first use, then open it in Neovim. The managed init sources
     /// `$XDG_CONFIG_HOME/superlemon/init.vim` after the bundled baseline.

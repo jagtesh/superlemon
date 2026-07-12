@@ -8,9 +8,39 @@ if vim.fn.executable("git") == 0 then
 end
 
 local calls = H.stub_gui()
+
+-- A directory change must invalidate an old cwd's in-flight result
+-- immediately, before the 150 ms debounce starts the replacement command.
+local real_system = vim.system
+local pending_callbacks = {}
+vim.system = function(_, _, callback)
+  pending_callbacks[#pending_callbacks + 1] = callback
+  return {}
+end
 require("superlemon").setup(1)
 
 local git = require("superlemon.git")
+
+local function git_push_count()
+  local count = 0
+  for _, call in ipairs(calls.notify) do
+    if call.method == "superlemon.git" then
+      count = count + 1
+    end
+  end
+  return count
+end
+
+local pushes_before_dir_change = git_push_count()
+vim.api.nvim_exec_autocmds("DirChanged", { modeline = false })
+pending_callbacks[1]({ code = 0, stdout = "?? stale-from-old-root.txt\0" })
+vim.wait(50)
+H.eq(
+  git_push_count(),
+  pushes_before_dir_change,
+  "DirChanged immediately suppresses an in-flight old-root result"
+)
+vim.system = real_system
 
 -- Porcelain parsing (pure).
 local parsed = git.parse_porcelain(table.concat({

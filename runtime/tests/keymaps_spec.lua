@@ -27,6 +27,13 @@ H.ok(vim.fn.maparg("<D-0>", "n") ~= "", "default <D-0> installed")
 local keymaps = require("superlemon.keymaps")
 H.ok(keymaps.installed > 0, "keymaps.installed count > 0")
 
+-- The default save flow delegates an unnamed buffer to the native sheet.
+local before_save = #calls.notify
+keymaps.save()
+H.eq(#calls.notify, before_save + 1, "unnamed save requests native Save As")
+H.eq(calls.notify[#calls.notify].method, "superlemon.save_as", "Save As notification method")
+H.eq(calls.notify[#calls.notify].chan, 4, "Save As notification channel")
+
 -- Idempotent re-setup keeps our maps and still skips the user's.
 require("superlemon").setup(4)
 H.ok(vim.fn.maparg("<D-s>", "n"):find("user%-save") ~= nil, "user map still wins after re-setup")

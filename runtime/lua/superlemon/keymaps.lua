@@ -22,6 +22,20 @@ function M.font_bump(delta)
   vim.rpcnotify(chan, "superlemon.font", { delta = delta })
 end
 
+--- Save through Neovim when the buffer is named; ask the GUI for its native
+--- Save As sheet when it is not. This remains behind the default `<D-s>`
+--- mapping, so a mapping supplied by the user still replaces the whole flow.
+function M.save()
+  if vim.api.nvim_buf_get_name(0) == "" then
+    local chan = vim.g.superlemon_channel
+    if chan ~= nil then
+      vim.rpcnotify(chan, "superlemon.save_as")
+    end
+    return
+  end
+  vim.cmd.write()
+end
+
 ---@param mode string
 ---@param lhs string
 ---@param rhs string|function
@@ -52,10 +66,11 @@ function M.setup()
   local bump_reset = function() M.font_bump(0) end
 
   local defaults = {
-    -- <D-s> write; <Cmd> keeps insert/visual state intact
-    { "n", "<D-s>", "<Cmd>write<CR>" },
-    { "i", "<D-s>", "<Cmd>write<CR>" },
-    { "x", "<D-s>", "<Cmd>write<CR>" },
+    -- <D-s> writes named buffers; unnamed buffers request native Save As.
+    -- Lua callbacks, like <Cmd>, keep insert/visual state intact.
+    { "n", "<D-s>", M.save },
+    { "i", "<D-s>", M.save },
+    { "x", "<D-s>", M.save },
 
     -- <D-a> select all
     { "n", "<D-a>", "ggVG" },

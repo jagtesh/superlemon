@@ -140,6 +140,15 @@ user's own statusline and the round trip is lossless. Opt out with
 `vim.g.superlemon_adopt_statusline = 0` to keep both bars. No other option
 is ever touched.
 
+### `superlemon.font`
+`{ delta = 1 | -1 | 0 }` — GUI adjusts guifont size (+/-) or resets to default.
+
+### `superlemon.save_as`
+No payload. The default `<D-s>` mapping emits this for an unnamed buffer;
+the GUI presents its native Save As sheet and completes the operation through
+Neovim's `:saveas`. Named buffers use `:write` directly. A user-owned
+`<D-s>` mapping replaces this default flow as usual.
+
 ### `superlemon.git`
 One map argument; pushed (debounced ~150 ms) on BufWritePost/FocusGained/
 DirChanged/VimResume plus once at setup. Gathered asynchronously via
@@ -205,7 +214,7 @@ and `*`. `lines` is a list of strings, `regtype` "v"/"V"/"b".
 ## GUI → nvim  (all via `nvim_input` / standard API — no custom methods)
 
 - Every ⌘-chord arrives as `<D-x>` through `nvim_input`. The plugin defines
-  DEFAULT mappings for: `<D-s>` write, `<D-a>` select all, `<D-c>` `"+y`,
+  DEFAULT mappings for: `<D-s>` save, `<D-a>` select all, `<D-c>` `"+y`,
   `<D-x>` `"+d` (visual), `<D-z>` undo / `<D-S-z>` redo, `<D-n>` `:enew`,
   `<D-=>`/`<D-->`/`<D-0>` font size (call `superlemon.font_bump(1|-1|0)`
   which rpcnotifies `superlemon.font` with `{delta = n}`). Use
@@ -214,9 +223,6 @@ and `*`. `lines` is a list of strings, `regtype` "v"/"V"/"b".
   `vim.fn.maparg(lhs, mode) == ""`. Set
   `g:superlemon_default_keymaps = 0` to disable every default at once.
 - Sidebar file operations use `:edit`/`:drop` via `nvim_command` (GUI side).
-
-### `superlemon.font`
-`{ delta = 1 | -1 | 0 }` — GUI adjusts guifont size (+/-) or resets to default.
 
 ## Guarantees
 

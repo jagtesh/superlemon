@@ -19,6 +19,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private var sidebarPane: NSView?
     private var appearanceObservation: NSKeyValueObservation?
     private var settings: SettingsWindowController?
+    private var savePanelIsOpen = false
 
     @objc private func showSettings(_ sender: Any?) {
         guard let controller else { return }
@@ -98,6 +99,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         let chrome = WorkspaceChrome(controller: controller, projectRoot: projectRoot)
         self.chrome = chrome
         controller.chrome = chrome
+        chrome.onSaveAsRequested = { [weak self] in self?.presentSaveAs() }
 
         // FontSpec default (nil name → system mono 13pt) until guifont arrives.
         let surface = GridSurfaceView(frame: contentRect, font: FontSpec())
@@ -184,6 +186,117 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
 
     // MARK: - Menu actions
+
+    @objc private func showAbout(_ sender: Any?) {
+        let legalParagraph = NSMutableParagraphStyle()
+        legalParagraph.alignment = .center
+        legalParagraph.lineSpacing = 1
+        legalParagraph.paragraphSpacing = 10
+
+        let bodyParagraph = NSMutableParagraphStyle()
+        bodyParagraph.alignment = .center
+        bodyParagraph.lineSpacing = 1
+
+        let credits = NSMutableAttributedString(
+            string:
+                "Copyright © 2026 Jagtesh Chadha\u{2028}"
+                + "Licensed under the BSD 3-Clause License\n",
+            attributes: [
+                .font: NSFont.systemFont(
+                    ofSize: NSFont.smallSystemFontSize, weight: .semibold),
+                .foregroundColor: NSColor.labelColor,
+                .paragraphStyle: legalParagraph,
+            ])
+        credits.append(NSAttributedString(
+            string:
+                "Superlemon stands on the shoulders of giants: Vim, Neovim, and "
+                + "Sublime Text—three of my favourite editors. They inspired its "
+                + "editing behaviour, feel, and layout, while Neovim’s exceptional "
+                + "client–server architecture powers it.",
+            attributes: [
+                .font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize),
+                .foregroundColor: NSColor.labelColor,
+                .paragraphStyle: bodyParagraph,
+            ]))
+
+        NSApp.orderFrontStandardAboutPanel(options: [
+            .applicationName: "Superlemon",
+            .credits: credits,
+        ])
+    }
+
+    @objc private func openFile(_ sender: Any?) {
+        guard let controller else { return }
+        Task { [weak self, weak controller] in
+            guard let self, let controller, let window = self.window else { return }
+            let panel = NSOpenPanel()
+            panel.title = "Open File"
+            panel.prompt = "Open"
+            panel.directoryURL = self.chrome?.projectRoot ?? NvimController.workingDirectory()
+            panel.canChooseFiles = true
+            panel.canChooseDirectories = false
+            panel.allowsMultipleSelection = false
+            panel.resolvesAliases = true
+            let response = await panel.beginSheetModal(for: window)
+            guard response == .OK, let url = panel.url else { return }
+            controller.openFile(url.path)
+        }
+    }
+
+    @objc private func openFolder(_ sender: Any?) {
+        guard let controller else { return }
+        Task { [weak self, weak controller] in
+            guard let self, let controller, let window = self.window else { return }
+            let panel = NSOpenPanel()
+            panel.title = "Open Folder"
+            panel.prompt = "Open"
+            panel.directoryURL = self.chrome?.projectRoot ?? NvimController.workingDirectory()
+            panel.canChooseFiles = false
+            panel.canChooseDirectories = true
+            panel.canCreateDirectories = true
+            panel.allowsMultipleSelection = false
+            panel.resolvesAliases = true
+            let response = await panel.beginSheetModal(for: window)
+            guard response == .OK, let url = panel.url else { return }
+            controller.openFolder(url.path)
+        }
+    }
+
+    /// Keep File ▸ Save in the same remappable namespace as keyboard input.
+    /// The bundled mapping saves by default; a user's `<D-s>` mapping wins.
+    @objc private func saveFile(_ sender: Any?) {
+        controller?.sendInput("<D-s>")
+    }
+
+    @objc private func saveFileAs(_ sender: Any?) {
+        presentSaveAs()
+    }
+
+    private func presentSaveAs() {
+        guard !savePanelIsOpen, let controller, let window else { return }
+        savePanelIsOpen = true
+        Task { [weak self, controller, window] in
+            guard let self else { return }
+            defer { self.savePanelIsOpen = false }
+            let currentPath = await controller.currentBufferPath()
+            let panel = NSSavePanel()
+            panel.title = "Save File As"
+            panel.prompt = "Save"
+            panel.canCreateDirectories = true
+            panel.isExtensionHidden = false
+            if let currentPath {
+                let currentURL = URL(fileURLWithPath: currentPath)
+                panel.directoryURL = currentURL.deletingLastPathComponent()
+                panel.nameFieldStringValue = currentURL.lastPathComponent
+            } else {
+                panel.directoryURL = self.chrome?.projectRoot ?? NvimController.workingDirectory()
+                panel.nameFieldStringValue = "Untitled"
+            }
+            let response = await panel.beginSheetModal(for: window)
+            guard response == .OK, let url = panel.url else { return }
+            controller.saveFile(as: url.path)
+        }
+    }
 
     @objc private func presentQuickOpen(_ sender: Any?) {
         chrome?.presentQuickOpen()
@@ -289,11 +402,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         mainMenu.addItem(appItem)
         let appMenu = NSMenu()
         appItem.submenu = appMenu
-        appMenu.addItem(
-            NSMenuItem(
-                title: "About Superlemon",
-                action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
-                keyEquivalent: ""))
+        let aboutItem = NSMenuItem(
+            title: "About Superlemon",
+            action: #selector(showAbout(_:)),
+            keyEquivalent: "")
+        aboutItem.target = self
+        appMenu.addItem(aboutItem)
         appMenu.addItem(.separator())
         let settingsItem = NSMenuItem(
             title: "Settings…",
@@ -307,11 +421,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                 action: #selector(NSApplication.terminate(_:)),
                 keyEquivalent: "q"))
 
-        // File menu: Close routed like ⌘Q (via windowShouldClose).
+        // File menu: native panels choose paths; Neovim owns all buffer I/O.
         let fileItem = NSMenuItem()
         mainMenu.addItem(fileItem)
         let fileMenu = NSMenu(title: "File")
         fileItem.submenu = fileMenu
+
+        let openFileItem = NSMenuItem(
+            title: "Open File…",
+            action: #selector(openFile(_:)),
+            keyEquivalent: "o")
+        openFileItem.target = self
+        fileMenu.addItem(openFileItem)
+
+        let openFolderItem = NSMenuItem(
+            title: "Open Folder…",
+            action: #selector(openFolder(_:)),
+            keyEquivalent: "o")
+        openFolderItem.keyEquivalentModifierMask = [.command, .shift]
+        openFolderItem.target = self
+        fileMenu.addItem(openFolderItem)
+
+        fileMenu.addItem(.separator())
+
+        let saveItem = NSMenuItem(
+            title: "Save",
+            action: #selector(saveFile(_:)),
+            keyEquivalent: "s")
+        saveItem.target = self
+        fileMenu.addItem(saveItem)
+
+        let saveAsItem = NSMenuItem(
+            title: "Save As…",
+            action: #selector(saveFileAs(_:)),
+            keyEquivalent: "s")
+        saveAsItem.keyEquivalentModifierMask = [.command, .shift]
+        saveAsItem.target = self
+        fileMenu.addItem(saveAsItem)
+
+        fileMenu.addItem(.separator())
         fileMenu.addItem(
             NSMenuItem(
                 title: "Close",
