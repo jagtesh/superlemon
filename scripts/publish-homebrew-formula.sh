@@ -48,7 +48,7 @@ if [[ -z $(git status --porcelain -- Formula/superlemon.rb Casks/superlemon.rb) 
   exit 0
 fi
 
-git add -A Formula/superlemon.rb Casks/superlemon.rb
+git add -A
 git commit -m "Update Superlemon to $version"
 git push origin HEAD
 
