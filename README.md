@@ -4,10 +4,22 @@
   <img src="assets/superlemon-icon.png" alt="Superlemon icon" width="160">
 </p>
 
-Superlemon is a native macOS code editor with Neovim at its core. Neovim owns
-editing, buffers, mappings, plugins, highlighting, and undo; Superlemon adds a
-fast AppKit interface with smooth scrolling, a file tree, buffer tabs, Quick
-Open, a minimap, native command UI, and proper Mac keyboard and IME support.
+Superlemon grew out of a love for Sublime Text's speed and native feel, and for
+Neovim's expressive editing model. It brings those ideas together without
+adding a Vim-emulation layer: Neovim is the editor. It remains authoritative
+for buffers, modes, mappings, plugins, highlighting, undo, and every final grid
+frame.
+
+Superlemon is the native macOS application built around that engine. It turns
+Neovim state into AppKit windows, pixels, motion, menus, panels, and gestures—
+about as far as a native Mac integration can go without forking Neovim itself.
+The result includes smooth display-linked scrolling, a native file browser,
+Quick Open, a minimap, a buffer tab bar, and a command/status bar integrated
+into the main window, plus proper Mac keyboard and IME support.
+
+This is still Neovim, not merely an editor with a Vim mode. Your mappings and
+Neovim plugins continue to work through your configuration, while Superlemon
+adds native Mac surfaces where they improve the experience.
 
 ![Superlemon in action](media/superlemon-demo.gif)
 
@@ -39,9 +51,13 @@ open dist/Superlemon.app
 
 ## Configure
 
-The managed configuration lives in `runtime/config/`. Put personal overrides
-in `~/.config/superlemon/init.vim`, or choose another Neovim init from
-**Superlemon → Settings…**. Common development overrides are:
+The managed configuration lives in `runtime/config/`. Personal overrides belong
+in `~/.config/superlemon/init.vim`; because Neovim remains the editor, this file
+can also load ordinary Neovim plugins and define mappings just like any other
+Neovim configuration. You can instead choose your existing Neovim init from
+**Superlemon → Settings…**.
+
+Common development overrides are:
 
 | Variable | Purpose |
 | --- | --- |
