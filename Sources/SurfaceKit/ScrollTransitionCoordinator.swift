@@ -6,20 +6,23 @@ import QuartzCore
 public enum ScrollMotionStyle: Sendable, Equatable {
     /// Present every authoritative Neovim frame without interpolation.
     case immediate
-    /// Reconcile discrete viewport rows with a short display-linked spring.
+    /// Reconcile discrete viewport rows with a display-linked motion envelope.
     case tightNative
 }
 
-/// Neovide's analytical critically damped spring, expressed in line units.
-/// New input changes `position` and deliberately leaves `velocity` intact.
+/// Analytical critically damped spring used for the cursor's short correction.
 struct CriticalDampedSpring: Equatable {
     var position: CGFloat = 0
     var velocity: CGFloat = 0
     var animationLength: CFTimeInterval = 0.300
 
+    var angularFrequency: CGFloat {
+        CGFloat(4 / max(0.001, animationLength))
+    }
+
     mutating func advance(by elapsed: CFTimeInterval) {
         guard elapsed > 0 else { return }
-        let omega = CGFloat(4 / max(0.001, animationLength))
+        let omega = angularFrequency
         let time = CGFloat(elapsed)
         let a = position
         let b = position * omega + velocity
@@ -33,22 +36,122 @@ struct CriticalDampedSpring: Equatable {
         velocity = 0
     }
 
-    /// Bound a discontinuous retarget to a single, non-overshooting cue.
-    /// Ordinary input never calls this and therefore preserves full velocity.
-    mutating func constrainVelocityTowardTarget() {
-        let omega = CGFloat(4 / max(0.001, animationLength))
-        let criticalLimit = -position * omega
-        if position < 0 {
-            velocity = min(max(0, velocity), criticalLimit)
-        } else if position > 0 {
-            velocity = max(min(0, velocity), criticalLimit)
-        } else {
-            velocity = 0
+    var isSettled: Bool {
+        abs(position) < 0.01 && abs(velocity) < 0.10
+    }
+}
+
+struct ScrollMotionSample: Equatable {
+    var position: CGFloat = 0
+    var velocity: CGFloat = 0
+    var acceleration: CGFloat = 0
+
+    static func + (lhs: Self, rhs: Self) -> Self {
+        Self(
+            position: lhs.position + rhs.position,
+            velocity: lhs.velocity + rhs.velocity,
+            acceleration: lhs.acceleration + rhs.acceleration)
+    }
+}
+
+/// A quintic minimum-jerk residual that reaches rest with continuous position,
+/// velocity, and acceleration. The residual begins at `initial.position` and
+/// ends at zero; adding `-delta` when the authoritative viewport rotates keeps
+/// the visible camera stationary without injecting a velocity/acceleration
+/// tooth at the row boundary.
+struct MinimumJerkScrollSegment: Equatable {
+    let initial: ScrollMotionSample
+    let duration: CFTimeInterval
+    private(set) var elapsed: CFTimeInterval = 0
+
+    init(initial: ScrollMotionSample, duration: CFTimeInterval) {
+        self.initial = initial
+        self.duration = max(0.001, duration)
+    }
+
+    var isFinished: Bool { elapsed >= duration }
+
+    var sample: ScrollMotionSample {
+        guard !isFinished else { return ScrollMotionSample() }
+        let u = CGFloat(min(1, max(0, elapsed / duration)))
+        let u2 = u * u
+        let u3 = u2 * u
+        let u4 = u3 * u
+        let u5 = u4 * u
+        let time = CGFloat(duration)
+
+        // Quintic Hermite basis for initial position/velocity/acceleration,
+        // with final position/velocity/acceleration all equal to zero.
+        let hPosition = 1 - 10 * u3 + 15 * u4 - 6 * u5
+        let hVelocity = u - 6 * u3 + 8 * u4 - 3 * u5
+        let hAcceleration = 0.5 * (u2 - 3 * u3 + 3 * u4 - u5)
+
+        let dhPosition = -30 * u2 + 60 * u3 - 30 * u4
+        let dhVelocity = 1 - 18 * u2 + 32 * u3 - 15 * u4
+        let dhAcceleration = u - 4.5 * u2 + 6 * u3 - 2.5 * u4
+
+        let ddhPosition = -60 * u + 180 * u2 - 120 * u3
+        let ddhVelocity = -36 * u + 96 * u2 - 60 * u3
+        let ddhAcceleration = 1 - 9 * u + 18 * u2 - 10 * u3
+
+        return ScrollMotionSample(
+            position: hPosition * initial.position
+                + hVelocity * time * initial.velocity
+                + hAcceleration * time * time * initial.acceleration,
+            velocity: dhPosition * initial.position / time
+                + dhVelocity * initial.velocity
+                + dhAcceleration * time * initial.acceleration,
+            acceleration: ddhPosition * initial.position / (time * time)
+                + ddhVelocity * initial.velocity / time
+                + ddhAcceleration * initial.acceleration)
+    }
+
+    mutating func advance(by elapsed: CFTimeInterval) {
+        self.elapsed = min(duration, self.elapsed + max(0, elapsed))
+    }
+}
+
+/// A gesture-level camera envelope. Every authoritative displacement adds a
+/// C2 residual pulse; overlapping pulses turn repeated rows into one smooth
+/// velocity envelope without changing derivatives at insertion boundaries.
+struct ContinuousScrollEnvelope: Equatable {
+    private(set) var segments: [MinimumJerkScrollSegment] = []
+
+    var sample: ScrollMotionSample {
+        segments.reduce(ScrollMotionSample()) { $0 + $1.sample }
+    }
+    var position: CGFloat { sample.position }
+    var velocity: CGFloat { sample.velocity }
+    var acceleration: CGFloat { sample.acceleration }
+    var isActive: Bool { !segments.isEmpty }
+    var negativeMagnitude: CGFloat {
+        -segments.reduce(CGFloat.zero) { result, segment in
+            result + min(0, segment.sample.position)
+        }
+    }
+    var positiveMagnitude: CGFloat {
+        segments.reduce(CGFloat.zero) { result, segment in
+            result + max(0, segment.sample.position)
         }
     }
 
-    var isSettled: Bool {
-        abs(position) < 0.01 && abs(velocity) < 0.10
+    mutating func add(positionOffset: CGFloat, duration: CFTimeInterval) {
+        guard positionOffset != 0 else { return }
+        segments.append(MinimumJerkScrollSegment(
+            initial: ScrollMotionSample(position: positionOffset),
+            duration: duration))
+    }
+
+    mutating func advance(by elapsed: CFTimeInterval) {
+        guard elapsed > 0 else { return }
+        for index in segments.indices {
+            segments[index].advance(by: elapsed)
+        }
+        segments.removeAll(where: \.isFinished)
+    }
+
+    mutating func settle() {
+        segments.removeAll(keepingCapacity: true)
     }
 }
 
@@ -163,6 +266,8 @@ package struct ScrollDiagnosticSample: Sendable, Equatable {
     package let historyHead: Int
     package let position: CGFloat
     package let velocity: CGFloat
+    package let acceleration: CGFloat
+    package let snappedTranslationPixels: Int
     package let cursorAuthoritativeY: CGFloat?
     package let cursorVisualY: CGFloat?
 }
@@ -189,11 +294,15 @@ private struct VeilSnapshotSource: @unchecked Sendable {
 /// crossed and translates one clipped container between those boundaries.
 @MainActor
 final class SmoothViewportState {
+    /// At this width, three 60 ms row steps already overlap; denser wheel and
+    /// key-repeat streams converge on a nearly flat, continuous velocity.
+    private static let motionEnvelopeDuration: CFTimeInterval = 0.180
+
     let gridID: Int
 
     private(set) var geometry = SmoothViewportGeometry(rows: 0, cols: 0, margins: nil)
     private(set) var history = CircularRowHistory<SharedImageRow>(capacity: 0)
-    private(set) var spring = CriticalDampedSpring()
+    private(set) var motion = ContinuousScrollEnvelope()
     private(set) var isActive = false
     private(set) var lastSemanticDelta = 0
 
@@ -256,8 +365,17 @@ final class SmoothViewportState {
         clipLayer.addSublayer(glowLayer)
     }
 
-    var position: CGFloat { spring.position }
-    var velocity: CGFloat { spring.velocity }
+    var position: CGFloat { motion.position }
+    var velocity: CGFloat { motion.velocity }
+    var acceleration: CGFloat { motion.acceleration }
+    var snappedTranslationY: CGFloat {
+        lastTranslationY.isFinite
+            ? lastTranslationY
+            : pixelSnap(motion.position * cellSize.height, scale: scale)
+    }
+    var snappedTranslationPixels: Int {
+        Int((snappedTranslationY * scale).rounded())
+    }
     var historyHead: Int { history.head }
     /// Kept for source compatibility with the previous transient overlay.
     /// It is now the permanent clipped exact-row viewport.
@@ -343,7 +461,7 @@ final class SmoothViewportState {
             self.cellSize = cellSize
             self.scale = nextScale
             rebuildLayers()
-            spring.settle()
+            motion.settle()
             isActive = false
             deactivateVeil()
             authoritativeRows = nextRows
@@ -379,8 +497,8 @@ final class SmoothViewportState {
                 if !eligible { settle() }
             } else {
                 // Coalesced reversal can return to the same viewport. It is
-                // still compatible motion: preserve an existing trajectory
-                // and velocity, but do not invent motion from rest.
+                // still compatible motion. Existing signed pulses continue;
+                // zero-net input adds no artificial camera movement.
                 eligible = semanticMotion?.hasMovement == true && isActive
             }
         }
@@ -390,12 +508,12 @@ final class SmoothViewportState {
         seedCurrentRows()
 
         if eligible, hasAuthoritativeRows {
-            lastSemanticDelta = delta != 0 ? delta : (semanticMotion?.lastDelta ?? 0)
-            isActive = true
+            lastSemanticDelta = semanticMotion?.lastDelta ?? delta
+            isActive = motion.isActive
         }
         render(forceBindings: false)
         scheduleVeilSnapshot()
-        return eligible && hasAuthoritativeRows
+        return eligible && hasAuthoritativeRows && (isActive || isVeilActive)
     }
 
     /// Integrate in <= 1/120-second steps. Only the latest analytical result
@@ -403,13 +521,16 @@ final class SmoothViewportState {
     @discardableResult
     func advance(
         by elapsed: CFTimeInterval,
-        nominalDisplayPeriod: CFTimeInterval = 1.0 / 60.0
+        nominalDisplayPeriod: CFTimeInterval = 1.0 / 60.0,
+        detectDisplayGap: Bool = true
     ) -> Bool {
         guard isActive || isVeilActive else { return false }
         let bounded = min(max(0, elapsed), 1.0)
         let nominal = max(1.0 / 240.0, nominalDisplayPeriod)
 
-        if isActive, bounded >= nominal * 2, lastSemanticDelta != 0 {
+        if detectDisplayGap, isActive, bounded >= nominal * 2,
+            lastSemanticDelta != 0
+        {
             // The delayed callback itself is the end of this measured gap;
             // exact current rows are already installed beneath the veil.
             activateVeil(direction: lastSemanticDelta.signum(), resolved: true)
@@ -427,18 +548,9 @@ final class SmoothViewportState {
         receivedInputWhileClamped = false
 
         if isActive {
-            var remaining = bounded
-            let maximumStep: CFTimeInterval = 1.0 / 120.0
-            while remaining > 0 {
-                let step = min(remaining, maximumStep)
-                spring.advance(by: step)
-                remaining -= step
-            }
-
-            let hasNoPixelResidual =
-                (spring.position * cellSize.height * scale).rounded() == 0
-            if spring.isSettled, hasNoPixelResidual {
-                spring.settle()
+            motion.advance(by: bounded)
+            if !motion.isActive {
+                motion.settle()
                 isActive = false
                 lastSemanticDelta = 0
                 discardNonCurrentHistory()
@@ -451,7 +563,7 @@ final class SmoothViewportState {
     }
 
     func settle() {
-        spring.settle()
+        motion.settle()
         isActive = false
         lastSemanticDelta = 0
         receivedInputWhileClamped = false
@@ -497,8 +609,10 @@ final class SmoothViewportState {
     ) -> ScrollDiagnosticSample {
         ScrollDiagnosticSample(
             timestamp: timestamp, gridID: gridID, delta: lastSemanticDelta,
-            historyHead: history.head, position: spring.position,
-            velocity: spring.velocity, cursorAuthoritativeY: cursorAuthoritativeY,
+            historyHead: history.head, position: motion.position,
+            velocity: motion.velocity, acceleration: motion.acceleration,
+            snappedTranslationPixels: snappedTranslationPixels,
+            cursorAuthoritativeY: cursorAuthoritativeY,
             cursorVisualY: cursorVisualY)
     }
 
@@ -523,18 +637,28 @@ final class SmoothViewportState {
         shiftFilmstripSlots(by: -animatedDelta)
 
         if trueFar {
-            spring.position = -CGFloat(animatedDelta)
-            spring.constrainVelocityTowardTarget()
+            motion.settle()
+            motion.add(
+                positionOffset: -CGFloat(animatedDelta),
+                duration: Self.motionEnvelopeDuration)
             activateVeil(direction: direction, resolved: true)
         } else {
-            let proposed = spring.position - CGFloat(delta)
             let capacity = CGFloat(height)
-            let bounded = min(capacity, max(-capacity, proposed))
-            receivedInputWhileClamped = receivedInputWhileClamped || bounded != proposed
-            spring.position = bounded
+            let requestedOffset = -CGFloat(delta)
+            let representableOffset: CGFloat
+            if requestedOffset < 0 {
+                let available = max(0, capacity - motion.negativeMagnitude)
+                representableOffset = max(requestedOffset, -available)
+            } else {
+                let available = max(0, capacity - motion.positiveMagnitude)
+                representableOffset = min(requestedOffset, available)
+            }
+            receivedInputWhileClamped = receivedInputWhileClamped
+                || representableOffset != requestedOffset
+            motion.add(
+                positionOffset: representableOffset,
+                duration: Self.motionEnvelopeDuration)
         }
-        // Velocity is intentionally preserved, including through reversals
-        // and cumulative-debt clamping.
         return true
     }
 
@@ -714,7 +838,7 @@ final class SmoothViewportState {
 
     private func render(forceBindings: Bool) {
         guard hasAuthoritativeRows, !rowSlots.isEmpty else { return }
-        let firstRow = Int(floor(spring.position))
+        let firstRow = Int(floor(motion.position))
         let needsBindings = forceBindings || rowsNeedBinding || firstRow != lastBoundFirstRow
         if needsBindings {
             let desiredRows = Array(firstRow...(firstRow + geometry.innerRows))
@@ -763,7 +887,7 @@ final class SmoothViewportState {
         lastBoundFirstRow = firstRow
 
         let translation = pixelSnap(
-            spring.position * cellSize.height, scale: scale)
+            motion.position * cellSize.height, scale: scale)
         if translation != lastTranslationY {
             rowContainerLayer.setAffineTransform(
                 CGAffineTransform(translationX: 0, y: translation))
@@ -786,8 +910,8 @@ final class SmoothViewportState {
     }
 
     /// Move bound slots into the new history coordinate space without
-    /// touching contents. The simultaneous spring retarget cancels this frame
-    /// shift visually; only newly exposed edge slots need a new image.
+    /// touching contents. The simultaneous envelope retarget cancels this
+    /// frame shift visually; only newly exposed edge slots need a new image.
     private func shiftFilmstripSlots(by logicalRows: Int) {
         guard logicalRows != 0 else { return }
         for index in rowSlots.indices {

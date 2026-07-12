@@ -341,23 +341,41 @@ Each grid has an independent `SmoothViewportState`:
 - only the clipped row container translates each display tick;
 - row layers rebind when an integer boundary is crossed or a row revision
   changes; and
-- translation is snapped to physical backing pixels.
+- analytical motion remains fractional in row units, while the container's
+  presented translation alone is snapped to physical backing pixels.
 
 The first scroll from idle presents immediately. While compatible motion is
-active, later scroll-only flushes may accumulate in GridStore and are consumed
-at the start of the next shared display callback. Immediate model changes drain
-pending scroll state before presenting.
+active, later scroll-only flushes may accumulate in GridStore. The next shared
+display callback first advances existing motion to the frame's
+`targetTimestamp`, then consumes and retargets the pending rows in the same
+disabled-actions transaction. A new delta is therefore never pre-aged by the
+interval before it arrived. Immediate model changes still drain pending scroll
+state before presenting.
 
-The motion model is a 0.3-second analytical critically damped spring in row
-units. New deltas retarget position without zeroing velocity, including through
-reversals. Delayed display intervals are integrated in steps no larger than
-1/120 second while only the final result is rendered.
+The motion model is a gesture-level sum of analytical 180 ms quintic
+minimum-jerk residuals in row units. When the authoritative viewport advances
+by `d` rows, a new residual begins at `-d` with zero velocity and acceleration.
+That position exactly cancels the discrete row rotation for the current frame,
+while the zero derivatives leave the existing envelope's velocity and
+acceleration unchanged. Each residual reaches zero position, velocity, and
+acceleration at its endpoint. Row arrivals and completed residuals are therefore
+C2-continuous in the visual camera rather than repeatedly retargeting a spring.
+
+Consecutive rows overlap in the same envelope. A lone row retains a finite
+start and stop, while three to five closely spaced rows already share a smooth
+velocity curve; additions and reversals do not insert a velocity or acceleration
+tooth. Coalesced rows add their net residual once at presentation time, so no
+unseen delta is pre-aged. Position, velocity, and acceleration are evaluated
+analytically at the display target. Retina snapping is a presentation-only
+operation and is never fed back into the envelope.
 
 A jump is considered truly far only when one incoming semantic step exceeds the
-inner viewport height. Many individually valid steps keep history and velocity
-even if cumulative visual debt reaches a screen. Debt clamps to retained
-capacity. A true far jump discards unavailable history and shows a final
-one-line directional cue.
+inner viewport height. Many individually valid steps keep their overlapping
+residuals even if cumulative visual debt reaches a screen. Positive and negative
+residual magnitudes consume independent retained-history budgets; each budget is
+capped at one inner viewport so cancellation cannot hide debt that later grows
+beyond available rows. A true far jump discards unavailable history and active
+residuals, then shows one final 180 ms, one-line directional cue.
 
 Horizontal scrolls, mismatched semantic/pixel directions, resize/layout changes,
 and conflicting partial scroll regions settle and present atomically.
@@ -370,6 +388,10 @@ when exact retained history cannot represent the transition:
 - a true beyond-screen jump;
 - clamped debt receiving new input for two display periods; or
 - a measured display callback gap of at least two periods.
+
+The first callback measures lateness from its resume time, excluding the extra
+target-frame horizon. Ordinary resume scheduling does not trigger the veil, but
+a real two-period stall immediately after resume still does.
 
 The veil uses a throttled quarter-resolution snapshot assembled off-main from
 immutable row images. It is softly magnified and directionally offset, with a
@@ -386,8 +408,9 @@ restarting blink.
 - `.immediate` installs every authoritative frame without interpolation.
 
 `NSWorkspace.accessibilityDisplayShouldReduceMotion` is observed live. Reduce
-Motion settles all springs and scheduled presentation immediately and bypasses
-interpolation and veil behavior.
+Motion settles all viewport envelopes, the cursor correction spring, and
+scheduled presentation immediately, then bypasses interpolation and veil
+behavior.
 
 ### Resize and backing changes
 
@@ -465,8 +488,10 @@ opacity temporarily.
 
 Scroll frames emit `os_signpost` events and can record a bounded in-memory
 diagnostic ring when `SUPERLEMON_SCROLL_TRACE=1` or a test hook is installed.
-Samples include time, semantic delta, history head, spring position/velocity,
-and authoritative/visual cursor Y.
+Samples include time, semantic delta, history head, envelope position, velocity,
+and acceleration, snapped physical translation, and authoritative/visual cursor
+Y. Display-linked presentation emits one final-state sample per target frame
+after any queued residual has been applied.
 
 Low input latency, hitch-free 60/120 Hz scrolling, bounded memory growth, and
 fast launch remain product targets. End-to-end key/RPC/raster/commit signposts,
@@ -683,8 +708,9 @@ Current Swift coverage includes:
   deferred presentation, scroll provenance, multigrid layout, and margins;
 - key, Option, mouse, click-count, and fractional wheel translation;
 - Core Text raster output, highlights, cursor glyphs, IOSurface row revisions,
-  pool bounds, circular history, spring equivalence, delayed frames, veil
-  behavior, pixel snapping, cursor coupling, and display-link idle behavior;
+  pool bounds, circular history, minimum-jerk envelope equivalence and C2
+  continuity, delayed frames, veil behavior, pixel snapping, cursor coupling,
+  and display-link idle behavior;
 - cmdline, popupmenu, messages, toast/history, and native view models; and
 - file indexing, ignore rules, fuzzy scoring, file operations, file tree, Quick
   Open, buffer strip, status bar, and generic UI-component stores.
@@ -720,8 +746,8 @@ rather than a SuperlemonApp test target.
 - Embedded Neovim process, MessagePack-RPC, typed redraw protocol, multigrid.
 - Row-COW grid model and damage/provenance-aware deferred presentation.
 - Core Text row renderer with IOSurface-backed revisions.
-- Display-linked two-viewport filmstrip, spring motion, cursor coupling, Reduce
-  Motion, and adaptive fast-scroll veil.
+- Display-linked two-viewport filmstrip, overlapping minimum-jerk row envelopes,
+  cursor coupling, Reduce Motion, and adaptive fast-scroll veil.
 - Keyboard, basic IME, mouse, trackpad, clipboard, and ordered input queue.
 - Native cmdline, popupmenu, messages, prompts, sidebar, Quick Open, preview
   buffers, buffer strip, statusline/status bar, file panels, Settings, and About.

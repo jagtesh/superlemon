@@ -237,7 +237,13 @@ public final class GridSurfaceView: NSView {
     private var reducedMotion = false
     private var accessibilityObserver: WorkspaceNotificationToken?
     private var animationDisplayLink: CADisplayLink?
-    private var lastDisplayTimestamp: CFTimeInterval?
+    /// Simulation time of the frame currently being targeted. CADisplayLink
+    /// callbacks arrive before that frame; integrating only to `timestamp`
+    /// leaves motion one refresh behind what the transaction will display.
+    private var lastDisplayTargetTimestamp: CFTimeInterval?
+    /// Lets the first callback distinguish its normal target-frame horizon
+    /// from a real main-thread stall that began immediately after resume.
+    private var displayLinkResumeTimestamp: CFTimeInterval?
     private var scheduledDisplayPresentation: (@MainActor () -> Void)?
     private var isInsideDisplayTick = false
 
@@ -408,7 +414,7 @@ public final class GridSurfaceView: NSView {
             fonts: fonts, cache: rasterizer.cache, scale: scale)
         let newAuthoritativeY = cursorLayer.frame.minY
         let cursorState = smoothViewports[flush.cursor.grid]
-        let coupledY = newAuthoritativeY - (cursorState?.position ?? 0) * cellSize.height
+        let coupledY = newAuthoritativeY - (cursorState?.snappedTranslationY ?? 0)
         let cursorGridChanged = previousCursorGrid != flush.cursor.grid
         let authoritativeChanged = previousAuthoritativeRow != flush.cursor.row
         if cursorGridChanged {
@@ -420,6 +426,7 @@ public final class GridSurfaceView: NSView {
         } else if cursorState?.isActive == true, authoritativeChanged,
             let previousVisualY {
             cursorCorrection.position = previousVisualY - coupledY
+            cursorCorrection.velocity = 0
             cursorCorrectionActive = !cursorCorrection.isSettled
         } else if cursorState?.isActive != true, authoritativeChanged {
             cursorCorrection.settle()
@@ -435,7 +442,9 @@ public final class GridSurfaceView: NSView {
         {
             resumeDisplayLink()
         }
-        emitDiagnostics(timestamp: CACurrentMediaTime())
+        if !isInsideDisplayTick {
+            emitDiagnostics(timestamp: CACurrentMediaTime())
+        }
     }
 
     private func settleSmoothMotion(destroyHistory: Bool = false) {
@@ -458,7 +467,8 @@ public final class GridSurfaceView: NSView {
     private func configureDisplayLink() {
         animationDisplayLink?.invalidate()
         animationDisplayLink = nil
-        lastDisplayTimestamp = nil
+        lastDisplayTargetTimestamp = nil
+        displayLinkResumeTimestamp = nil
         guard window != nil else { return }
         let link = displayLink(
             target: self, selector: #selector(displayLinkDidFire(_:)))
@@ -473,24 +483,34 @@ public final class GridSurfaceView: NSView {
     }
 
     @objc private func displayLinkDidFire(_ link: CADisplayLink) {
+        let nominalDisplayPeriod = Self.nominalDisplayPeriod(
+            timestamp: link.timestamp,
+            targetTimestamp: link.targetTimestamp,
+            duration: link.duration)
+        let targetTimestamp = Self.displayTargetTimestamp(
+            timestamp: link.timestamp,
+            targetTimestamp: link.targetTimestamp,
+            duration: link.duration)
         let elapsed: CFTimeInterval
-        if let lastDisplayTimestamp {
-            elapsed = max(0, link.timestamp - lastDisplayTimestamp)
+        if let lastDisplayTargetTimestamp {
+            let targetDelta = targetTimestamp - lastDisplayTargetTimestamp
+            elapsed = targetDelta > 0 ? targetDelta : nominalDisplayPeriod
         } else {
-            elapsed = link.duration > 0 ? link.duration : 1.0 / 60.0
+            elapsed = nominalDisplayPeriod
         }
-        lastDisplayTimestamp = link.timestamp
+        lastDisplayTargetTimestamp = targetTimestamp
+        let detectDisplayGap = Self.shouldDetectDisplayGap(
+            resumedAt: displayLinkResumeTimestamp,
+            callbackTimestamp: link.timestamp,
+            nominalDisplayPeriod: nominalDisplayPeriod)
+        displayLinkResumeTimestamp = nil
 
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         isInsideDisplayTick = true
-        if let scheduledDisplayPresentation {
-            self.scheduledDisplayPresentation = nil
-            scheduledDisplayPresentation()
-        }
-        let active = advanceAnimationsWithoutTransaction(
-            by: elapsed, nominalDisplayPeriod: link.duration,
-            timestamp: CACurrentMediaTime())
+        let active = runDisplayTickWithoutTransaction(
+            by: elapsed, nominalDisplayPeriod: nominalDisplayPeriod,
+            timestamp: targetTimestamp, detectDisplayGap: detectDisplayGap)
         isInsideDisplayTick = false
         CATransaction.commit()
 
@@ -503,25 +523,46 @@ public final class GridSurfaceView: NSView {
     /// refresh-rate equivalence tests.
     @discardableResult
     func advanceAnimations(
-        by elapsed: CFTimeInterval, timestamp: CFTimeInterval = CACurrentMediaTime()
+        by elapsed: CFTimeInterval,
+        nominalDisplayPeriod: CFTimeInterval = 1.0 / 60.0,
+        timestamp: CFTimeInterval = CACurrentMediaTime(),
+        detectDisplayGap: Bool = true
     ) -> Bool {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         isInsideDisplayTick = true
-        if let scheduledDisplayPresentation {
-            self.scheduledDisplayPresentation = nil
-            scheduledDisplayPresentation()
-        }
-        let active = advanceAnimationsWithoutTransaction(
-            by: elapsed, nominalDisplayPeriod: 1.0 / 60.0, timestamp: timestamp)
+        let active = runDisplayTickWithoutTransaction(
+            by: elapsed, nominalDisplayPeriod: nominalDisplayPeriod,
+            timestamp: timestamp, detectDisplayGap: detectDisplayGap)
         isInsideDisplayTick = false
         CATransaction.commit()
         return active
     }
 
+    /// Advance motion that existed during the elapsed interval before applying
+    /// a scroll batch that arrived during that interval. Retargeting first
+    /// would pre-age the new delta by up to one frame and create a phase-
+    /// dependent pixel kick. Both operations still commit atomically.
+    private func runDisplayTickWithoutTransaction(
+        by elapsed: CFTimeInterval, nominalDisplayPeriod: CFTimeInterval,
+        timestamp: CFTimeInterval, detectDisplayGap: Bool
+    ) -> Bool {
+        let pendingPresentation = scheduledDisplayPresentation
+        scheduledDisplayPresentation = nil
+        let wasActive = advanceAnimationsWithoutTransaction(
+            by: elapsed, nominalDisplayPeriod: nominalDisplayPeriod,
+            detectDisplayGap: detectDisplayGap)
+        pendingPresentation?()
+        // A pending presentation may extend the envelope and retarget the cursor. Sample
+        // once, after that final state exists, using the timestamp of the
+        // frame this transaction is preparing.
+        emitDiagnostics(timestamp: timestamp)
+        return wasActive || hasActiveAnimationWork
+    }
+
     private func advanceAnimationsWithoutTransaction(
         by elapsed: CFTimeInterval, nominalDisplayPeriod: CFTimeInterval,
-        timestamp: CFTimeInterval
+        detectDisplayGap: Bool
     ) -> Bool {
         let boundedElapsed = min(max(0, elapsed), 1.0)
         var active = false
@@ -529,7 +570,8 @@ public final class GridSurfaceView: NSView {
             active = state.advance(
                 by: boundedElapsed,
                 nominalDisplayPeriod: nominalDisplayPeriod > 0
-                    ? nominalDisplayPeriod : 1.0 / 60.0) || active
+                    ? nominalDisplayPeriod : 1.0 / 60.0,
+                detectDisplayGap: detectDisplayGap) || active
         }
 
         if cursorCorrectionActive {
@@ -547,23 +589,37 @@ public final class GridSurfaceView: NSView {
             }
         }
         updateCursorPresentation()
-
-        emitDiagnostics(timestamp: timestamp)
         return active
             || smoothViewports.values.contains(where: { $0.isActive || $0.isVeilActive })
             || scheduledDisplayPresentation != nil
     }
 
     var animationsAreIdle: Bool {
-        !smoothViewports.values.contains(where: { $0.isActive || $0.isVeilActive })
-            && !cursorCorrectionActive && scheduledDisplayPresentation == nil
+        !hasActiveAnimationWork
             && (animationDisplayLink?.isPaused ?? true)
+    }
+
+    private var hasActiveAnimationWork: Bool {
+        smoothViewports.values.contains(where: { $0.isActive || $0.isVeilActive })
+            || cursorCorrectionActive || scheduledDisplayPresentation != nil
     }
 
     /// Deterministic test hook that avoids annotating hot-path CALayers with
     /// names/KVC metadata solely to identify their authoritative source row.
     func visibleRowLayer(gridID: Int, sourceRow: Int) -> CALayer? {
         smoothViewports[gridID]?.visibleLayer(sourceRow: sourceRow)
+    }
+
+    /// Deterministic camera-state hook for cadence and retargeting tests.
+    package func scrollTranslationPixels(gridID: Int) -> Int? {
+        smoothViewports[gridID]?.snappedTranslationPixels
+    }
+
+    /// Analytical position before Retina pixel snapping. A C2 motion envelope
+    /// can advance during its first display period without crossing a physical
+    /// pixel, so cadence tests must not infer retarget ordering from layers.
+    package func scrollPosition(gridID: Int) -> CGFloat? {
+        smoothViewports[gridID]?.position
     }
 
     private func resumeDisplayLink() {
@@ -573,14 +629,20 @@ public final class GridSurfaceView: NSView {
         // it reset the timestamp here, the next callback would integrate only
         // one nominal frame and silently discard the delayed interval.
         if animationDisplayLink.isPaused {
-            lastDisplayTimestamp = CACurrentMediaTime()
+            // Seed with real time; the callback advances to targetTimestamp,
+            // so a step committed just before vsync still moves on the frame
+            // that the callback is preparing.
+            let now = CACurrentMediaTime()
+            lastDisplayTargetTimestamp = now
+            displayLinkResumeTimestamp = now
             animationDisplayLink.isPaused = false
         }
     }
 
     private func pauseDisplayLink() {
         animationDisplayLink?.isPaused = true
-        lastDisplayTimestamp = nil
+        lastDisplayTargetTimestamp = nil
+        displayLinkResumeTimestamp = nil
     }
 
     private func updateCursorPresentation() {
@@ -593,7 +655,7 @@ public final class GridSurfaceView: NSView {
         let state = smoothViewports[authoritativeCursorGrid]
         cursorLayer.setScrollDimmed(state?.isVeilActive == true)
         var y = authoritativeCursorY
-            - (state?.position ?? 0) * cellSize.height
+            - (state?.snappedTranslationY ?? 0)
             + cursorCorrection.position
 
         if let frame = lastFrames.first(where: { $0.gridID == authoritativeCursorGrid }),
@@ -634,14 +696,48 @@ public final class GridSurfaceView: NSView {
                 cursorVisualY: visualCursorY)
             os_signpost(
                 .event, log: Self.scrollSignpostLog, name: "ScrollFrame",
-                "grid=%{public}d delta=%{public}d head=%{public}d pos=%{public}.4f vel=%{public}.4f",
+                "grid=%{public}d delta=%{public}d head=%{public}d pos=%{public}.4f vel=%{public}.4f acc=%{public}.4f snap=%{public}d",
                 sample.gridID, sample.delta, sample.historyHead,
-                Double(sample.position), Double(sample.velocity))
+                Double(sample.position), Double(sample.velocity),
+                Double(sample.acceleration),
+                sample.snappedTranslationPixels)
             if scrollDiagnosticHandler != nil || environmentDiagnosticsEnabled {
                 diagnosticRing.append(sample)
                 scrollDiagnosticHandler?(sample)
             }
         }
+    }
+
+    package static func displayTargetTimestamp(
+        timestamp: CFTimeInterval, targetTimestamp: CFTimeInterval,
+        duration: CFTimeInterval
+    ) -> CFTimeInterval {
+        if targetTimestamp.isFinite, targetTimestamp > timestamp {
+            return targetTimestamp
+        }
+        return timestamp + nominalDisplayPeriod(
+            timestamp: timestamp, targetTimestamp: targetTimestamp,
+            duration: duration)
+    }
+
+    package static func nominalDisplayPeriod(
+        timestamp: CFTimeInterval, targetTimestamp: CFTimeInterval,
+        duration: CFTimeInterval
+    ) -> CFTimeInterval {
+        let targetPeriod = targetTimestamp - timestamp
+        if targetPeriod.isFinite, targetPeriod > 0 {
+            return targetPeriod
+        }
+        return duration.isFinite && duration > 0 ? duration : 1.0 / 60.0
+    }
+
+    package static func shouldDetectDisplayGap(
+        resumedAt: CFTimeInterval?, callbackTimestamp: CFTimeInterval,
+        nominalDisplayPeriod: CFTimeInterval
+    ) -> Bool {
+        guard let resumedAt else { return true }
+        let nominal = max(1.0 / 240.0, nominalDisplayPeriod)
+        return callbackTimestamp - resumedAt >= nominal * 2
     }
 
     private func renderer(for id: Int) -> GridRenderer {

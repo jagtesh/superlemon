@@ -372,15 +372,23 @@ than asking Neovim to synthesize fake intermediate edits:
   filmstrip. Core Animation translates already-rasterized Retina rows on the
   display link; glyphs are not blurred, scaled, or crossfaded during exact
   motion.
-- A critically damped spring preserves velocity through repeated steps and
-  reversals. Slow scrolling feels directly connected; fast scrolling coalesces
-  obsolete presentation work without dropping Neovim events.
+- Every discrete row joins one continuous gesture-level envelope as an
+  approximately 180 ms quintic minimum-jerk contribution. A new contribution
+  cancels its authoritative row jump without changing the camera's existing
+  velocity or acceleration; repeated rows overlap until the motion reads as one
+  native gesture instead of a sequence of eased teeth.
+- Position, velocity, and acceleration remain continuous through additions,
+  reversals, and natural stops. The analytical path remains fractional; Retina
+  pixel snapping occurs only when presenting a frame and never alters the motion
+  that the next frame inherits.
 - Vertical, horizontal, wrapped-line, fold, split, and margin-aware motion share
   one semantic model. Unsupported geometry settles atomically rather than
   showing a plausible but wrong transition.
-- True beyond-history jumps receive one concise directional cue. A low-cost
-  velocity veil may bridge a measured display gap, but it is rare, directionally
-  honest, and hard-limited; exact text returns without a snap.
+- Each direction has an independently bounded history budget, so reversals
+  cannot conceal more visual debt than exact retained rows can represent. True
+  beyond-history jumps receive one concise one-row cue. A low-cost velocity veil
+  may bridge a measured display gap, but it is rare, directionally honest, and
+  hard-limited; exact text returns without a snap.
 - Cursor position derives from the same residual motion as its text, clamps at
   viewport edges, preserves blink phase, and never jitters independently.
 - Reduce Motion presents every authoritative state immediately and removes all
@@ -468,7 +476,7 @@ or plugin state store.
 | **Workspace overview** | Responsive grid of live top-level workspace thumbnails plus a new-workspace card; never conflated with buffers or tabpages |
 | **Sidebar** | Resizable lazy tree, compact project header, type symbols, Git/diagnostic/plugin decorations, FSEvents refresh, preview/pin behavior, and buffer-aware file operations |
 | **Editor surface** | Exact Neovim multigrid with Core Text glyphs, per-grid row surfaces, native float treatment, and no theme translation |
-| **Smooth viewport** | Display-linked exact-row history for semantic motion, velocity-preserving spring, coupled cursor, bounded exceptional veil, and atomic fallback |
+| **Smooth viewport** | Display-linked exact-row history, overlapping C2 minimum-jerk row envelopes, presentation-only Retina snapping, coupled cursor, bounded exceptional veil, and atomic fallback |
 | **Native scrollbars** | Independent overlay scroller per Neovim window, derived from viewport metadata and routed back through Neovim |
 | **Status/command bar** | User-evaluated statusline, polished fallback, plugin segments, and in-place externalized command line |
 | **Quick Open / palettes** | 498 × 346 pt file palette and reusable provider-driven native picker with cancellable async data |
@@ -638,8 +646,8 @@ requested from Neovim at whole-cell crossings.
 | Window corners/shadow | Standard macOS window geometry |
 | Scroll history | At least two inner viewports per grid |
 | Exact filmstrip | Inner viewport height + 1 recyclable row layer |
-| Scroll spring | ≈0.300 s critically damped settling target |
-| Delayed-frame integration | Steps no larger than 1/120 s |
+| Scroll envelope | ≈0.180 s quintic minimum-jerk contribution per row; C2-continuous overlap |
+| Display-linked sampling | Analytical at the target frame; Retina snapping at presentation only |
 | Cursor correction | ≈0.040 s critical correction |
 | Exceptional velocity veil | ≤0.75 cell offset, subtle magnification, ≤8% accent, ≤150 ms |
 | Palette entry/exit | One display period in; ≈50–90 ms out |
@@ -662,7 +670,8 @@ The destination is reached only when all of these statements are true together:
   macOS.
 - Typing reaches a visible glyph within one display period under ordinary load.
   No preview, index, Git, thumbnail, or animation work may sit on that path.
-- Slow scrolling is directly connected and fast scrolling has no repeated
+- Slow scrolling is directly connected and repeated rows merge into a single
+  smooth speed curve without acceleration teeth. Fast scrolling has no repeated
   frame, reverse tail, overlay snap, cursor-independent jitter, or two-period
   hitch at 60 or 120 Hz.
 - Text remains sharp and pixel-snapped throughout exact motion. Visual

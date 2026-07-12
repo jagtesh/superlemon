@@ -532,6 +532,92 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
         #expect(abs(monotonic.position) < 0.000_1)
     }
 
+    @Test func minimumJerkSegmentHasExactC2EndpointsAndSymmetry() {
+        let duration = 0.180
+        var down = MinimumJerkScrollSegment(
+            initial: ScrollMotionSample(position: -1), duration: duration)
+        var up = MinimumJerkScrollSegment(
+            initial: ScrollMotionSample(position: 1), duration: duration)
+
+        #expect(down.sample == ScrollMotionSample(position: -1))
+        #expect(up.sample == ScrollMotionSample(position: 1))
+        var previous = down.sample.position
+        for _ in 0..<180 {
+            down.advance(by: 0.001)
+            up.advance(by: 0.001)
+            #expect(down.sample.position >= previous)
+            #expect(down.sample.position <= 0)
+            #expect(down.sample.position == -up.sample.position)
+            #expect(down.sample.velocity == -up.sample.velocity)
+            #expect(down.sample.acceleration == -up.sample.acceleration)
+            previous = down.sample.position
+        }
+        #expect(down.sample == ScrollMotionSample())
+        #expect(up.sample == ScrollMotionSample())
+    }
+
+    @Test func fiveRowBurstPreservesC2CameraAndStopsExactly() {
+        let duration = 0.180
+        let period = 1.0 / 120.0
+        var motion = ContinuousScrollEnvelope()
+        var semanticRows: CGFloat = 0
+
+        for input in 1...5 {
+            if input > 1 { motion.advance(by: period) }
+            let before = motion.sample
+            let cameraBefore = semanticRows + before.position
+            semanticRows += 1
+            motion.add(positionOffset: -1, duration: duration)
+            let after = motion.sample
+            #expect(abs(semanticRows + after.position - cameraBefore) < 0.000_001)
+            #expect(after.velocity == before.velocity)
+            #expect(after.acceleration == before.acceleration)
+            if input >= 3 { #expect(after.velocity > 0) }
+        }
+
+        var previousCamera = semanticRows + motion.position
+        for _ in 0..<240 where motion.isActive {
+            motion.advance(by: period)
+            let camera = semanticRows + motion.position
+            #expect(camera >= previousCamera)
+            #expect(camera <= semanticRows)
+            previousCamera = camera
+        }
+        #expect(!motion.isActive)
+        #expect(motion.sample == ScrollMotionSample())
+        #expect(previousCamera == 5)
+    }
+
+    @Test func identicalEnvelopeTimelineMatchesAt60And120Hz() {
+        let duration = 0.180
+        func trajectory(hz: Int) -> [ScrollMotionSample] {
+            var motion = ContinuousScrollEnvelope()
+            var result: [ScrollMotionSample] = []
+            let period = 1.0 / Double(hz)
+            for frame in 0...(hz * 3 / 5) {
+                if frame > 0 { motion.advance(by: period) }
+                let time = Double(frame) * period
+                let eventIndex = Int((time * 60).rounded())
+                if eventIndex < 5,
+                    abs(time - Double(eventIndex) / 60.0) < 0.000_001
+                {
+                    motion.add(positionOffset: -1, duration: duration)
+                }
+                result.append(motion.sample)
+            }
+            return result
+        }
+        let at60 = trajectory(hz: 60)
+        let at120 = trajectory(hz: 120)
+        for index in at60.indices where index * 2 < at120.count {
+            let lhs = at60[index]
+            let rhs = at120[index * 2]
+            #expect(abs(lhs.position - rhs.position) < 0.000_001)
+            #expect(abs(lhs.velocity - rhs.velocity) < 0.000_001)
+            #expect(abs(lhs.acceleration - rhs.acceleration) < 0.000_001)
+        }
+    }
+
     @Test func stateSeedsTwoViewportHistoryAndAnimatesSharedImageRows() {
         let host = CALayer()
         host.frame = CGRect(x: 0, y: 0, width: 80, height: 96)
@@ -592,36 +678,74 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
                 "settling must expose the exact authoritative backing image")
     }
 
-    @Test func newInputPreservesVelocityThroughImmediateReversal() {
-        let host = CALayer()
-        let first = solidImage(width: 80, height: 96)
-        let second = solidImage(width: 80, height: 96)
-        let third = solidImage(width: 80, height: 96)
-        let state = SmoothViewportState(gridID: 1)
-        _ = state.present(
-            image: first, rows: 6, cols: 10, margins: nil,
-            scrolls: [], semanticDelta: nil, cellSize: cellSize,
-            scale: 1, host: host, animate: true)
-        _ = state.present(
-            image: second, rows: 6, cols: 10, margins: nil,
-            scrolls: [ScrollDelta(
-                top: 0, bottom: 6, left: 0, right: 10, rows: 1, cols: 0)],
-            semanticDelta: 1, cellSize: cellSize,
-            scale: 1, host: host, animate: true)
-        _ = state.advance(by: 1.0 / 60.0)
-        let velocityBeforeReversal = state.velocity
-        let positionBeforeReversal = state.position
+    @Test func reversalPreservesC2MotionAndReturnsToExactViewport() {
+        let rowPixels = Int(cellSize.height * 2)
+        let period = 1.0 / 120.0
 
-        _ = state.present(
-            image: third, rows: 6, cols: 10, margins: nil,
-            scrolls: [ScrollDelta(
-                top: 0, bottom: 6, left: 0, right: 10, rows: -1, cols: 0)],
-            semanticDelta: -1, cellSize: cellSize,
-            scale: 1, host: host, animate: true)
-        #expect(state.velocity == velocityBeforeReversal)
-        #expect(state.position == positionBeforeReversal + 1)
-        #expect(state.historyHead == 0)
-        #expect(state.currentRowsReference(third))
+        for direction in [-1, 1] {
+            for ticksBeforeReversal in 0...2 {
+                let host = CALayer()
+                let state = SmoothViewportState(
+                    gridID: direction * 10 + ticksBeforeReversal)
+                _ = state.present(
+                    image: solidImage(width: 160, height: 192),
+                    rows: 6, cols: 10, margins: nil, scrolls: [],
+                    semanticDelta: nil, cellSize: cellSize, scale: 2,
+                    host: host, animate: true)
+                _ = state.present(
+                    image: solidImage(width: 160, height: 192),
+                    rows: 6, cols: 10, margins: nil,
+                    scrolls: [ScrollDelta(
+                        top: 0, bottom: 6, left: 0, right: 10,
+                        rows: direction, cols: 0)],
+                    semanticDelta: direction, cellSize: cellSize, scale: 2,
+                    host: host, animate: true)
+
+                for _ in 0..<ticksBeforeReversal {
+                    _ = state.advance(by: period, nominalDisplayPeriod: period)
+                }
+                var semanticRows = direction
+                let before = semanticRows * rowPixels
+                    + state.snappedTranslationPixels
+                let velocityBefore = state.velocity
+                let accelerationBefore = state.acceleration
+                _ = state.present(
+                    image: solidImage(width: 160, height: 192),
+                    rows: 6, cols: 10, margins: nil,
+                    scrolls: [ScrollDelta(
+                        top: 0, bottom: 6, left: 0, right: 10,
+                        rows: -direction, cols: 0)],
+                    semanticDelta: -direction, cellSize: cellSize, scale: 2,
+                    host: host, animate: true)
+                semanticRows -= direction
+                let atRetarget = semanticRows * rowPixels
+                    + state.snappedTranslationPixels
+                #expect(abs(atRetarget - before) <= 1,
+                        "reversal retargeting must preserve the visible camera")
+                #expect(state.velocity == velocityBefore)
+                #expect(state.acceleration == accelerationBefore,
+                        "a row reversal must not add an acceleration tooth")
+
+                var camera = [atRetarget]
+                var sawReverseVelocity = ticksBeforeReversal == 0
+                for _ in 0..<240 where state.isActive {
+                    _ = state.advance(by: period, nominalDisplayPeriod: period)
+                    camera.append(semanticRows * rowPixels
+                        + state.snappedTranslationPixels)
+                    if state.velocity * CGFloat(direction) < 0 {
+                        sawReverseVelocity = true
+                    }
+                }
+                #expect(sawReverseVelocity,
+                        "the opposite pulse must smoothly turn carried momentum")
+                #expect(camera.last == 0)
+                #expect(!state.isActive)
+                #expect(state.position == 0)
+                #expect(state.velocity == 0)
+                #expect(state.acceleration == 0)
+                #expect(state.historyHead == 0)
+            }
+        }
     }
 
     @Test func farJumpRetainsOnlyItsFinalLineOfMotion() {
@@ -779,6 +903,61 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
         }
     }
 
+    @Test func alternatingDirectionsBoundSignedResidualsAndCleanUpExactly() {
+        let rows = 6
+        let host = CALayer()
+        let image = solidImage(width: 80, height: 96)
+        let state = SmoothViewportState(gridID: 1)
+        _ = state.present(
+            image: image, rows: rows, cols: 10, margins: nil,
+            scrolls: [], semanticDelta: nil, cellSize: cellSize,
+            scale: 1, host: host, animate: true)
+        let down = ScrollDelta(
+            top: 0, bottom: rows, left: 0, right: 10, rows: 1, cols: 0)
+        let up = ScrollDelta(
+            top: 0, bottom: rows, left: 0, right: 10, rows: -1, cols: 0)
+
+        // Net position remains zero after every pair. Each direction must
+        // nevertheless consume and clamp its own retained-history capacity.
+        for pair in 1...(rows * 2) {
+            _ = state.present(
+                image: image, rows: rows, cols: 10, margins: nil,
+                scrolls: [down], semanticDelta: 1, cellSize: cellSize,
+                scale: 1, host: host, animate: true)
+            #expect(state.motion.negativeMagnitude == CGFloat(min(pair, rows)))
+            #expect(state.motion.positiveMagnitude == CGFloat(min(pair - 1, rows)))
+
+            _ = state.present(
+                image: image, rows: rows, cols: 10, margins: nil,
+                scrolls: [up], semanticDelta: -1, cellSize: cellSize,
+                scale: 1, host: host, animate: true)
+            let expectedMagnitude = CGFloat(min(pair, rows))
+            #expect(state.motion.negativeMagnitude == expectedMagnitude)
+            #expect(state.motion.positiveMagnitude == expectedMagnitude)
+            #expect(state.motion.negativeMagnitude <= CGFloat(rows))
+            #expect(state.motion.positiveMagnitude <= CGFloat(rows))
+        }
+
+        #expect(state.motion.segments.count == rows * 2)
+        #expect(state.position == 0)
+        #expect(state.velocity == 0)
+        #expect(state.acceleration == 0)
+        #expect(state.isActive)
+        #expect(state.historyHead == 0)
+
+        #expect(!state.advance(
+            by: 1, nominalDisplayPeriod: 1.0 / 120.0,
+            detectDisplayGap: false))
+        #expect(!state.isActive)
+        #expect(state.motion.segments.isEmpty)
+        #expect(state.motion.sample == ScrollMotionSample())
+        #expect(state.motion.negativeMagnitude == 0)
+        #expect(state.motion.positiveMagnitude == 0)
+        #expect(state.snappedTranslationPixels == 0)
+        #expect(state.historyHead == 0)
+        #expect(state.currentRowsReference(image))
+    }
+
     @Test func coalescedSmallMotionBeyondAViewportClampsWithoutFarReset() {
         let host = CALayer()
         let state = SmoothViewportState(gridID: 1)
@@ -803,7 +982,7 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
         #expect(!state.isVeilActive)
     }
 
-    @Test func zeroNetCoalescedReversalPreservesActiveSpringAndVelocity() {
+    @Test func zeroNetCoalescedReversalPreservesActiveEnvelopeDerivatives() {
         let host = CALayer()
         let state = SmoothViewportState(gridID: 1)
         _ = state.present(
@@ -819,6 +998,7 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
         _ = state.advance(by: 1.0 / 60.0)
         let oldPosition = state.position
         let oldVelocity = state.velocity
+        let oldAcceleration = state.acceleration
         var reversal = ViewportScrollMotion(delta: 1)
         reversal.append(-1)
 
@@ -833,6 +1013,7 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
         #expect(state.isActive)
         #expect(state.position == oldPosition)
         #expect(state.velocity == oldVelocity)
+        #expect(state.acceleration == oldAcceleration)
     }
 
     @Test func fractionalTicksOnlyTranslateTheContainer() {
@@ -852,7 +1033,7 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
         let before = state.visibleRowLayers.map { $0.contents as AnyObject? }
         let transformBefore = state.translatedContainerLayer.affineTransform()
 
-        _ = state.advance(by: 1.0 / 60.0)
+        _ = state.advance(by: 1.0 / 30.0)
 
         let after = state.visibleRowLayers.map { $0.contents as AnyObject? }
         for index in before.indices {
@@ -926,6 +1107,43 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
         #expect(!state.isVeilActive, "Reduce Motion/immediate never installs a veil")
     }
 
+    @Test func firstResumedTargetIntervalDoesNotTriggerVelocityVeil() {
+        func scrollingState(gridID: Int) -> SmoothViewportState {
+            let state = SmoothViewportState(gridID: gridID)
+            let host = CALayer()
+            _ = state.present(
+                image: solidImage(width: 160, height: 192),
+                rows: 6, cols: 10, margins: nil, scrolls: [],
+                semanticDelta: nil, cellSize: cellSize, scale: 2,
+                host: host, animate: true)
+            _ = state.present(
+                image: solidImage(width: 160, height: 192),
+                rows: 6, cols: 10, margins: nil,
+                scrolls: [ScrollDelta(
+                    top: 0, bottom: 6, left: 0, right: 10,
+                    rows: 1, cols: 0)],
+                semanticDelta: 1, cellSize: cellSize, scale: 2,
+                host: host, animate: true)
+            return state
+        }
+
+        let schedulingLatency = 0.0188
+        let period = 1.0 / 120.0
+        let firstTick = scrollingState(gridID: 1)
+        _ = firstTick.advance(
+            by: schedulingLatency, nominalDisplayPeriod: period,
+            detectDisplayGap: false)
+        #expect(!firstTick.isVeilActive,
+                "resume latency is not evidence of a missed display period")
+
+        let genuinelyLateTick = scrollingState(gridID: 2)
+        _ = genuinelyLateTick.advance(
+            by: schedulingLatency, nominalDisplayPeriod: period,
+            detectDisplayGap: true)
+        #expect(genuinelyLateTick.isVeilActive,
+                "the same interval after resume remains a real measured gap")
+    }
+
     @Test func sustainedClampShowsOneBoundedVeilWithoutPulsing() {
         let host = CALayer()
         let state = SmoothViewportState(gridID: 1)
@@ -935,7 +1153,7 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
             cellSize: cellSize, scale: 1, host: host, animate: true)
         let scroll = ScrollDelta(
             top: 0, bottom: 6, left: 0, right: 10, rows: 1, cols: 0)
-        // Fill the retained-history debt without advancing the spring.
+        // Fill the retained-history debt without advancing the envelope.
         for _ in 0..<6 {
             _ = state.present(
                 image: solidImage(width: 80, height: 96),
@@ -963,7 +1181,7 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
                 "the unresolved veil still obeys its absolute 150 ms cap")
     }
 
-    @Test func settlementWaitsUntilTheSnappedResidualIsZero() {
+    @Test func envelopeFinishesAnalyticallyAfterPixelResidualReachesZero() {
         let largeCell = CGSize(width: 12, height: 64)
         let host = CALayer()
         let first = solidImage(width: 120, height: 384)
@@ -980,22 +1198,21 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
             semanticDelta: 1, cellSize: largeCell,
             scale: 2, host: host, animate: true)
 
-        var reference = CriticalDampedSpring(position: -1)
-        var steps = 0
-        repeat {
-            reference.advance(by: 1.0 / 120.0)
-            steps += 1
-        } while !reference.isSettled
-        #expect((reference.position * largeCell.height * 2).rounded() != 0,
-                "the line-relative threshold still has a visible Retina pixel")
-        for _ in 0..<steps { _ = state.advance(by: 1.0 / 120.0) }
-        #expect(state.isActive,
-                "the history must remain until its snapped translation is zero")
-
+        var sawPixelEquivalentTail = false
         for _ in 0..<240 where state.isActive {
-            _ = state.advance(by: 1.0 / 120.0)
+            _ = state.advance(
+                by: 1.0 / 120.0,
+                nominalDisplayPeriod: 1.0 / 120.0)
+            if state.snappedTranslationPixels == 0, state.isActive {
+                sawPixelEquivalentTail = true
+            }
         }
+        #expect(sawPixelEquivalentTail,
+                "pixel snapping must not feed back into the analytical envelope")
         #expect(!state.isActive)
+        #expect(state.position == 0)
+        #expect(state.velocity == 0)
+        #expect(state.acceleration == 0)
         #expect(!state.overlayLayer.isHidden)
     }
 
@@ -1364,11 +1581,76 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
                 curline: 3, curcol: 2, lineCount: 100, scrollDelta: 1),
         ]))
 
-        #expect(view.schedulePresentationOnNextDisplay { calls += 1 })
+        let pendingFlush = flush(store, [
+            .gridScroll(
+                grid: 1, top: 0, bottom: 6, left: 0, right: 10,
+                rows: 1, cols: 0),
+            .winViewport(
+                grid: 1, win: 10, topline: 2, botline: 8,
+                curline: 3, curcol: 2, lineCount: 100, scrollDelta: 1),
+        ])
+        let beforeTick = view.scrollPosition(gridID: 1)
+        var actionRan = false
+        var positionWhenActionRan: CGFloat?
+        var samples: [ScrollDiagnosticSample] = []
+        view.resetScrollDiagnostics()
+        view.scrollDiagnosticHandler = { sample in
+            samples.append(sample)
+            #expect(actionRan,
+                    "the frame sample must describe the final retargeted state")
+        }
+        #expect(view.schedulePresentationOnNextDisplay {
+            actionRan = true
+            positionWhenActionRan = view.scrollPosition(gridID: 1)
+            view.present(pendingFlush)
+            calls += 1
+        })
         #expect(calls == 0)
-        _ = view.advanceAnimations(by: 1.0 / 60.0)
+        _ = view.advanceAnimations(
+            by: 1.0 / 120.0, nominalDisplayPeriod: 1.0 / 120.0,
+            timestamp: 100)
         #expect(calls == 1)
+        #expect(positionWhenActionRan != beforeTick,
+                "existing motion advances before a newly queued retarget")
+        #expect(samples.count == 1,
+                "one display target must produce one final-state sample")
+        #expect(samples.first?.timestamp == 100)
+        #expect(samples.first?.historyHead == 2)
+
+        _ = view.advanceAnimations(
+            by: 1.0 / 120.0, nominalDisplayPeriod: 1.0 / 120.0,
+            timestamp: 100 + 1.0 / 120.0)
+        #expect(samples.count == 2)
+        #expect(zip(samples, samples.dropFirst()).allSatisfy {
+            before, after in before.timestamp < after.timestamp
+        }, "diagnostic timestamps must remain monotonic")
         window.contentView = nil
+    }
+
+    @Test func displayLinkSimulationTargetsTheFrameBeingPrepared() {
+        let timestamp = 100.0
+        let target = timestamp + 1.0 / 120.0
+        #expect(abs(GridSurfaceView.nominalDisplayPeriod(
+            timestamp: timestamp, targetTimestamp: target,
+            duration: 1.0 / 60.0) - 1.0 / 120.0) < 0.000_001)
+        #expect(GridSurfaceView.displayTargetTimestamp(
+            timestamp: timestamp, targetTimestamp: target,
+            duration: 1.0 / 60.0) == target)
+        #expect(abs(GridSurfaceView.displayTargetTimestamp(
+            timestamp: timestamp, targetTimestamp: timestamp,
+            duration: 1.0 / 60.0) - (timestamp + 1.0 / 60.0)) < 0.000_001)
+        #expect(!GridSurfaceView.shouldDetectDisplayGap(
+            resumedAt: timestamp, callbackTimestamp: timestamp + 0.0105,
+            nominalDisplayPeriod: 1.0 / 120.0),
+            "normal first-callback scheduling latency is not a missed frame")
+        #expect(GridSurfaceView.shouldDetectDisplayGap(
+            resumedAt: timestamp, callbackTimestamp: timestamp + 0.050,
+            nominalDisplayPeriod: 1.0 / 120.0),
+            "a real stall immediately after resume still triggers gap handling")
+        #expect(GridSurfaceView.shouldDetectDisplayGap(
+            resumedAt: nil, callbackTimestamp: timestamp,
+            nominalDisplayPeriod: 1.0 / 120.0),
+            "all callbacks after the first participate in gap detection")
     }
 }
 
@@ -1624,6 +1906,94 @@ extension CursorRenderTests {
         }
         #expect(view.animationsAreIdle)
         #expect(abs(cursor.frame.minY - 2 * view.cellSize.height) <= tolerance)
+    }
+
+    @Test func fastInteriorCursorStreamStaysLockedAndKeepsBlinkPhase() {
+        let rows = 12
+        let view = GridSurfaceView(
+            frame: NSRect(x: 0, y: 0, width: 600, height: 400), font: menlo)
+        let store = GridStore()
+        let mode = blinkingBlockMode()
+        let contents = [
+            "aaaaaaaaaa", "bbbbbbbbbb", "cccccccccc", "dddddddddd",
+            "eeeeeeeeee", "ffffffffff", "gggggggggg", "hhhhhhhhhh",
+            "iiiiiiiiii", "jjjjjjjjjj", "kkkkkkkkkk", "llllllllll",
+        ]
+        var initial: [UIEvent] = [
+            .gridResize(grid: 1, width: 10, height: rows),
+            .defaultColorsSet(
+                fg: rgb(0xFFFFFF), bg: rgb(0x000000), special: rgb(0xFF0000)),
+            .modeInfoSet(cursorStyleEnabled: true, modes: [mode]),
+            .modeChange(mode: "normal", modeIndex: 0),
+        ]
+        initial.append(contentsOf: contents.enumerated().map {
+            line($0.offset, $0.element, hl: 0)
+        })
+        initial.append(contentsOf: [
+            .gridCursorGoto(grid: 1, row: 8, col: 2),
+            .winViewport(
+                grid: 1, win: 10, topline: 0, botline: rows,
+                curline: 8, curcol: 2, lineCount: 100, scrollDelta: 0),
+        ])
+        view.present(flush(store, initial))
+
+        guard let cursor = cursorLayer(in: view),
+            let blink = cursor.animation(forKey: "superlemon.blink"),
+            let firstContents = cursor.contents
+        else {
+            Issue.record("expected a blinking interior cursor")
+            return
+        }
+        let bitmap = firstContents as! CGImage
+        let tolerance: CGFloat = 0.5
+        func expectLocked(to sourceRow: Int) {
+            guard let moving = movingRowLayer(
+                in: view, sourceRow: sourceRow, totalRows: rows)
+            else {
+                Issue.record("authoritative cursor row missing from fast filmstrip")
+                return
+            }
+            let rowY = moving.row.convert(moving.row.bounds, to: view.layer).minY
+            #expect(abs(cursor.frame.minY - rowY) <= tolerance,
+                    "fast cursor y=\(cursor.frame.minY) must stay on row y=\(rowY)")
+            #expect(cursor.animation(forKey: "superlemon.blink")?.beginTime
+                == blink.beginTime)
+            let currentBitmap = cursor.contents as! CGImage
+            #expect(currentBitmap === bitmap,
+                    "scrolling the same buffer cell must not rebuild the cursor")
+        }
+
+        // Two authoritative row changes per display tick approximate the
+        // 4 ms-class stream used by the camera cadence test. The cursor stays
+        // interior for all six steps, so edge clamping cannot mask a sawtooth.
+        for step in 1...6 {
+            let cursorRow = 8 - step
+            view.present(flush(store, [
+                .gridScroll(
+                    grid: 1, top: 0, bottom: rows, left: 0, right: 10,
+                    rows: 1, cols: 0),
+                line(rows - 1, "zzzzzzzzzz", hl: 0),
+                .gridCursorGoto(grid: 1, row: cursorRow, col: 2),
+                .winViewport(
+                    grid: 1, win: 10, topline: step, botline: step + rows,
+                    curline: 8, curcol: 2, lineCount: 100, scrollDelta: 1),
+            ]))
+            expectLocked(to: cursorRow)
+            if step.isMultiple(of: 2) {
+                _ = view.advanceAnimations(
+                    by: 1.0 / 120.0,
+                    nominalDisplayPeriod: 1.0 / 120.0)
+                expectLocked(to: cursorRow)
+            }
+        }
+
+        for _ in 0..<240 where !view.animationsAreIdle {
+            _ = view.advanceAnimations(
+                by: 1.0 / 120.0,
+                nominalDisplayPeriod: 1.0 / 120.0)
+            expectLocked(to: 2)
+        }
+        #expect(view.animationsAreIdle)
     }
 
     @Test func cursorAtBottomMarginRemainsClampedDuringScroll() {
