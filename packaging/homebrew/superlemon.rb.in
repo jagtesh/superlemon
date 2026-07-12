@@ -1,0 +1,15 @@
+cask "superlemon" do
+  version "@VERSION@"
+  sha256 "@SHA256@"
+
+  url "https://github.com/jagtesh/superlemon/releases/download/v#{version}/Superlemon-#{version}-macOS.zip"
+  name "Superlemon"
+  desc "Native macOS interface built around Neovim"
+  homepage "https://github.com/jagtesh/superlemon"
+
+  depends_on macos: ">= :sonoma"
+
+  app "Superlemon.app"
+
+  zap trash: "~/.config/superlemon"
+end

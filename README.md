@@ -35,6 +35,14 @@ needed.
 
 ## Run
 
+Install the latest release with Homebrew:
+
+```sh
+brew install --cask jagtesh/tap/superlemon
+```
+
+Or build and run from source:
+
 ```sh
 swift build
 .build/debug/superlemon
@@ -85,6 +93,11 @@ The command updates the application version, creates and pushes the release
 commit and `v0.2.0` tag, and starts the release workflow. GitHub Actions tests
 the tagged source, uploads its packaged application as a workflow artifact,
 and attaches that exact archive to the corresponding GitHub Release.
+Once the release workflow completes, publish its checksum-pinned Homebrew cask:
+
+```sh
+scripts/publish-homebrew-cask.sh 0.2.0
+```
 
 See [DESIGN.md](DESIGN.md) for the implemented architecture,
 [NORTHSTAR.md](NORTHSTAR.md) for the product direction, and
