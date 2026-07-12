@@ -112,6 +112,61 @@ public final class GridSurfaceView: NSView {
         }
     }
 
+    /// Sublime-style native miniature for each sufficiently large normal
+    /// window grid. The app still owns the Neovim resize request; SurfaceKit
+    /// waits for the matching grid_resize before exposing the gutter.
+    public var showsMinimap: Bool = true {
+        didSet {
+            guard showsMinimap != oldValue else { return }
+            refreshEditorAccessories()
+        }
+    }
+
+    /// Small native overlay scrollers are opt-in. When a minimap is present
+    /// they occupy its trailing 12 points; otherwise they overlay the grid's
+    /// trailing edge without reserving a text column.
+    public var showsNativeScrollbars: Bool = false {
+        didSet {
+            guard showsNativeScrollbars != oldValue else { return }
+            refreshEditorAccessories()
+        }
+    }
+
+    /// Desired trailing minimap gutter in points. SurfaceKit clamps the
+    /// effective value to the runtime-supported 48...160 point range.
+    public var minimapWidth: CGFloat = 88 {
+        didSet {
+            guard minimapWidth != oldValue else { return }
+            refreshEditorAccessories()
+        }
+    }
+
+    /// CoreText glyph scale relative to the active editor font size. It never
+    /// scales the already-rasterized editor viewport.
+    public var minimapScale: CGFloat = 0.20 {
+        didSet {
+            guard minimapScale != oldValue else { return }
+            refreshEditorAccessories()
+        }
+    }
+
+    /// Vertical minimap row pitch in points, snapped to physical pixels.
+    public var minimapPitch: CGFloat = 3.0 {
+        didSet {
+            guard minimapPitch != oldValue else { return }
+            refreshEditorAccessories()
+        }
+    }
+
+    /// Minimum text columns required before reserving the minimap gutter.
+    /// Hiding uses a four-column hysteresis band.
+    public var minimapMinEditorColumns: Int = 40 {
+        didSet {
+            guard minimapMinEditorColumns != oldValue else { return }
+            refreshEditorAccessories()
+        }
+    }
+
     public init(frame frameRect: NSRect, font: FontSpec) {
         self.fontSpec = font
         self.fonts = FontSet(spec: font)
@@ -187,7 +242,15 @@ public final class GridSurfaceView: NSView {
         for frame in lastFrames.reversed() {
             let r = frame.rect
             if row >= r.row, row < r.row + r.height, col >= r.col, col < r.col + r.width {
-                return (grid: frame.gridID, row: row - r.row, col: col - r.col)
+                let localRow = row - r.row
+                let localCol = col - r.col
+                if let grid = lastFlush?.grids[frame.gridID],
+                    (localRow >= grid.rows || localCol >= grid.cols)
+                {
+                    // A UI-owned trailing gutter is never a Neovim cell.
+                    return nil
+                }
+                return (grid: frame.gridID, row: localRow, col: localCol)
             }
         }
         return (grid: 1, row: row, col: col)
@@ -213,9 +276,12 @@ public final class GridSurfaceView: NSView {
         guard let frame = lastFrames.first(where: { $0.gridID == id }) else { return nil }
         let localRow = Int(floor(point.y / cellSize.height)) - frame.rect.row
         let localCol = Int(floor(point.x / cellSize.width)) - frame.rect.col
+        let gridRows = lastFlush?.grids[id]?.rows ?? frame.rect.height
+        let gridCols = lastFlush?.grids[id]?.cols ?? frame.rect.width
+        guard gridRows > 0, gridCols > 0 else { return nil }
         return (
-            row: max(0, min(frame.rect.height - 1, localRow)),
-            col: max(0, min(frame.rect.width - 1, localCol))
+            row: max(0, min(gridRows - 1, localRow)),
+            col: max(0, min(gridCols - 1, localCol))
         )
     }
 
@@ -225,6 +291,68 @@ public final class GridSurfaceView: NSView {
         guard let flush = lastFlush, cellSize != .zero else { return nil }
         let origin = cursorOrigin(flush)
         return NSRect(origin: origin, size: cellSize)
+    }
+
+    // MARK: - Package editor-accessory bridge
+
+    package var onMinimapContentRangeRequest:
+        ((MinimapContentRangeRequest) -> Void)?
+    {
+        get { accessoryCoordinator.onContentRangeRequest }
+        set { accessoryCoordinator.onContentRangeRequest = newValue }
+    }
+
+    package var onGridAccessorySizeRequest:
+        ((GridAccessorySizeRequest) -> Void)?
+    {
+        get { accessoryCoordinator.onGridSizeRequest }
+        set { accessoryCoordinator.onGridSizeRequest = newValue }
+    }
+
+    package var onGridAccessoryViewportTargetRequest:
+        ((GridAccessoryViewportTargetRequest) -> Void)?
+    {
+        get { accessoryCoordinator.onViewportTargetRequest }
+        set { accessoryCoordinator.onViewportTargetRequest = newValue }
+    }
+
+    package var onGridAccessoryWheelRequest:
+        ((GridAccessoryWheelRequest) -> Void)?
+    {
+        get { accessoryCoordinator.onWheelRequest }
+        set { accessoryCoordinator.onWheelRequest = newValue }
+    }
+
+    package func setMinimapTopologies(_ topologies: [MinimapBufferTopology]) {
+        accessoryCoordinator.setTopologies(topologies)
+    }
+
+    package func updateMinimapTopology(_ topology: MinimapBufferTopology) {
+        accessoryCoordinator.updateTopology(topology)
+    }
+
+    package func removeMinimapTopology(windowHandle: Int) {
+        accessoryCoordinator.removeTopology(windowHandle: windowHandle)
+    }
+
+    package func provideMinimapContent(_ chunk: MinimapContentChunk) {
+        accessoryCoordinator.provide(chunk)
+    }
+
+    /// InputHostView asks this before converting an event into a Neovim cell.
+    /// It returns only explicit, topmost-safe accessory controls.
+    package func accessoryInteractionView(at point: NSPoint) -> NSView? {
+        accessoryCoordinator.interactionView(at: point)
+    }
+
+    package func editorAccessoryDebugSnapshot(
+        gridID: Int
+    ) -> GridAccessoryDebugSnapshot? {
+        accessoryCoordinator.debugSnapshot(gridID: gridID)
+    }
+
+    package func editorAccessoryScroller(gridID: Int) -> NSScroller? {
+        accessoryCoordinator.scroller(gridID: gridID)
     }
 
     public override func viewDidChangeBackingProperties() {
@@ -244,6 +372,7 @@ public final class GridSurfaceView: NSView {
     private var renderers: [Int: GridRenderer] = [:]
     private var gridLayers: [Int: CALayer] = [:]
     private var smoothViewports: [Int: SmoothViewportState] = [:]
+    private lazy var accessoryCoordinator = GridAccessoryCoordinator(hostView: self)
     private let cursorLayer = CursorLayer()
     private var lastFlush: FlushResult?
     private var lastFrames: [ResolvedGridFrame] = []
@@ -418,6 +547,8 @@ public final class GridSurfaceView: NSView {
             smoothViewports.removeValue(forKey: id)
         }
 
+        syncEditorAccessories(flush: flush, frames: frames)
+
         // 4. Cursor.
         if atomicallySettledGrids.contains(flush.cursor.grid)
             || authoritativeCursorGrid.map(atomicallySettledGrids.contains) == true
@@ -476,6 +607,7 @@ public final class GridSurfaceView: NSView {
         cursorCorrection.settle()
         cursorCorrectionActive = false
         updateCursorPresentation()
+        updateEditorAccessoryMotion()
         pauseDisplayLink()
     }
 
@@ -603,6 +735,7 @@ public final class GridSurfaceView: NSView {
                 active = true
             }
         }
+        updateEditorAccessoryMotion()
         updateCursorPresentation()
         return active
             || smoothViewports.values.contains(where: \.isActive)
@@ -782,6 +915,38 @@ public final class GridSurfaceView: NSView {
         let created = GridRenderer(rasterizer: rasterizer, scale: scale)
         renderers[id] = created
         return created
+    }
+
+    private func refreshEditorAccessories() {
+        guard let flush = lastFlush else { return }
+        syncEditorAccessories(flush: flush, frames: lastFrames)
+    }
+
+    private func syncEditorAccessories(
+        flush: FlushResult, frames: [ResolvedGridFrame]
+    ) {
+        let residuals = smoothViewports.reduce(into: [Int: CGFloat]()) {
+            $0[$1.key] = cellSize.height > 0
+                ? $1.value.snappedTranslationY / cellSize.height : 0
+        }
+        accessoryCoordinator.sync(
+            flush: flush, frames: frames, gridLayers: gridLayers,
+            residuals: residuals, cellSize: cellSize, scale: scale,
+            fontName: CTFontCopyPostScriptName(fonts.regular) as String,
+            editorFontSize: fontSpec.size,
+            showsMinimap: showsMinimap,
+            showsScrollbars: showsNativeScrollbars,
+            minimapWidth: minimapWidth, minimapScale: minimapScale,
+            minimapPitch: minimapPitch,
+            minimapMinEditorColumns: minimapMinEditorColumns)
+    }
+
+    private func updateEditorAccessoryMotion() {
+        accessoryCoordinator.updateResiduals(
+            smoothViewports.reduce(into: [Int: CGFloat]()) {
+                $0[$1.key] = cellSize.height > 0
+                    ? $1.value.snappedTranslationY / cellSize.height : 0
+            })
     }
 
     /// Layer for a grid, created on demand. A grid that never appeared in
