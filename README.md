@@ -38,12 +38,14 @@ needed.
 Install the latest release with Homebrew:
 
 ```sh
-brew install --cask --no-quarantine jagtesh/tap/superlemon
+brew tap jagtesh/tap
+brew install --cask --no-quarantine superlemon
 ```
 
 The current preview builds are ad-hoc signed rather than Apple Developer ID
-signed and notarized, so Homebrew must install them without quarantine. Future
-notarized releases will use the normal `brew install --cask` command.
+signed and notarized. The `--no-quarantine` option bypasses Gatekeeper for this
+app; only use it if you trust this repository and its checksum-pinned release.
+Future notarized releases will use the normal `brew install --cask` command.
 
 Or build and run from source:
 

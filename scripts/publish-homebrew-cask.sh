@@ -54,4 +54,6 @@ git commit -m "Update Superlemon to $version"
 git push origin HEAD
 
 echo "Published $tap_repo/Casks/superlemon.rb"
-echo "Install with: brew install --cask jagtesh/tap/superlemon"
+echo "Install with:"
+echo "  brew tap jagtesh/tap"
+echo "  brew install --cask --no-quarantine superlemon"
