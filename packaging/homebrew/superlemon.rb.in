@@ -7,7 +7,7 @@ cask "superlemon" do
   desc "Native macOS interface built around Neovim"
   homepage "https://github.com/jagtesh/superlemon"
 
-  depends_on macos: ">= :sonoma"
+  depends_on macos: :sonoma
 
   app "Superlemon.app"
 
