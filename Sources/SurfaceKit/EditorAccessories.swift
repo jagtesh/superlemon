@@ -589,8 +589,17 @@ private final class GridAccessoryScroller: NSScroller {
         target = self
         action = #selector(valueChanged(_:))
         controlSize = .small
-        scrollerStyle = .overlay
         knobStyle = .default
+    }
+
+    /// Overlay scrollers are invisible when idle: NSScrollView's private
+    /// flash/fade machinery is what ever shows them, and this scroller is
+    /// standalone. The style is pinned (not merely assigned) because the
+    /// assignment is applied device-dependently — it held on trackpad Macs
+    /// (preferred style overlay) and was ignored elsewhere.
+    override var scrollerStyle: NSScroller.Style {
+        get { .legacy }
+        set { _ = newValue }
     }
 
     @available(*, unavailable)
@@ -640,14 +649,14 @@ private final class GridAccessoryInteractionView: NSView {
     override var acceptsFirstResponder: Bool { false }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
+    /// `point` is in the superview's (surface's) coordinate system, per the
+    /// AppKit hit-testing contract.
     override func hitTest(_ point: NSPoint) -> NSView? {
-        guard !isHidden, bounds.contains(point) else { return nil }
-        if let superview {
-            let surfacePoint = convert(point, to: superview)
-            guard isTopmostAtSurfacePoint?(surfacePoint) != false else { return nil }
-        }
-        if !scroller.isHidden, scroller.frame.contains(point) {
-            return scroller.hitTest(convert(point, to: scroller))
+        guard !isHidden, superview != nil, frame.contains(point) else { return nil }
+        guard isTopmostAtSurfacePoint?(point) != false else { return nil }
+        let local = convert(point, from: superview)
+        if !scroller.isHidden, scroller.frame.contains(local) {
+            return scroller.hitTest(local)
         }
         return minimapIsInteractive ? self : nil
     }
@@ -1553,12 +1562,13 @@ final class GridAccessoryCoordinator {
     }
 
     func interactionView(at point: NSPoint) -> NSView? {
-        guard let hostView, let top = topmostGrid(at: point),
+        guard hostView != nil, let top = topmostGrid(at: point),
             let state = states[top.gridID],
             state.interactionView.superview != nil
         else { return nil }
-        let pointInInteraction = state.interactionView.convert(point, from: hostView)
-        return state.interactionView.hitTest(pointInInteraction)
+        // The interaction view is a direct subview of the surface, so a
+        // surface point already satisfies the hit-testing contract.
+        return state.interactionView.hitTest(point)
     }
 
     func debugSnapshot(gridID: Int) -> GridAccessoryDebugSnapshot? {

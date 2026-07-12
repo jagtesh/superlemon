@@ -1,0 +1,34 @@
+name: Proposal
+description: Start a discussion about a feature or product direction before code is written.
+title: "[Proposal]: "
+labels:
+  - "kind: proposal"
+  - "status: needs discussion"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please lead with the user problem. A maintainer will add `status: ready for PR` if implementation is invited.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem or opportunity do you see?
+      description: Explain who encounters it and in what workflow.
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: What outcome would help?
+      description: Describe how the experience should improve without assuming a particular implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives or examples
+      description: What do you do today, and are there other products or interactions worth learning from?
+  - type: textarea
+    id: scope
+    attributes:
+      label: Anything that should be out of scope?

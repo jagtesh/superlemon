@@ -224,6 +224,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
         NSApp.orderFrontStandardAboutPanel(options: [
             .applicationName: "Superlemon",
+            .applicationIcon: NSApp.applicationIconImage as Any,
             .credits: credits,
         ])
     }
@@ -328,10 +329,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         controller?.toggleNativeChrome("minimap")
     }
 
-    @objc private func toggleNativeScrollbars(_ sender: Any?) {
-        controller?.toggleNativeChrome("scrollbars")
-    }
-
     /// Configuration-source selector retained for the Settings-owned managed
     /// versus user-init preference; changes take effect at launch.
     @objc private func toggleManagedConfig(_ sender: Any?) {
@@ -374,8 +371,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             menuItem.state = (chrome?.nativeStatusbar ?? false) ? .on : .off
         case #selector(toggleMinimap(_:)):
             menuItem.state = (chrome?.nativeMinimap ?? true) ? .on : .off
-        case #selector(toggleNativeScrollbars(_:)):
-            menuItem.state = (chrome?.nativeScrollbars ?? false) ? .on : .off
         default:
             break
         }
@@ -522,12 +517,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             keyEquivalent: "")
         minimapItem.target = self
         viewMenu.addItem(minimapItem)
-        let nativeScrollbarsItem = NSMenuItem(
-            title: "Native Scroll Bars",
-            action: #selector(toggleNativeScrollbars(_:)),
-            keyEquivalent: "")
-        nativeScrollbarsItem.target = self
-        viewMenu.addItem(nativeScrollbarsItem)
+        // Native scroll bars are hidden from the menu while the standalone
+        // NSScroller presentation is unreliable; the runtime plumbing stays
+        // (:SuperlemonChrome scrollbars / g:superlemon_native_scrollbars,
+        // both default off).
         viewMenu.addItem(.separator())
         let historyItem = NSMenuItem(
             title: "Message History…",

@@ -47,9 +47,12 @@ final class InputHostView: NSView, @preconcurrency NSTextInputClient {
 
     /// Grid pixels remain owned by this first-responder view. Explicit native
     /// controls in an acknowledged accessory gutter are the sole exception.
+    /// AppKit passes `point` in the superview's coordinate system; this view
+    /// sits at a sidebar-width x offset inside the split view, so converting
+    /// from the correct space is load-bearing.
     override func hitTest(_ point: NSPoint) -> NSView? {
         guard super.hitTest(point) != nil else { return nil }
-        let pointInSurface = surface.convert(point, from: self)
+        let pointInSurface = surface.convert(point, from: superview)
         return surface.accessoryInteractionView(at: pointInSurface) ?? self
     }
 

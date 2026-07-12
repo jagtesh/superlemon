@@ -1,127 +1,73 @@
 # Superlemon
 
-Superlemon is a macOS-native code editor powered by an embedded Neovim
-process. Neovim remains authoritative for buffers, modes, undo, mappings,
-plugins, highlighting, windows, and final grid state. Superlemon supplies the
-native Mac window, input bridge, renderer, file chrome, menus, panels, and
-motion between Neovim's discrete frames.
+<p align="center">
+  <img src="assets/superlemon-icon.png" alt="Superlemon icon" width="160">
+</p>
 
-The current editor includes:
+Superlemon is a native macOS code editor with Neovim at its core. Neovim owns
+editing, buffers, mappings, plugins, highlighting, and undo; Superlemon adds a
+fast AppKit interface with smooth scrolling, a file tree, buffer tabs, Quick
+Open, a minimap, native command UI, and proper Mac keyboard and IME support.
 
-- a Core Text/Core Graphics renderer composed from persistent row-sized
-  `IOSurface` tiles;
-- display-linked, interruptible smooth vertical scrolling with exact retained
-  row history, cursor coupling, Reduce Motion support, and a bounded fast-scroll
-  veil for gaps that cannot be represented exactly;
-- a syntax-colored native minimap for each sufficiently large Neovim split,
-  with viewport/cursor markers, automatic narrow-split hiding, and an
-  independently configurable native overlay scrollbar;
-- a native file tree, fuzzy Quick Open, buffer tabs with Sublime-style preview
-  behavior, and an evaluated native Neovim statusline;
-- native command-line, completion, message, confirmation, file-open, folder-open,
-  Save, and Save As surfaces;
-- an `NSTextInputClient` bridge, including marked-text IME composition and a
-  per-side Option/Meta policy;
-- a Lua bridge for plugin-owned palettes, prompts, toasts, status segments, and
-  sidebar decorations.
+![Superlemon in action](media/superlemon-demo.gif)
 
 ## Requirements
 
-- macOS 14 or newer
-- Swift 6 toolchain
-- Neovim 0.12 or newer for the bundled managed configuration
+- macOS 14+
+- Swift 6
+- Neovim 0.12+
 
-Set `SUPERLEMON_NVIM` to an executable path when Neovim is not discoverable
-through the login-shell `PATH` or `/opt/homebrew/bin/nvim`.
+If Neovim is not on your login-shell `PATH`, set `SUPERLEMON_NVIM` to its full
+path.
 
-## Build and run
+## Run
 
 ```sh
 swift build
 .build/debug/superlemon
 ```
 
-The process working directory becomes the initial workspace root. A Finder
-launch whose working directory is `/` starts in the user's home directory.
+Superlemon opens the current directory as its workspace. Press `⌘P` for Quick
+Open, `⌘O` to open a file, and `⇧⌘O` to switch folders.
 
-Useful development overrides:
+To build a native application bundle with the system-managed macOS icon:
 
-| Variable | Purpose |
-|---|---|
-| `SUPERLEMON_NVIM` | Neovim executable path |
-| `SUPERLEMON_RUNTIME` | bundled runtime directory |
-| `SUPERLEMON_LISTEN` | expose the embedded Neovim on a server socket |
-| `SUPERLEMON_SCROLL_TRACE=1` | enable the bounded in-memory scroll diagnostic ring |
-
-## Configuration
-
-The default launch uses [`runtime/config/init.lua`](runtime/config/init.lua),
-which sources the annotated Superlemon baseline in
-[`runtime/config/superlemon.vim`](runtime/config/superlemon.vim). Personal
-Superlemon overrides belong in:
-
-```text
-$XDG_CONFIG_HOME/superlemon/init.vim
+```sh
+scripts/package-app.sh
+open dist/Superlemon.app
 ```
 
-That is normally `~/.config/superlemon/init.vim`. It is sourced after the
-bundled baseline, so personal values win. The same personal file is sourced
-once before bridge setup when Superlemon launches with the user's own Neovim
-configuration or an explicitly selected init file.
+## Configure
 
-Open **Superlemon > Settings…** to choose the Neovim init source or create and
-open the personal Superlemon file. Font name, font size, and line spacing stay
-in Neovim's `guifont` and `linespace`; renderer and native-chrome settings live
-in the annotated Superlemon file.
+The managed configuration lives in `runtime/config/`. Put personal overrides
+in `~/.config/superlemon/init.vim`, or choose another Neovim init from
+**Superlemon → Settings…**. Common development overrides are:
 
-The managed baseline enables the per-split minimap and leaves native
-scrollbars off. These settings are independent:
+| Variable | Purpose |
+| --- | --- |
+| `SUPERLEMON_NVIM` | Path to the Neovim executable |
+| `SUPERLEMON_RUNTIME` | Path to the bundled runtime |
+| `SUPERLEMON_LISTEN` | Expose the embedded Neovim socket |
 
-| Vim global | Default | Purpose |
-|---|---:|---|
-| `g:superlemon_native_minimap` | `1` | Show the minimap when a split can retain a useful editor width |
-| `g:superlemon_native_scrollbars` | `0` | Show a small native overlay scroller per scrollable split |
-| `g:superlemon_minimap_width` | `88` | Desired gutter width in points; clamped to 48…160 |
-| `g:superlemon_minimap_scale` | `0.20` | Core Text glyph size relative to the active editor font; clamped to 0.10…0.50 |
-| `g:superlemon_minimap_pitch` | `3.0` | Vertical line pitch in points; clamped to 1…6 |
-| `g:superlemon_minimap_min_editor_columns` | `40` | Text columns that must remain before the gutter appears; clamped to 20…120 |
-
-Use **View > Minimap** and **View > Native Scrollbars** for live toggles. The
-menu asks Neovim to change the corresponding runtime state and reflects the
-resulting notification; it does not maintain a second preference value.
-
-## Native file workflow
-
-| Action | Shortcut | Behavior |
-|---|---|---|
-| Open File… | ⌘O | Native picker, then Neovim `:drop` |
-| Open Folder… | ⇧⌘O | Changes Neovim's cwd and re-roots the sidebar, Quick Open, git state, and plugin decorations |
-| Save | ⌘S | Sends the user-remappable `<D-s>` mapping; the bundled mapping writes named buffers and opens native Save As for unnamed buffers |
-| Save As… | ⇧⌘S | Native picker, then Neovim `:saveas!` after AppKit confirms replacement |
-| Quick Open… | ⌘P | Searches the current workspace index |
-
-The GUI never writes buffer contents itself. Neovim performs every edit and
-save so encodings, autocmds, undo, swap state, and modified flags remain
-coherent.
-
-## Tests
+## Test
 
 ```sh
 swift test
 bash runtime/tests/run.sh
-swift build -c release
-SUPERLEMON_RUNTIME="$PWD/runtime" .build/release/superlemon --smoke
 ```
 
-## Documentation map
+See [DESIGN.md](DESIGN.md) for the implemented architecture,
+[NORTHSTAR.md](NORTHSTAR.md) for the product direction, and
+[runtime/CONTRACT.md](runtime/CONTRACT.md) for the Swift/Lua interface.
 
-- [`DESIGN.md`](DESIGN.md) — implemented architecture and authority boundaries
-- [`NORTHSTAR.md`](NORTHSTAR.md) — aspirational product and experience direction
-- [`runtime/CONTRACT.md`](runtime/CONTRACT.md) — fixed Swift/Lua RPC contract
-- [`Sources/ChromeKit/WIRING.md`](Sources/ChromeKit/WIRING.md) — externalized
-  Neovim UI wiring
-- [`Sources/ShellKit/WIRING.md`](Sources/ShellKit/WIRING.md) — native workspace
-  chrome wiring
+## Contributing
 
-the palette and geometry. `NORTHSTAR.md` turns that research into a destination;
-the README, design document, and wiring contracts describe what ships today.
+Feedback and discussion are more valuable than unsolicited code. Tell us what
+you like, what you do not, and what would make Superlemon better for you by
+opening an issue. Please read [CONTRIBUTING.md](CONTRIBUTING.md) before starting
+a pull request.
+
+## License
+
+Copyright © 2026 Jagtesh Chadha. Released under the [BSD 3-Clause
+License](LICENSE).

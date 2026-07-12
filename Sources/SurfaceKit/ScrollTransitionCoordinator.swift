@@ -297,6 +297,13 @@ final class SmoothViewportState {
     private(set) var geometry = SmoothViewportGeometry(rows: 0, cols: 0, margins: nil)
     private(set) var history = CircularRowHistory<SharedImageRow>(capacity: 0)
     private(set) var motion = ContinuousScrollEnvelope()
+    /// Backlog absorber for sustained far scrolling. The fixed-duration
+    /// envelope drains debt too slowly under page-jump storms, forcing
+    /// per-event cuts at the retained-history bound; this spring's drain
+    /// rate scales with the backlog, so storms reach a smooth equilibrium
+    /// below the physical one-screenful limit.
+    private(set) var catchUp = CriticalDampedSpring(
+        animationLength: SmoothViewportState.motionEnvelopeDuration)
     private(set) var isActive = false
     private(set) var lastSemanticDelta = 0
 
@@ -328,13 +335,13 @@ final class SmoothViewportState {
         clipLayer.addSublayer(rowContainerLayer)
     }
 
-    var position: CGFloat { motion.position }
-    var velocity: CGFloat { motion.velocity }
+    var position: CGFloat { motion.position + catchUp.position }
+    var velocity: CGFloat { motion.velocity + catchUp.velocity }
     var acceleration: CGFloat { motion.acceleration }
     var snappedTranslationY: CGFloat {
         lastTranslationY.isFinite
             ? lastTranslationY
-            : pixelSnap(motion.position * cellSize.height, scale: scale)
+            : pixelSnap(position * cellSize.height, scale: scale)
     }
     var snappedTranslationPixels: Int {
         Int((snappedTranslationY * scale).rounded())
@@ -425,6 +432,7 @@ final class SmoothViewportState {
             self.scale = nextScale
             rebuildLayers()
             motion.settle()
+            catchUp.settle()
             isActive = false
             authoritativeRows = nextRows
             bindAuthoritativeRows()
@@ -470,7 +478,7 @@ final class SmoothViewportState {
 
         if eligible, hasAuthoritativeRows {
             lastSemanticDelta = semanticMotion?.lastDelta ?? delta
-            isActive = motion.isActive
+            isActive = motion.isActive || !catchUp.isSettled
         }
         render(forceBindings: false)
         return eligible && hasAuthoritativeRows && isActive
@@ -491,8 +499,13 @@ final class SmoothViewportState {
 
         if isActive {
             motion.advance(by: bounded)
-            if !motion.isActive {
+            if !catchUp.isSettled {
+                catchUp.advance(by: bounded)
+                if catchUp.isSettled { catchUp.settle() }
+            }
+            if !motion.isActive, catchUp.isSettled {
                 motion.settle()
+                catchUp.settle()
                 isActive = false
                 lastSemanticDelta = 0
                 discardNonCurrentHistory()
@@ -505,6 +518,7 @@ final class SmoothViewportState {
 
     func settle() {
         motion.settle()
+        catchUp.settle()
         isActive = false
         lastSemanticDelta = 0
         discardNonCurrentHistory()
@@ -562,34 +576,53 @@ final class SmoothViewportState {
 
         let direction = trueFar ? farDirection : delta.signum()
         guard direction != 0 else { return false }
+        let catchingUp = !catchUp.isSettled
+
+        if trueFar, !motion.isActive, !catchingUp {
+            // An isolated far jump stays a cut: teleport with a one-row cue.
+            discardNonCurrentHistory()
+            guard copyDisplacedRows(for: direction) else { return false }
+            history.rotate(by: direction)
+            shiftFilmstripSlots(by: -direction)
+            motion.settle()
+            motion.add(
+                positionOffset: -CGFloat(direction),
+                duration: Self.motionEnvelopeDuration)
+            return true
+        }
+
         let retainedMagnitude = Int(min(UInt(height), delta.magnitude))
-        let animatedDelta = trueFar ? direction : delta.signum() * retainedMagnitude
+        let animatedDelta = direction * retainedMagnitude
         if trueFar { discardNonCurrentHistory() }
 
         guard copyDisplacedRows(for: animatedDelta) else { return false }
         history.rotate(by: animatedDelta)
         shiftFilmstripSlots(by: -animatedDelta)
 
-        if trueFar {
-            motion.settle()
-            motion.add(
-                positionOffset: -CGFloat(animatedDelta),
-                duration: Self.motionEnvelopeDuration)
-        } else {
+        let requestedOffset = -CGFloat(animatedDelta)
+        if !trueFar, !catchingUp {
             let capacity = CGFloat(height)
-            let requestedOffset = -CGFloat(delta)
-            let representableOffset: CGFloat
-            if requestedOffset < 0 {
-                let available = max(0, capacity - motion.negativeMagnitude)
-                representableOffset = max(requestedOffset, -available)
-            } else {
-                let available = max(0, capacity - motion.positiveMagnitude)
-                representableOffset = min(requestedOffset, available)
+            let available = requestedOffset < 0
+                ? max(0, capacity - motion.negativeMagnitude)
+                : max(0, capacity - motion.positiveMagnitude)
+            if abs(requestedOffset) <= available {
+                motion.add(
+                    positionOffset: requestedOffset,
+                    duration: Self.motionEnvelopeDuration)
+                return true
             }
-            motion.add(
-                positionOffset: representableOffset,
-                duration: Self.motionEnvelopeDuration)
         }
+
+        // Catch-up regime: migrating the envelope's position and velocity
+        // into the spring keeps the camera continuous; only the retained-
+        // history screenful remains a hard bound, and in equilibrium the
+        // spring's backlog-proportional drain stays below it.
+        catchUp.position += motion.position
+        catchUp.velocity += motion.velocity
+        motion.settle()
+        catchUp.position = max(
+            -CGFloat(height),
+            min(CGFloat(height), catchUp.position + requestedOffset))
         return true
     }
 
@@ -767,7 +800,7 @@ final class SmoothViewportState {
 
     private func render(forceBindings: Bool) {
         guard hasAuthoritativeRows, !rowSlots.isEmpty else { return }
-        let firstRow = Int(floor(motion.position))
+        let firstRow = Int(floor(position))
         let needsBindings = forceBindings || rowsNeedBinding || firstRow != lastBoundFirstRow
         if needsBindings {
             let desiredRows = Array(firstRow...(firstRow + geometry.innerRows))
@@ -816,7 +849,7 @@ final class SmoothViewportState {
         lastBoundFirstRow = firstRow
 
         let translation = pixelSnap(
-            motion.position * cellSize.height, scale: scale)
+            position * cellSize.height, scale: scale)
         if translation != lastTranslationY {
             rowContainerLayer.setAffineTransform(
                 CGAffineTransform(translationX: 0, y: translation))

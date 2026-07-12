@@ -777,7 +777,7 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
         #expect(state.currentRowsReference(final))
     }
 
-    @Test func farJumpCannotOvershootItsSingleLineCue() {
+    @Test func farJumpDuringActiveMotionSweepsTheRetainedPage() {
         let host = CALayer()
         let state = SmoothViewportState(gridID: 1)
         _ = state.present(
@@ -794,6 +794,9 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
         _ = state.advance(by: 1.0 / 60.0)
         #expect(state.velocity > 0)
 
+        // A far jump mid-motion migrates the envelope into the catch-up
+        // spring: the carried backlog clamps at one retained page and drains
+        // monotonically — no settle teleport, no ease-out strobing.
         _ = state.present(
             image: solidImage(width: 80, height: 96),
             rows: 6, cols: 10, margins: nil,
@@ -801,15 +804,61 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
                 top: 0, bottom: 6, left: 0, right: 10, rows: 20, cols: 0)],
             semanticDelta: 20, cellSize: cellSize,
             scale: 1, host: host, animate: true)
-        #expect(state.position == -1)
+        #expect(state.position == -6)
         var previous = state.position
-        for _ in 0..<240 where state.isActive {
+        for _ in 0..<480 where state.isActive {
             _ = state.advance(by: 1.0 / 120.0)
-            #expect(state.position >= previous)
-            #expect(state.position <= 0)
+            #expect(state.position >= previous - 0.001)
+            #expect(state.position <= 0.001)
             previous = state.position
         }
         #expect(!state.isActive)
+        #expect(state.position == 0)
+    }
+
+    @Test func sustainedFarInputCutsOnlyAtTheRetainedHistoryBound() {
+        let host = CALayer()
+        let rows = 6
+        let image = solidImage(width: 80, height: 96)
+        let state = SmoothViewportState(gridID: 1)
+        _ = state.present(
+            image: image, rows: rows, cols: 10, margins: nil,
+            scrolls: [], semanticDelta: nil, cellSize: cellSize,
+            scale: 1, host: host, animate: true)
+        let storm = ScrollDelta(
+            top: 0, bottom: rows, left: 0, right: 10, rows: 3, cols: 0)
+
+        // Half-page jumps faster than the envelope can drain. At every
+        // insertion the camera either stays fully compensated (moves by
+        // exactly the rotation) or rests at the retained-history bound —
+        // the mid-range teleports that caused ease-out strobing are gone.
+        for _ in 0..<12 {
+            let before = state.position
+            _ = state.present(
+                image: image, rows: rows, cols: 10, margins: nil,
+                scrolls: [storm], semanticDelta: 3, cellSize: cellSize,
+                scale: 1, host: host, animate: true)
+            let expected = max(before - 3, -CGFloat(rows))
+            #expect(abs(state.position - expected) <= 0.001,
+                "the camera may cut only at the retained-history bound")
+            var previous = state.position
+            for _ in 0..<4 {
+                _ = state.advance(
+                    by: 1.0 / 120.0, nominalDisplayPeriod: 1.0 / 120.0)
+                #expect(state.position >= previous - 0.001,
+                    "catch-up must drain monotonically between inputs")
+                previous = state.position
+            }
+            expectExactFilmstripOnly(state)
+        }
+
+        for _ in 0..<600 where state.isActive {
+            _ = state.advance(
+                by: 1.0 / 120.0, nominalDisplayPeriod: 1.0 / 120.0)
+        }
+        #expect(!state.isActive)
+        #expect(state.position == 0)
+        expectExactFilmstripOnly(state)
     }
 
     @Test func coalescedFarJumpKeepsTheFarStepsDirection() {
@@ -924,27 +973,43 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
             top: 0, bottom: rows, left: 0, right: 10, rows: -1, cols: 0)
 
         // Net position remains zero after every pair. Each direction must
-        // nevertheless consume and clamp its own retained-history capacity.
-        for pair in 1...(rows * 2) {
+        // nevertheless consume and clamp its own retained-history capacity
+        // while the envelope has room.
+        for pair in 1...rows {
             _ = state.present(
                 image: image, rows: rows, cols: 10, margins: nil,
                 scrolls: [down], semanticDelta: 1, cellSize: cellSize,
                 scale: 1, host: host, animate: true)
-            #expect(state.motion.negativeMagnitude == CGFloat(min(pair, rows)))
-            #expect(state.motion.positiveMagnitude == CGFloat(min(pair - 1, rows)))
+            #expect(state.motion.negativeMagnitude == CGFloat(pair))
+            #expect(state.motion.positiveMagnitude == CGFloat(pair - 1))
 
             _ = state.present(
                 image: image, rows: rows, cols: 10, margins: nil,
                 scrolls: [up], semanticDelta: -1, cellSize: cellSize,
                 scale: 1, host: host, animate: true)
-            let expectedMagnitude = CGFloat(min(pair, rows))
-            #expect(state.motion.negativeMagnitude == expectedMagnitude)
-            #expect(state.motion.positiveMagnitude == expectedMagnitude)
-            #expect(state.motion.negativeMagnitude <= CGFloat(rows))
-            #expect(state.motion.positiveMagnitude <= CGFloat(rows))
+            #expect(state.motion.negativeMagnitude == CGFloat(pair))
+            #expect(state.motion.positiveMagnitude == CGFloat(pair))
         }
 
-        #expect(state.motion.segments.count == rows * 2)
+        // Beyond envelope capacity the catch-up spring carries the debt.
+        // The presented camera invariant is what matters: one row behind
+        // after each down, exactly recovered after each up.
+        for _ in 1...rows {
+            _ = state.present(
+                image: image, rows: rows, cols: 10, margins: nil,
+                scrolls: [down], semanticDelta: 1, cellSize: cellSize,
+                scale: 1, host: host, animate: true)
+            #expect(state.position == -1)
+            #expect(abs(state.position) <= CGFloat(rows))
+
+            _ = state.present(
+                image: image, rows: rows, cols: 10, margins: nil,
+                scrolls: [up], semanticDelta: -1, cellSize: cellSize,
+                scale: 1, host: host, animate: true)
+            #expect(state.position == 0)
+        }
+
+        #expect(!state.motion.segments.isEmpty)
         #expect(state.position == 0)
         #expect(state.velocity == 0)
         #expect(state.acceleration == 0)

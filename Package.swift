@@ -29,7 +29,8 @@ let package = Package(
         // app shell: windows, menus, session
         .executableTarget(
             name: "SuperlemonApp",
-            dependencies: ["NvimKit", "GridKit", "InputKit", "SurfaceKit", "ChromeKit", "ShellKit"]
+            dependencies: ["NvimKit", "GridKit", "InputKit", "SurfaceKit", "ChromeKit", "ShellKit"],
+            resources: [.process("Resources")]
         ),
         .testTarget(name: "NvimKitTests", dependencies: ["NvimKit"]),
         .testTarget(name: "GridKitTests", dependencies: ["GridKit"]),

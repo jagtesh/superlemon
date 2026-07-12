@@ -276,6 +276,9 @@ final class NvimController {
         if let env = ProcessInfo.processInfo.environment["SUPERLEMON_RUNTIME"], !env.isEmpty {
             candidates.append(URL(fileURLWithPath: env, isDirectory: true))
         }
+        if let resources = Bundle.main.resourceURL {
+            candidates.append(resources.appendingPathComponent("runtime", isDirectory: true))
+        }
         let executable = URL(fileURLWithPath: Bundle.main.executablePath ?? "")
         candidates.append(
             executable.deletingLastPathComponent()  // .build/debug

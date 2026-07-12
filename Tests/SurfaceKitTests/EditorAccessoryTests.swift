@@ -87,11 +87,12 @@ private final class AccessoryRoutingHost: NSView {
 
     override var isFlipped: Bool { true }
 
-    /// Mirrors InputHostView's production routing without importing the
-    /// executable target into SurfaceKitTests.
+    /// Mirrors InputHostView's production routing — including the AppKit
+    /// contract that `point` arrives in superview coordinates — without
+    /// importing the executable target into SurfaceKitTests.
     override func hitTest(_ point: NSPoint) -> NSView? {
         guard super.hitTest(point) != nil else { return nil }
-        let pointInSurface = surface.convert(point, from: self)
+        let pointInSurface = surface.convert(point, from: superview)
         return surface.accessoryInteractionView(at: pointInSurface) ?? self
     }
 
@@ -290,11 +291,20 @@ private func dominantRedPixelCount(_ image: CGImage) -> Int {
         harness.presentInitial()
         harness.acknowledge(sizeRequest!)
 
+        // Embed the host at a sidebar-like x offset inside a container, the
+        // production split-view arrangement: hit-test points then arrive in
+        // superview coordinates that differ from host-local ones, which is
+        // exactly what broke live minimap routing.
         let host = AccessoryRoutingHost(surface: harness.view)
+        let container = NSView(frame: NSRect(
+            x: 0, y: 0,
+            width: host.frame.width + 220, height: host.frame.height))
+        host.setFrameOrigin(NSPoint(x: 220, y: 0))
+        container.addSubview(host)
         let window = NSWindow(
-            contentRect: host.bounds, styleMask: .borderless,
+            contentRect: container.frame, styleMask: .borderless,
             backing: .buffered, defer: false)
-        window.contentView = host
+        window.contentView = container
         guard let snapshot = harness.view.editorAccessoryDebugSnapshot(gridID: 2),
             let interaction = snapshot.interactionFrame,
             let viewport = snapshot.viewportFrame,
@@ -310,7 +320,9 @@ private func dominantRedPixelCount(_ image: CGImage) -> Int {
             x: interaction.minX + 8,
             y: interaction.minY + interaction.height * 0.8)
         let clickInHost = host.convert(clickInSurface, from: harness.view)
-        guard let routed = host.hitTest(clickInHost), routed !== host else {
+        guard let routed = host.hitTest(
+            container.convert(clickInHost, from: host)), routed !== host
+        else {
             Issue.record("InputHost-style hit routing missed the minimap")
             return
         }
@@ -339,7 +351,9 @@ private func dominantRedPixelCount(_ image: CGImage) -> Int {
             x: interaction.minX + 8,
             y: interaction.minY + viewport.midY)
         let grabInHost = host.convert(grabInSurface, from: harness.view)
-        guard let dragTarget = host.hitTest(grabInHost), dragTarget !== host else {
+        guard let dragTarget = host.hitTest(
+            container.convert(grabInHost, from: host)), dragTarget !== host
+        else {
             Issue.record("viewport marker drag was not routed to minimap")
             return
         }
@@ -532,6 +546,30 @@ private func dominantRedPixelCount(_ image: CGImage) -> Int {
         #expect(snapshot.scrollerIsVisible)
         #expect(abs(scroller.frame.width - 12) < 0.001)
         #expect(abs(scroller.frame.maxX - interaction.width) < 0.001)
+
+        // A standalone overlay scroller never draws its knob (NSScrollView's
+        // fade machinery is what shows overlay knobs); the bar must be
+        // persistently visible and draggable.
+        #expect(scroller.scrollerStyle == .legacy)
+        #expect(scroller.isEnabled)
+        #expect(scroller.knobProportion > 0)
+        let knob = scroller.rect(for: .knob)
+        #expect(!knob.isEmpty, "the scroller must lay out a draggable knob")
+        guard let rep = scroller.bitmapImageRepForCachingDisplay(
+            in: scroller.bounds)
+        else {
+            Issue.record("scroller rasterization unavailable")
+            return
+        }
+        scroller.cacheDisplay(in: scroller.bounds, to: rep)
+        var inkedPixels = 0
+        for y in 0..<rep.pixelsHigh {
+            for x in 0..<rep.pixelsWide
+            where (rep.colorAt(x: x, y: y)?.alphaComponent ?? 0) > 0.1 {
+                inkedPixels += 1
+            }
+        }
+        #expect(inkedPixels > 0, "the scroll bar must actually draw")
     }
 
     @Test func nativeScrollerAutoHidesWhenTheViewportCoversTheBuffer() {
