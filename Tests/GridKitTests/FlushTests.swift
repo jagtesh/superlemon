@@ -281,6 +281,167 @@ import NvimKit
         #expect(resized?.allowsScrollInterpolation == false)
     }
 
+    @Test func externalizedModeCommandAndRulerMessagesRemainScrollCompatible() {
+        let store = makeStore(rows: 6, cols: 6)
+        let disposition = store.applyDeferred(batch(
+            .msgShowmode(content: [(hlID: 0, text: "-- NORMAL --")]),
+            .gridScroll(
+                grid: 1, top: 0, bottom: 6, left: 0, right: 6,
+                rows: 1, cols: 0),
+            line(1, 5, 0, runs("next  ")),
+            .msgShowcmd(content: [(hlID: 0, text: "^E")]),
+            .msgRuler(content: [(hlID: 0, text: "2,1")]),
+            .winViewport(
+                grid: 1, win: 10, topline: 1, botline: 7,
+                curline: 2, curcol: 0, lineCount: 100, scrollDelta: 1),
+            .gridCursorGoto(grid: 1, row: 1, col: 0),
+            .flush
+        ))
+
+        #expect(disposition == .displayLinked)
+        let result = store.consumePendingPresentation()
+        #expect(result?.allowsScrollInterpolation == true)
+        #expect(result?.viewportScrollMotions[1]?.stepCount == 1)
+    }
+
+    @Test func standaloneExternalizedMessagesDoNotRequestDeferredPresentation() {
+        let store = makeStore(rows: 6, cols: 6)
+        let messages = batch(
+            .msgShowmode(content: [(hlID: 0, text: "-- NORMAL --")]),
+            .msgShowcmd(content: [(hlID: 0, text: "^E")]),
+            .msgRuler(content: [(hlID: 0, text: "2,1")]),
+            .flush
+        )
+
+        #expect(store.applyDeferred(messages) == .none)
+        #expect(store.consumePendingPresentation() == nil)
+
+        let directStore = makeStore(rows: 6, cols: 6)
+        #expect(directStore.apply(messages) != nil,
+                "public direct apply keeps its one-flush/one-result contract")
+    }
+
+    @Test func externalizedMessageOnlyFlushLeavesPendingScrollScheduled() {
+        let store = makeStore(rows: 6, cols: 6)
+        #expect(store.applyDeferred(batch(
+            .gridScroll(
+                grid: 1, top: 0, bottom: 6, left: 0, right: 6,
+                rows: 1, cols: 0),
+            line(1, 5, 0, runs("next  ")),
+            .winViewport(
+                grid: 1, win: 10, topline: 1, botline: 7,
+                curline: 2, curcol: 0, lineCount: 100, scrollDelta: 1),
+            .flush
+        )) == .displayLinked)
+
+        #expect(store.applyDeferred(batch(
+            .msgShowcmd(content: [(hlID: 0, text: "^E")]),
+            .flush
+        )) == .none)
+
+        let result = store.consumePendingPresentation()
+        #expect(result?.allowsScrollInterpolation == true)
+        #expect(result?.viewportScrollDeltas == [1: 1])
+        #expect(result?.viewportScrollMotions[1]?.stepCount == 1)
+    }
+
+    @Test func aggregatedViewportDeltaUsesOrderedUnitGridScrollProvenance() {
+        let store = makeStore(rows: 6, cols: 6)
+        var events: [UIEvent] = []
+        for step in 1...5 {
+            events.append(.gridScroll(
+                grid: 1, top: 0, bottom: 6, left: 0, right: 6,
+                rows: 1, cols: 0))
+            events.append(line(1, 5, 0, runs("row\(step) ")))
+            events.append(.msgRuler(content: [
+                (hlID: 0, text: "\(step + 1),1"),
+            ]))
+        }
+        events.append(contentsOf: [
+            .winViewport(
+                grid: 1, win: 10, topline: 5, botline: 11,
+                curline: 6, curcol: 0, lineCount: 100, scrollDelta: 5),
+            .gridCursorGoto(grid: 1, row: 1, col: 0),
+            .flush,
+        ])
+
+        #expect(store.applyDeferred(RedrawBatch(events: events)) == .displayLinked)
+        let motion = store.consumePendingPresentation()?.viewportScrollMotions[1]
+        #expect(motion?.netDelta == 5)
+        #expect(motion?.stepCount == 5)
+        #expect(motion?.largestStepMagnitude == 1)
+        #expect(motion?.largestStepDelta == 1)
+        #expect(motion?.containsReversal == false)
+    }
+
+    @Test func oneLargeGridScrollRemainsOneLargeSemanticStep() {
+        let store = makeStore(rows: 6, cols: 6)
+        #expect(store.applyDeferred(batch(
+            .gridScroll(
+                grid: 1, top: 0, bottom: 6, left: 0, right: 6,
+                rows: 5, cols: 0),
+            line(1, 5, 0, runs("final ")),
+            .msgRuler(content: [(hlID: 0, text: "6,1")]),
+            .winViewport(
+                grid: 1, win: 10, topline: 5, botline: 11,
+                curline: 6, curcol: 0, lineCount: 100, scrollDelta: 5),
+            .flush
+        )) == .displayLinked)
+
+        let motion = store.consumePendingPresentation()?.viewportScrollMotions[1]
+        #expect(motion?.netDelta == 5)
+        #expect(motion?.stepCount == 1)
+        #expect(motion?.largestStepMagnitude == 5)
+        #expect(motion?.largestStepDelta == 5)
+    }
+
+    @Test func aggregatedZeroNetReversalRetainsPixelStepOrder() {
+        let store = makeStore(rows: 6, cols: 6)
+        #expect(store.applyDeferred(batch(
+            .gridScroll(
+                grid: 1, top: 0, bottom: 6, left: 0, right: 6,
+                rows: 1, cols: 0),
+            .gridScroll(
+                grid: 1, top: 0, bottom: 6, left: 0, right: 6,
+                rows: -1, cols: 0),
+            .winViewport(
+                grid: 1, win: 10, topline: 0, botline: 6,
+                curline: 1, curcol: 0, lineCount: 100, scrollDelta: 0),
+            .flush
+        )) == .immediate)
+
+        let motion = store.consumePendingPresentation()?.viewportScrollMotions[1]
+        #expect(motion?.netDelta == 0)
+        #expect(motion?.stepCount == 2)
+        #expect(motion?.largestStepMagnitude == 1)
+        #expect(motion?.largestStepDelta == -1)
+        #expect(motion?.lastDelta == -1)
+        #expect(motion?.containsReversal == true)
+    }
+
+    @Test func pixelSemanticNetMismatchFallsBackToAtomicAuthoritativeStep() {
+        let store = makeStore(rows: 6, cols: 6)
+        #expect(store.applyDeferred(batch(
+            .gridScroll(
+                grid: 1, top: 0, bottom: 6, left: 0, right: 6,
+                rows: 1, cols: 0),
+            .gridScroll(
+                grid: 1, top: 0, bottom: 6, left: 0, right: 6,
+                rows: 1, cols: 0),
+            .winViewport(
+                grid: 1, win: 10, topline: 5, botline: 11,
+                curline: 6, curcol: 0, lineCount: 100, scrollDelta: 5),
+            .flush
+        )) == .immediate)
+
+        let result = store.consumePendingPresentation()
+        #expect(result?.allowsScrollInterpolation == false)
+        let motion = result?.viewportScrollMotions[1]
+        #expect(motion?.netDelta == 5)
+        #expect(motion?.stepCount == 1)
+        #expect(motion?.largestStepMagnitude == 5)
+    }
+
     @Test func directApplyCarriesTheSameInterpolationSafety() {
         let store = makeStore(rows: 6, cols: 6)
         let compatible = store.apply(batch(

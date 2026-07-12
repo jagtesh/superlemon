@@ -386,13 +386,13 @@ than asking Neovim to synthesize fake intermediate edits:
   showing a plausible but wrong transition.
 - Each direction has an independently bounded history budget, so reversals
   cannot conceal more visual debt than exact retained rows can represent. True
-  beyond-history jumps receive one concise one-row cue. A low-cost velocity veil
-  may bridge a measured display gap, but it is rare, directionally honest, and
-  hard-limited; exact text returns without a snap.
+  beyond-history jumps receive one concise one-row cue. When history clamps or a
+  display callback is delayed, the latest exact rows remain visible—never a
+  tinted, blurred, magnified, or misregistered substitute.
 - Cursor position derives from the same residual motion as its text, clamps at
   viewport edges, preserves blink phase, and never jitters independently.
 - Reduce Motion presents every authoritative state immediately and removes all
-  interpolation, veil, and ornamental movement.
+  interpolation and ornamental movement.
 
 Each Neovim window/split gains an independent native overlay scrollbar. Thumb
 geometry comes from `win_viewport`; it appears on hover/scroll, fades at rest,
@@ -476,7 +476,7 @@ or plugin state store.
 | **Workspace overview** | Responsive grid of live top-level workspace thumbnails plus a new-workspace card; never conflated with buffers or tabpages |
 | **Sidebar** | Resizable lazy tree, compact project header, type symbols, Git/diagnostic/plugin decorations, FSEvents refresh, preview/pin behavior, and buffer-aware file operations |
 | **Editor surface** | Exact Neovim multigrid with Core Text glyphs, per-grid row surfaces, native float treatment, and no theme translation |
-| **Smooth viewport** | Display-linked exact-row history, overlapping C2 minimum-jerk row envelopes, presentation-only Retina snapping, coupled cursor, bounded exceptional veil, and atomic fallback |
+| **Smooth viewport** | Display-linked exact-row history, overlapping C2 minimum-jerk row envelopes, presentation-only Retina snapping, coupled cursor, exact-only capacity handling, and atomic fallback |
 | **Native scrollbars** | Independent overlay scroller per Neovim window, derived from viewport metadata and routed back through Neovim |
 | **Status/command bar** | User-evaluated statusline, polished fallback, plugin segments, and in-place externalized command line |
 | **Quick Open / palettes** | 498 × 346 pt file palette and reusable provider-driven native picker with cancellable async data |
@@ -649,7 +649,7 @@ requested from Neovim at whole-cell crossings.
 | Scroll envelope | ≈0.180 s quintic minimum-jerk contribution per row; C2-continuous overlap |
 | Display-linked sampling | Analytical at the target frame; Retina snapping at presentation only |
 | Cursor correction | ≈0.040 s critical correction |
-| Exceptional velocity veil | ≤0.75 cell offset, subtle magnification, ≤8% accent, ≤150 ms |
+| Exceptional scroll gaps | Exact rows remain visible; bounded debt or one-line far cue; no synthetic overlay |
 | Palette entry/exit | One display period in; ≈50–90 ms out |
 
 These values define visual rhythm, not rigid window constraints. Small windows

@@ -143,6 +143,11 @@ public final class GridStore {
     private var pendingPresentationRequiresImmediate = false
     private var hasUnflushedDeferredEvents = false
     private var deferredFrame = DeferredFrameClassification()
+    /// Direct `apply(_:)` also accepts redraw notifications split before their
+    /// eventual `flush`. Keep its frame provenance across calls just as the
+    /// deferred path does.
+    private var directFrame = DeferredFrameClassification()
+    private var directFrameHasEvents = false
 
     public init() {}
 
@@ -152,21 +157,20 @@ public final class GridStore {
     @discardableResult
     public func apply(_ batch: RedrawBatch) -> FlushResult? {
         var sawFlush = false
-        var frameHasEvents = false
-        var frame = DeferredFrameClassification()
         var allowsScrollInterpolation = !pendingPresentationRequiresImmediate
         for event in batch.events {
             if case .flush = event {
                 sawFlush = true
-                if frameHasEvents {
+                appendPendingViewportSteps(directFrame.reconciledViewportSteps)
+                if directFrameHasEvents {
                     allowsScrollInterpolation =
-                        allowsScrollInterpolation && frame.isDisplayLinked
+                        allowsScrollInterpolation && directFrame.isDisplayLinked
                 }
-                frameHasEvents = false
-                frame.reset()
+                directFrameHasEvents = false
+                directFrame.reset()
             } else {
-                frameHasEvents = true
-                frame.observe(event, grids: grids)
+                directFrameHasEvents = true
+                directFrame.observe(event, grids: grids)
             }
             apply(event)
         }
@@ -190,6 +194,17 @@ public final class GridStore {
         var result: PresentationDisposition = .none
         for event in batch.events {
             if case .flush = event {
+                // ext_messages frames are consumed by ChromeKit before they
+                // reach GridStore. If that is all Neovim flushed, there is no
+                // SurfaceKit state to present. In particular, do not turn a
+                // standalone msg_showcmd frame into an immediate drain that
+                // interrupts an already scheduled scroll presentation.
+                guard deferredFrame.hasPresentationEffect else {
+                    hasUnflushedDeferredEvents = false
+                    deferredFrame.reset()
+                    continue
+                }
+                appendPendingViewportSteps(deferredFrame.reconciledViewportSteps)
                 hasPendingPresentation = true
                 hasUnflushedDeferredEvents = false
                 let frameDisposition = deferredFrame.isDisplayLinked
@@ -200,8 +215,13 @@ public final class GridStore {
                 result = pendingPresentationRequiresImmediate ? .immediate : .displayLinked
                 deferredFrame.reset()
             } else {
-                hasUnflushedDeferredEvents = true
                 deferredFrame.observe(event, grids: grids)
+                // Externalized messages are already complete from
+                // SurfaceKit's perspective, even if their redraw notification
+                // is split before its eventual `flush`. They must not block a
+                // previously scheduled authoritative grid presentation.
+                hasUnflushedDeferredEvents = hasUnflushedDeferredEvents
+                    || deferredFrame.hasPresentationEffect
             }
             apply(event)
         }
@@ -321,14 +341,6 @@ public final class GridStore {
             grids[grid]?.viewport = Viewport(
                 topline: topline, botline: botline, curline: curline,
                 curcol: curcol, lineCount: lineCount, scrollDelta: scrollDelta)
-            if grids[grid] != nil, scrollDelta != 0 {
-                if pendingViewportScrollMotions[grid] == nil {
-                    pendingViewportScrollMotions[grid] = ViewportScrollMotion(
-                        delta: scrollDelta)
-                } else {
-                    pendingViewportScrollMotions[grid]?.append(scrollDelta)
-                }
-            }
         case .winViewportMargins(let grid, _, let top, let bottom, let left, let right):
             grids[grid]?.viewportMargins = ViewportMargins(
                 top: top, bottom: bottom, left: left, right: right)
@@ -341,6 +353,22 @@ public final class GridStore {
     }
 
     // MARK: - Flush
+
+    /// Merge one flushed wire frame's reconciled row steps into the one-shot
+    /// presentation provenance. Zero entries are metadata-only viewport reports;
+    /// zero *nets* produced by real opposite steps remain observable.
+    private func appendPendingViewportSteps(_ stepsByGrid: [Int: [Int]]) {
+        for (grid, steps) in stepsByGrid {
+            for delta in steps where delta != 0 {
+                if pendingViewportScrollMotions[grid] == nil {
+                    pendingViewportScrollMotions[grid] = ViewportScrollMotion(
+                        delta: delta)
+                } else {
+                    pendingViewportScrollMotions[grid]?.append(delta)
+                }
+            }
+        }
+    }
 
     private func makeFlushResult(allowsScrollInterpolation: Bool) -> FlushResult {
         var damaged: [FlushResult.DamagedGrid] = []
@@ -389,9 +417,21 @@ private struct DeferredFrameClassification {
     private var scrollDirections: [Int: Int] = [:]
     private var scrollDistances: [Int: Int] = [:]
     private var semanticDeltas: [Int: Int] = [:]
+    /// Authoritative semantic reports in wire order, including zero. A zero
+    /// report can validate an ordered pixel reversal whose net is also zero.
+    private var semanticReports: [Int: [Int]] = [:]
+    /// Full inner-viewport vertical row moves are the only pixel events that
+    /// can refine semantic provenance. Their order distinguishes repeated
+    /// one-row input from one genuinely large jump.
+    private var viewportScrollSteps: [Int: [Int]] = [:]
+    private var invalidProvenanceGrids: Set<Int> = []
     private var lineGrids: Set<Int> = []
     private var lineRows: [Int: Set<Int>] = [:]
     private var cursorGrids: Set<Int> = []
+    /// Externalized message events are routed to ChromeKit and have no model
+    /// or SurfaceKit effect. Their flush boundary must not request a duplicate
+    /// presentation of the current grid snapshot.
+    private(set) var hasPresentationEffect = false
 
     var isDisplayLinked: Bool {
         guard sawMotion, !requiresImmediate else { return false }
@@ -411,6 +451,19 @@ private struct DeferredFrameClassification {
                 semantic.signum() == direction
             else { return false }
 
+            // A pixel scroll and semantic viewport report that disagree cannot
+            // share an exact history coordinate system. The provenance result
+            // still falls back to the authoritative semantic step, but the
+            // pixels for this frame must present atomically.
+            if let candidates = viewportScrollSteps[grid],
+                let reports = semanticReports[grid]
+            {
+                guard let pixelNet = Self.exactSum(candidates),
+                    let semanticNet = Self.exactSum(reports),
+                    pixelNet == semanticNet
+                else { return false }
+            }
+
             if let region = regions[grid], let rows = lineRows[grid] {
                 let distance = min(
                     region.bottom - region.top,
@@ -424,6 +477,33 @@ private struct DeferredFrameClassification {
         return true
     }
 
+    /// Neovim may process several input notifications before emitting one
+    /// aggregated `win_viewport.scroll_delta`. When the ordered compatible
+    /// `grid_scroll` rows have exactly the same net, they are a more precise
+    /// account of the small steps that produced that authoritative movement.
+    /// Any incompatible geometry or net mismatch falls back to the semantic
+    /// reports exactly as received, never inventing intermediate movement.
+    var reconciledViewportSteps: [Int: [Int]] {
+        var result: [Int: [Int]] = [:]
+        for (grid, reports) in semanticReports {
+            let semanticSteps = reports.filter { $0 != 0 }
+            guard let semanticNet = Self.exactSum(reports) else {
+                if !semanticSteps.isEmpty { result[grid] = semanticSteps }
+                continue
+            }
+            if !invalidProvenanceGrids.contains(grid),
+                let candidates = viewportScrollSteps[grid],
+                !candidates.isEmpty,
+                Self.exactSum(candidates) == semanticNet
+            {
+                result[grid] = candidates
+            } else if !semanticSteps.isEmpty {
+                result[grid] = semanticSteps
+            }
+        }
+        return result
+    }
+
     mutating func reset() {
         sawMotion = false
         requiresImmediate = false
@@ -431,21 +511,29 @@ private struct DeferredFrameClassification {
         scrollDirections.removeAll(keepingCapacity: true)
         scrollDistances.removeAll(keepingCapacity: true)
         semanticDeltas.removeAll(keepingCapacity: true)
+        semanticReports.removeAll(keepingCapacity: true)
+        viewportScrollSteps.removeAll(keepingCapacity: true)
+        invalidProvenanceGrids.removeAll(keepingCapacity: true)
         lineGrids.removeAll(keepingCapacity: true)
         lineRows.removeAll(keepingCapacity: true)
         cursorGrids.removeAll(keepingCapacity: true)
+        hasPresentationEffect = false
     }
 
     mutating func observe(_ event: UIEvent, grids: [Int: Grid]) {
         switch event {
         case .gridLine(let grid, let row, _, _, _):
+            hasPresentationEffect = true
             lineGrids.insert(grid)
             lineRows[grid, default: []].insert(row)
 
         case .gridCursorGoto(let grid, _, _):
+            hasPresentationEffect = true
             cursorGrids.insert(grid)
 
         case .winViewport(let grid, _, _, _, _, _, _, let scrollDelta):
+            hasPresentationEffect = true
+            semanticReports[grid, default: []].append(scrollDelta)
             sawMotion = sawMotion || scrollDelta != 0
             semanticDeltas[grid, default: 0] += scrollDelta
             if semanticDeltas[grid] == 0 { semanticDeltas.removeValue(forKey: grid) }
@@ -453,6 +541,7 @@ private struct DeferredFrameClassification {
         case .gridScroll(
             let gridID, let top, let bottom, let left, let right,
             let rows, let cols):
+            hasPresentationEffect = true
             let margins = grids[gridID]?.viewportMargins
             let marginTop = margins?.top ?? 0
             let marginBottom = margins?.bottom ?? 0
@@ -462,9 +551,11 @@ private struct DeferredFrameClassification {
                 top == marginTop, bottom == grid.rows - marginBottom, top < bottom,
                 left == marginLeft, right == grid.cols - marginRight, left < right
             else {
+                invalidProvenanceGrids.insert(gridID)
                 requiresImmediate = true
                 return
             }
+            viewportScrollSteps[gridID, default: []].append(rows)
             sawMotion = true
             let direction = rows.signum()
             if let existing = scrollDirections[gridID], existing != direction {
@@ -479,13 +570,31 @@ private struct DeferredFrameClassification {
             }
             let region = Region(top: top, bottom: bottom, left: left, right: right)
             if let existing = regions[gridID], existing != region {
+                invalidProvenanceGrids.insert(gridID)
                 requiresImmediate = true
             } else {
                 regions[gridID] = region
             }
 
+        // These surfaces are externalized from the grid. Neovim commonly
+        // emits `msg_ruler` beside every viewport move and `msg_showcmd` beside
+        // keyboard scrolling; neither changes row pixels or geometry.
+        case .msgShowmode, .msgShowcmd, .msgRuler:
+            break
+
         default:
+            hasPresentationEffect = true
             requiresImmediate = true
         }
+    }
+
+    private static func exactSum(_ values: [Int]) -> Int? {
+        var total = 0
+        for value in values {
+            let (next, overflow) = total.addingReportingOverflow(value)
+            guard !overflow else { return nil }
+            total = next
+        }
+        return total
     }
 }

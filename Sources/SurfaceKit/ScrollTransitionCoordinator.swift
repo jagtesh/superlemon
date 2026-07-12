@@ -283,12 +283,6 @@ private struct FilmstripSlot {
     var binding: RowLayerBinding?
 }
 
-private struct VeilSnapshotSource: @unchecked Sendable {
-    let rows: [SharedImageRow]
-    let outputWidth: Int
-    let outputHeight: Int
-}
-
 /// Persistent per-grid row compositor. Exact authoritative row tiles are
 /// always installed; scrolling only rebinds a row when an integer boundary is
 /// crossed and translates one clipped container between those boundaries.
@@ -310,8 +304,6 @@ final class SmoothViewportState {
     private let baseLayer = CALayer()
     private let clipLayer = CALayer()
     private let rowContainerLayer = CALayer()
-    private let veilLayer = CALayer()
-    private let glowLayer = CAGradientLayer()
     private var baseRowLayers: [CALayer] = []
     private var baseBindings: [RowLayerBinding?] = []
     private var rowSlots: [FilmstripSlot] = []
@@ -324,45 +316,16 @@ final class SmoothViewportState {
     private var rowsNeedBinding = true
     private var hasAuthoritativeRows = false
 
-    private(set) var isVeilActive = false
-    private var veilElapsed: CFTimeInterval = 0
-    private var veilDirection = 0
-    private var veilGapResolved = true
-    private var veilFadeStart: CFTimeInterval?
-    private var veilSuppressedUntilGapClears = false
-    private var cachedVeilImage: CGImage?
-    private var veilSnapshotTask: Task<Void, Never>?
-    private var veilSnapshotSerial: UInt64 = 0
-    private var lastVeilSnapshotRequest: CFTimeInterval = 0
-    private var receivedInputWhileClamped = false
-    private var clampedDisplayPeriods = 0
-
     init(gridID: Int) {
         self.gridID = gridID
-        for layer in [baseLayer, clipLayer, rowContainerLayer, veilLayer, glowLayer] {
+        for layer in [baseLayer, clipLayer, rowContainerLayer] {
             disableActions(on: layer)
         }
         baseLayer.zPosition = 0
         clipLayer.zPosition = 1
         clipLayer.masksToBounds = true
         rowContainerLayer.zPosition = 0
-        veilLayer.zPosition = 2
-        veilLayer.contentsGravity = .resizeAspectFill
-        veilLayer.minificationFilter = .linear
-        veilLayer.magnificationFilter = .linear
-        veilLayer.isHidden = true
-        glowLayer.zPosition = 3
-        glowLayer.isHidden = true
-        let accent = NSColor.controlAccentColor.withAlphaComponent(1).cgColor
-        glowLayer.colors = [
-            NSColor.clear.cgColor, accent, NSColor.clear.cgColor,
-        ]
-        glowLayer.locations = [0, 0.5, 1]
-        glowLayer.startPoint = CGPoint(x: 0.5, y: 0)
-        glowLayer.endPoint = CGPoint(x: 0.5, y: 1)
         clipLayer.addSublayer(rowContainerLayer)
-        clipLayer.addSublayer(veilLayer)
-        clipLayer.addSublayer(glowLayer)
     }
 
     var position: CGFloat { motion.position }
@@ -463,12 +426,10 @@ final class SmoothViewportState {
             rebuildLayers()
             motion.settle()
             isActive = false
-            deactivateVeil()
             authoritativeRows = nextRows
             bindAuthoritativeRows()
             seedCurrentRows()
             render(forceBindings: true)
-            scheduleVeilSnapshot()
             return false
         }
 
@@ -478,7 +439,7 @@ final class SmoothViewportState {
         let carriesMovement = !scrolls.isEmpty
             || semanticMotion?.hasMovement == true
             || (semanticDelta != nil && delta != 0)
-        if !animate, isActive || isVeilActive {
+        if !animate, isActive {
             // An explicitly atomic/Reduce Motion frame supersedes any visual
             // tail even when it contains only edits or highlight changes.
             settle()
@@ -512,40 +473,21 @@ final class SmoothViewportState {
             isActive = motion.isActive
         }
         render(forceBindings: false)
-        scheduleVeilSnapshot()
-        return eligible && hasAuthoritativeRows && (isActive || isVeilActive)
+        return eligible && hasAuthoritativeRows && isActive
     }
 
-    /// Integrate in <= 1/120-second steps. Only the latest analytical result
-    /// is rendered, so a delayed callback never causes obsolete layer commits.
+    /// Advance every active analytical residual to the latest display target.
+    /// Delayed callbacks render only that exact resulting filmstrip position.
     @discardableResult
     func advance(
         by elapsed: CFTimeInterval,
         nominalDisplayPeriod: CFTimeInterval = 1.0 / 60.0,
         detectDisplayGap: Bool = true
     ) -> Bool {
-        guard isActive || isVeilActive else { return false }
+        guard isActive else { return false }
         let bounded = min(max(0, elapsed), 1.0)
-        let nominal = max(1.0 / 240.0, nominalDisplayPeriod)
-
-        if detectDisplayGap, isActive, bounded >= nominal * 2,
-            lastSemanticDelta != 0
-        {
-            // The delayed callback itself is the end of this measured gap;
-            // exact current rows are already installed beneath the veil.
-            activateVeil(direction: lastSemanticDelta.signum(), resolved: true)
-        }
-        if receivedInputWhileClamped {
-            clampedDisplayPeriods += 1
-            if clampedDisplayPeriods >= 2, lastSemanticDelta != 0 {
-                activateVeil(direction: lastSemanticDelta.signum(), resolved: false)
-            }
-        } else {
-            clampedDisplayPeriods = 0
-            veilSuppressedUntilGapClears = false
-            if isVeilActive, !veilGapResolved { resolveVeilGap() }
-        }
-        receivedInputWhileClamped = false
+        _ = nominalDisplayPeriod
+        _ = detectDisplayGap
 
         if isActive {
             motion.advance(by: bounded)
@@ -558,26 +500,19 @@ final class SmoothViewportState {
             render(forceBindings: false)
         }
 
-        advanceVeil(by: bounded)
-        return isActive || isVeilActive
+        return isActive
     }
 
     func settle() {
         motion.settle()
         isActive = false
         lastSemanticDelta = 0
-        receivedInputWhileClamped = false
-        clampedDisplayPeriods = 0
-        veilSuppressedUntilGapClears = false
         discardNonCurrentHistory()
-        deactivateVeil()
         render(forceBindings: false)
     }
 
     func destroy() {
         settle()
-        veilSnapshotTask?.cancel()
-        veilSnapshotTask = nil
         baseLayer.removeFromSuperlayer()
         clipLayer.removeFromSuperlayer()
         hostLayer = nil
@@ -627,7 +562,6 @@ final class SmoothViewportState {
 
         let direction = trueFar ? farDirection : delta.signum()
         guard direction != 0 else { return false }
-        if isVeilActive, veilDirection != direction { deactivateVeil() }
         let retainedMagnitude = Int(min(UInt(height), delta.magnitude))
         let animatedDelta = trueFar ? direction : delta.signum() * retainedMagnitude
         if trueFar { discardNonCurrentHistory() }
@@ -641,7 +575,6 @@ final class SmoothViewportState {
             motion.add(
                 positionOffset: -CGFloat(animatedDelta),
                 duration: Self.motionEnvelopeDuration)
-            activateVeil(direction: direction, resolved: true)
         } else {
             let capacity = CGFloat(height)
             let requestedOffset = -CGFloat(delta)
@@ -653,8 +586,6 @@ final class SmoothViewportState {
                 let available = max(0, capacity - motion.positiveMagnitude)
                 representableOffset = min(requestedOffset, available)
             }
-            receivedInputWhileClamped = receivedInputWhileClamped
-                || representableOffset != requestedOffset
             motion.add(
                 positionOffset: representableOffset,
                 duration: Self.motionEnvelopeDuration)
@@ -786,8 +717,6 @@ final class SmoothViewportState {
         rowContainerLayer.position = .zero
         rowContainerLayer.bounds = CGRect(
             x: 0, y: 0, width: clipLayer.bounds.width, height: clipLayer.bounds.height)
-        veilLayer.frame = clipLayer.bounds
-        glowLayer.frame = clipLayer.bounds
 
         for row in 0..<geometry.rows {
             let layer = makeRowLayer()
@@ -941,148 +870,6 @@ final class SmoothViewportState {
 
     private func pixelSnap(_ value: CGFloat, scale: CGFloat) -> CGFloat {
         (value * max(1, scale)).rounded() / max(1, scale)
-    }
-
-    // MARK: - Adaptive velocity veil
-
-    private func activateVeil(direction: Int, resolved: Bool) {
-        guard direction != 0 else { return }
-        guard resolved || !veilSuppressedUntilGapClears else { return }
-        if isVeilActive, veilDirection == direction {
-            if resolved {
-                if !veilGapResolved { resolveVeilGap() }
-            } else {
-                veilGapResolved = false
-                veilFadeStart = nil
-            }
-            return
-        }
-        if isVeilActive { deactivateVeil() }
-        isVeilActive = true
-        veilDirection = direction
-        veilElapsed = 0
-        veilGapResolved = resolved
-        veilFadeStart = resolved ? 1.0 / 60.0 : nil
-        clampedDisplayPeriods = 0
-        veilLayer.contents = cachedVeilImage
-        veilLayer.opacity = 0
-        veilLayer.isHidden = false
-        glowLayer.opacity = 0
-        glowLayer.isHidden = false
-    }
-
-    private func advanceVeil(by elapsed: CFTimeInterval) {
-        guard isVeilActive else { return }
-        veilElapsed += elapsed
-        let fadeIn: CFTimeInterval = 1.0 / 60.0
-        let hardLimit: CFTimeInterval = 0.150
-        if veilElapsed >= hardLimit {
-            if !veilGapResolved { veilSuppressedUntilGapClears = true }
-            deactivateVeil()
-            return
-        }
-
-        var alpha = min(1, CGFloat(veilElapsed / fadeIn))
-        if veilGapResolved, let veilFadeStart, veilElapsed > veilFadeStart {
-            let fadeProgress = CGFloat((veilElapsed - veilFadeStart) / 0.050)
-            if fadeProgress >= 1 {
-                deactivateVeil()
-                return
-            }
-            alpha *= 1 - fadeProgress
-        }
-        let progress = CGFloat(min(1, veilElapsed / hardLimit))
-        let offset = CGFloat(veilDirection) * cellSize.height * 0.75 * progress
-        veilLayer.opacity = Float(0.68 * alpha)
-        veilLayer.setAffineTransform(
-            CGAffineTransform(translationX: 0, y: offset).scaledBy(x: 1.015, y: 1.015))
-        glowLayer.opacity = Float(0.08 * alpha)
-        glowLayer.setAffineTransform(CGAffineTransform(
-            translationX: 0,
-            y: CGFloat(veilDirection) * clipLayer.bounds.height * (progress - 0.5)))
-    }
-
-    private func deactivateVeil() {
-        isVeilActive = false
-        veilElapsed = 0
-        veilDirection = 0
-        veilGapResolved = true
-        veilFadeStart = nil
-        veilLayer.isHidden = true
-        veilLayer.opacity = 0
-        veilLayer.setAffineTransform(.identity)
-        glowLayer.isHidden = true
-        glowLayer.opacity = 0
-        glowLayer.setAffineTransform(.identity)
-    }
-
-    private func resolveVeilGap() {
-        veilGapResolved = true
-        veilFadeStart = max(veilElapsed, 1.0 / 60.0)
-    }
-
-    /// Keep a throttled quarter-resolution exact snapshot ready. Composition
-    /// occurs away from the main actor and only immutable CGImages cross the
-    /// boundary; activation itself is a cheap contents/transform update.
-    private func scheduleVeilSnapshot() {
-        guard geometry.innerRows > 0, geometry.innerCols > 0,
-            (0..<geometry.innerRows).allSatisfy({ history[$0] != nil })
-        else { return }
-        let now = CACurrentMediaTime()
-        guard now - lastVeilSnapshotRequest >= 0.080 || cachedVeilImage == nil else { return }
-        lastVeilSnapshotRequest = now
-        veilSnapshotSerial &+= 1
-        let serial = veilSnapshotSerial
-        let rows = (0..<geometry.innerRows).compactMap { history[$0] }
-        let width = max(1, Int(
-            CGFloat(geometry.innerCols) * cellSize.width * scale / 4))
-        let height = max(1, Int(
-            CGFloat(geometry.innerRows) * cellSize.height * scale / 4))
-        let source = VeilSnapshotSource(
-            rows: rows, outputWidth: width, outputHeight: height)
-        veilSnapshotTask?.cancel()
-        veilSnapshotTask = Task.detached(priority: .utility) { [weak self] in
-            let image = Self.makeVeilSnapshot(source)
-            guard !Task.isCancelled else { return }
-            await MainActor.run { [weak self] in
-                guard let self, self.veilSnapshotSerial == serial else { return }
-                self.cachedVeilImage = image
-                // Do not replace the old-frame bridge with a newer exact
-                // snapshot while it is visibly fading out.
-                if self.isVeilActive, self.veilLayer.contents == nil {
-                    self.veilLayer.contents = image
-                }
-            }
-        }
-    }
-
-    nonisolated private static func makeVeilSnapshot(
-        _ source: VeilSnapshotSource
-    ) -> CGImage? {
-        guard let context = GridRenderer.makeContext(
-            width: source.outputWidth, height: source.outputHeight, scale: 1),
-            !source.rows.isEmpty
-        else { return nil }
-        context.setBlendMode(.copy)
-        context.interpolationQuality = .low
-        let rowHeight = CGFloat(source.outputHeight) / CGFloat(source.rows.count)
-        for (index, row) in source.rows.enumerated() {
-            let width = CGFloat(row.image.width)
-            let height = CGFloat(row.image.height)
-            let crop = CGRect(
-                x: row.contentsRect.minX * width,
-                y: (1 - row.contentsRect.maxY) * height,
-                width: row.contentsRect.width * width,
-                height: row.contentsRect.height * height).integral
-            guard crop.width > 0, crop.height > 0,
-                let image = row.image.cropping(to: crop)
-            else { continue }
-            context.draw(image, in: CGRect(
-                x: 0,
-                y: CGFloat(source.rows.count - index - 1) * rowHeight,
-                width: CGFloat(source.outputWidth), height: rowHeight))
-        }
-        return context.makeImage()
     }
 
     private func disableActions(on layer: CALayer) {

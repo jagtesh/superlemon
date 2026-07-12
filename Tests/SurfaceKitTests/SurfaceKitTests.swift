@@ -466,6 +466,13 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
 @Suite struct ScrollTransitionTests {
     private let cellSize = CGSize(width: 8, height: 16)
 
+    private func expectExactFilmstripOnly(_ state: SmoothViewportState) {
+        let sublayers = state.overlayLayer.sublayers ?? []
+        #expect(sublayers.count == 1,
+                "the clipped viewport must contain no synthetic visual layers")
+        #expect(sublayers.first === state.translatedContainerLayer)
+    }
+
     @Test func circularHistoryRotatesWithoutCopyingAndWrapsNegativeIndices() {
         var history = CircularRowHistory<Int>(capacity: 6)
         for row in 0..<6 { history[row] = row }
@@ -898,8 +905,7 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
             #expect(state.position == -CGFloat(min(input, 6)),
                     "cumulative debt clamps at retained history instead of resetting")
             #expect(state.historyHead == input % 12)
-            #expect(!state.isVeilActive,
-                    "clamped small inputs are not a single unbridgeable jump")
+            expectExactFilmstripOnly(state)
         }
     }
 
@@ -979,7 +985,7 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
         #expect(state.position == -6)
         #expect(state.historyHead == 6,
                 "retained history rotates a full viewport, not a one-line far cue")
-        #expect(!state.isVeilActive)
+        expectExactFilmstripOnly(state)
     }
 
     @Test func zeroNetCoalescedReversalPreservesActiveEnvelopeDerivatives() {
@@ -1077,7 +1083,7 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
                 "only the newly exposed edge slot may upload different contents")
     }
 
-    @Test func trueFarJumpUsesABoundedVelocityVeil() {
+    @Test func trueFarJumpKeepsOnlyTheExactOneRowCue() {
         let host = CALayer()
         let state = SmoothViewportState(gridID: 1)
         _ = state.present(
@@ -1091,10 +1097,11 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
                 top: 0, bottom: 6, left: 0, right: 10, rows: 20, cols: 0)],
             semanticDelta: 20, cellSize: cellSize, scale: 1,
             host: host, animate: true)
-        #expect(state.isVeilActive)
+        #expect(state.position == -1)
+        expectExactFilmstripOnly(state)
 
         for _ in 0..<20 { _ = state.advance(by: 1.0 / 120.0) }
-        #expect(!state.isVeilActive, "the velocity veil has a 150 ms hard limit")
+        expectExactFilmstripOnly(state)
 
         state.settle()
         _ = state.present(
@@ -1104,10 +1111,10 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
                 top: 0, bottom: 6, left: 0, right: 10, rows: 20, cols: 0)],
             semanticDelta: 20, cellSize: cellSize, scale: 1,
             host: host, animate: false)
-        #expect(!state.isVeilActive, "Reduce Motion/immediate never installs a veil")
+        expectExactFilmstripOnly(state)
     }
 
-    @Test func firstResumedTargetIntervalDoesNotTriggerVelocityVeil() {
+    @Test func delayedDisplayIntervalsKeepOnlyExactRows() {
         func scrollingState(gridID: Int) -> SmoothViewportState {
             let state = SmoothViewportState(gridID: gridID)
             let host = CALayer()
@@ -1133,18 +1140,16 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
         _ = firstTick.advance(
             by: schedulingLatency, nominalDisplayPeriod: period,
             detectDisplayGap: false)
-        #expect(!firstTick.isVeilActive,
-                "resume latency is not evidence of a missed display period")
+        expectExactFilmstripOnly(firstTick)
 
         let genuinelyLateTick = scrollingState(gridID: 2)
         _ = genuinelyLateTick.advance(
             by: schedulingLatency, nominalDisplayPeriod: period,
             detectDisplayGap: true)
-        #expect(genuinelyLateTick.isVeilActive,
-                "the same interval after resume remains a real measured gap")
+        expectExactFilmstripOnly(genuinelyLateTick)
     }
 
-    @Test func sustainedClampShowsOneBoundedVeilWithoutPulsing() {
+    @Test func sustainedClampKeepsTheExactFilmstripVisible() {
         let host = CALayer()
         let state = SmoothViewportState(gridID: 1)
         _ = state.present(
@@ -1162,8 +1167,6 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
                 scale: 1, host: host, animate: true)
         }
 
-        var activations = 0
-        var wasVisible = false
         for _ in 0..<24 {
             _ = state.present(
                 image: solidImage(width: 80, height: 96),
@@ -1171,14 +1174,11 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
                 scrolls: [scroll], semanticDelta: 1, cellSize: cellSize,
                 scale: 1, host: host, animate: true)
             _ = state.advance(by: 1.0 / 60.0)
-            if state.isVeilActive, !wasVisible { activations += 1 }
-            wasVisible = state.isVeilActive
+            expectExactFilmstripOnly(state)
         }
 
-        #expect(activations == 1,
-                "a sustained unresolved clamp must not repeatedly pulse the veil")
-        #expect(!state.isVeilActive,
-                "the unresolved veil still obeys its absolute 150 ms cap")
+        #expect(abs(state.position) <= 6,
+                "clamped motion must remain inside retained exact history")
     }
 
     @Test func envelopeFinishesAnalyticallyAfterPixelResidualReachesZero() {
@@ -1396,7 +1396,7 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
         #expect(!started)
         #expect(!state.isActive)
         #expect(!state.overlayLayer.isHidden)
-        #expect(!state.isVeilActive)
+        expectExactFilmstripOnly(state)
         #expect(state.currentRowsReference(final))
     }
 
@@ -1456,7 +1456,7 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
         #expect(!started)
         #expect(!state.isActive)
         #expect(!state.overlayLayer.isHidden)
-        #expect(!state.isVeilActive)
+        expectExactFilmstripOnly(state)
         #expect(state.position == 0)
         #expect(state.velocity == 0)
         #expect(state.currentRowsReference(atomic))

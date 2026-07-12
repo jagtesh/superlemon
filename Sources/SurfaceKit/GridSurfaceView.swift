@@ -256,11 +256,17 @@ public final class GridSurfaceView: NSView {
 
     /// Internal hook used by deterministic tests and opt-in field diagnostics.
     package var scrollDiagnosticHandler: ((ScrollDiagnosticSample) -> Void)?
+    private let diagnosticExportURL = ProcessInfo.processInfo.environment[
+        "SUPERLEMON_SCROLL_TRACE_FILE"
+    ].flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0) }
     private let environmentDiagnosticsEnabled =
         ProcessInfo.processInfo.environment["SUPERLEMON_SCROLL_TRACE"] == "1"
+        || ProcessInfo.processInfo.environment["SUPERLEMON_SCROLL_TRACE_FILE"] != nil
     private var diagnosticRing = ScrollDiagnosticRing(capacity: 2_048)
+    private var diagnosticExportTask: Task<Void, Never>?
     private static let scrollSignpostLog = OSLog(
-        subsystem: "com.superlemon.editor", category: "Scroll")
+        subsystem: "com.superlemon.editor",
+        category: OSLog.Category.pointsOfInterest.rawValue)
 
     /// Queue one accumulated model presentation for the next shared display
     /// callback. Returning false preserves immediate first-scroll response and
@@ -271,7 +277,7 @@ public final class GridSurfaceView: NSView {
     ) -> Bool {
         guard scrollMotionStyle == .tightNative, !reducedMotion,
             animationDisplayLink != nil,
-            smoothViewports.values.contains(where: { $0.isActive || $0.isVeilActive })
+            smoothViewports.values.contains(where: \.isActive)
         else { return false }
         scheduledDisplayPresentation = action
         resumeDisplayLink()
@@ -437,9 +443,7 @@ public final class GridSurfaceView: NSView {
         authoritativeCursorGrid = flush.cursor.grid
         updateCursorPresentation()
 
-        if motionStarted || cursorCorrectionActive
-            || smoothViewports.values.contains(where: \.isVeilActive)
-        {
+        if motionStarted || cursorCorrectionActive {
             resumeDisplayLink()
         }
         if !isInsideDisplayTick {
@@ -475,7 +479,7 @@ public final class GridSurfaceView: NSView {
         link.isPaused = true
         link.add(to: .main, forMode: .common)
         animationDisplayLink = link
-        if smoothViewports.values.contains(where: { $0.isActive || $0.isVeilActive })
+        if smoothViewports.values.contains(where: \.isActive)
             || cursorCorrectionActive || scheduledDisplayPresentation != nil
         {
             resumeDisplayLink()
@@ -566,7 +570,7 @@ public final class GridSurfaceView: NSView {
     ) -> Bool {
         let boundedElapsed = min(max(0, elapsed), 1.0)
         var active = false
-        for state in smoothViewports.values where state.isActive || state.isVeilActive {
+        for state in smoothViewports.values where state.isActive {
             active = state.advance(
                 by: boundedElapsed,
                 nominalDisplayPeriod: nominalDisplayPeriod > 0
@@ -590,7 +594,7 @@ public final class GridSurfaceView: NSView {
         }
         updateCursorPresentation()
         return active
-            || smoothViewports.values.contains(where: { $0.isActive || $0.isVeilActive })
+            || smoothViewports.values.contains(where: \.isActive)
             || scheduledDisplayPresentation != nil
     }
 
@@ -600,7 +604,7 @@ public final class GridSurfaceView: NSView {
     }
 
     private var hasActiveAnimationWork: Bool {
-        smoothViewports.values.contains(where: { $0.isActive || $0.isVeilActive })
+        smoothViewports.values.contains(where: \.isActive)
             || cursorCorrectionActive || scheduledDisplayPresentation != nil
     }
 
@@ -643,17 +647,43 @@ public final class GridSurfaceView: NSView {
         animationDisplayLink?.isPaused = true
         lastDisplayTargetTimestamp = nil
         displayLinkResumeTimestamp = nil
+        exportScrollDiagnosticsIfRequested()
+    }
+
+    /// Export only after motion settles so diagnostics never add file I/O to
+    /// the input, raster, or display-commit path. A later gesture cancels and
+    /// replaces an older pending export with the ring's newest bounded view.
+    private func exportScrollDiagnosticsIfRequested() {
+        guard let diagnosticExportURL else { return }
+        let samples = diagnosticRing.ordered
+        guard !samples.isEmpty else { return }
+        let lines = samples.map { sample in
+            let authoritative = sample.cursorAuthoritativeY.map { "\($0)" } ?? "null"
+            let visual = sample.cursorVisualY.map { "\($0)" } ?? "null"
+            return "{\"timestamp\":\(sample.timestamp),\"grid\":\(sample.gridID),"
+                + "\"delta\":\(sample.delta),\"historyHead\":\(sample.historyHead),"
+                + "\"position\":\(sample.position),\"velocity\":\(sample.velocity),"
+                + "\"acceleration\":\(sample.acceleration),"
+                + "\"snappedTranslationPixels\":\(sample.snappedTranslationPixels),"
+                + "\"cursorAuthoritativeY\":\(authoritative),"
+                + "\"cursorVisualY\":\(visual)}"
+        }
+        guard let payload = (lines.joined(separator: "\n") + "\n").data(using: .utf8)
+        else { return }
+        diagnosticExportTask?.cancel()
+        diagnosticExportTask = Task.detached(priority: .utility) {
+            guard !Task.isCancelled else { return }
+            try? payload.write(to: diagnosticExportURL, options: .atomic)
+        }
     }
 
     private func updateCursorPresentation() {
         guard let flush = lastFlush, let authoritativeCursorY,
             let authoritativeCursorGrid
         else {
-            cursorLayer.setScrollDimmed(false)
             return
         }
         let state = smoothViewports[authoritativeCursorGrid]
-        cursorLayer.setScrollDimmed(state?.isVeilActive == true)
         var y = authoritativeCursorY
             - (state?.snappedTranslationY ?? 0)
             + cursorCorrection.position
@@ -690,7 +720,7 @@ public final class GridSurfaceView: NSView {
     }
 
     private func emitDiagnostics(timestamp: CFTimeInterval) {
-        for state in smoothViewports.values where state.isActive || state.isVeilActive {
+        for state in smoothViewports.values where state.isActive {
             let sample = state.diagnosticSample(
                 timestamp: timestamp, cursorAuthoritativeY: authoritativeCursorY,
                 cursorVisualY: visualCursorY)

@@ -270,7 +270,15 @@ translates existing dirty spans with their content and marks the exposed strip.
 - highlights, cursor/mode, title, busy state, and mouse state.
 
 Semantic viewport deltas are consumed once per presented frame, including when
-several wire flushes coalesce.
+several wire flushes coalesce. Within each wire frame, ordered compatible
+`grid_scroll.rows` events are reconciled with the authoritative
+`win_viewport.scroll_delta`. Matching nets preserve repeated one-row provenance
+even when Neovim reports one aggregated viewport delta; mismatches force atomic
+presentation and retain the authoritative semantic report. Externalized
+`msg_showmode`, `msg_showcmd`, and `msg_ruler` updates do not invalidate an
+otherwise-compatible grid scroll. A flush containing only those externalized
+messages requests no SurfaceKit presentation and cannot drain or cancel a
+display-linked scroll already waiting for vsync.
 
 ### Event handling
 
@@ -300,9 +308,7 @@ GridSurfaceView
 ├── grid host layer (one per visible Neovim grid)
 │   ├── stationary base row layers
 │   └── clipped SmoothViewportState
-│       ├── translated row container (innerHeight + 1 recyclable rows)
-│       ├── velocity-veil snapshot
-│       └── accent gradient
+│       └── translated row container (innerHeight + 1 recyclable rows)
 └── CursorLayer
 ```
 
@@ -380,37 +386,25 @@ residuals, then shows one final 180 ms, one-line directional cue.
 Horizontal scrolls, mismatched semantic/pixel directions, resize/layout changes,
 and conflicting partial scroll regions settle and present atomically.
 
-### Adaptive velocity veil
+### Exact-only exceptional presentation
 
-Exact rows remain the primary presentation. A short velocity veil appears only
-when exact retained history cannot represent the transition:
-
-- a true beyond-screen jump;
-- clamped debt receiving new input for two display periods; or
-- a measured display callback gap of at least two periods.
-
-The first callback measures lateness from its resume time, excluding the extra
-target-frame horizon. Ordinary resume scheduling does not trigger the veil, but
-a real two-period stall immediately after resume still does.
-
-The veil uses a throttled quarter-resolution snapshot assembled off-main from
-immutable row images. It is softly magnified and directionally offset, with a
-moving accent gradient capped at 8% opacity. It fades in over one display period,
-fades out over 50 ms when exact motion resumes, and has a 150 ms hard limit.
-Direction changes remove or reverse it immediately. The cursor dims without
-restarting blink.
+The filmstrip never places a tinted, blurred, magnified, or offset approximation
+above the editor. When accumulated residuals reach retained-history capacity,
+the representable motion clamps while the latest authoritative exact rows remain
+visible. A true beyond-screen jump keeps only the final one-row directional cue.
+A delayed display callback advances the analytical envelope to its latest time
+and presents that exact result; it does not synthesize intermediate imagery.
 
 ### Motion policy and accessibility
 
 `GridSurfaceView.scrollMotionStyle` is public and source-compatible:
 
-- `.tightNative` enables filmstrip interpolation and the adaptive veil;
+- `.tightNative` enables exact-row filmstrip interpolation;
 - `.immediate` installs every authoritative frame without interpolation.
 
 `NSWorkspace.accessibilityDisplayShouldReduceMotion` is observed live. Reduce
 Motion settles all viewport envelopes, the cursor correction spring, and
-scheduled presentation immediately, then bypasses interpolation and veil
-behavior.
+scheduled presentation immediately, then bypasses interpolation.
 
 ### Resize and backing changes
 
@@ -481,8 +475,7 @@ to use `guifont`.
   position through a 40 ms correction spring; and
 - `busy_start` hides the cursor.
 
-Typing does not currently suppress blink. The velocity veil alone reduces cursor
-opacity temporarily.
+Typing does not currently suppress blink.
 
 ### Instrumentation and targets
 
@@ -491,7 +484,10 @@ diagnostic ring when `SUPERLEMON_SCROLL_TRACE=1` or a test hook is installed.
 Samples include time, semantic delta, history head, envelope position, velocity,
 and acceleration, snapped physical translation, and authoritative/visual cursor
 Y. Display-linked presentation emits one final-state sample per target frame
-after any queued residual has been applied.
+after any queued residual has been applied. Setting
+`SUPERLEMON_SCROLL_TRACE_FILE=/path/to/trace.jsonl` also enables sampling and
+writes the bounded ring off-main after motion settles, keeping file I/O out of
+the input, raster, and display-commit paths.
 
 Low input latency, hitch-free 60/120 Hz scrolling, bounded memory growth, and
 fast launch remain product targets. End-to-end key/RPC/raster/commit signposts,
@@ -709,8 +705,8 @@ Current Swift coverage includes:
 - key, Option, mouse, click-count, and fractional wheel translation;
 - Core Text raster output, highlights, cursor glyphs, IOSurface row revisions,
   pool bounds, circular history, minimum-jerk envelope equivalence and C2
-  continuity, delayed frames, veil behavior, pixel snapping, cursor coupling,
-  and display-link idle behavior;
+  continuity, delayed frames, exact-only clamping/far jumps, pixel snapping,
+  cursor coupling, and display-link idle behavior;
 - cmdline, popupmenu, messages, toast/history, and native view models; and
 - file indexing, ignore rules, fuzzy scoring, file operations, file tree, Quick
   Open, buffer strip, status bar, and generic UI-component stores.
@@ -747,7 +743,7 @@ rather than a SuperlemonApp test target.
 - Row-COW grid model and damage/provenance-aware deferred presentation.
 - Core Text row renderer with IOSurface-backed revisions.
 - Display-linked two-viewport filmstrip, overlapping minimum-jerk row envelopes,
-  cursor coupling, Reduce Motion, and adaptive fast-scroll veil.
+  cursor coupling, exact-only exceptional presentation, and Reduce Motion.
 - Keyboard, basic IME, mouse, trackpad, clipboard, and ordered input queue.
 - Native cmdline, popupmenu, messages, prompts, sidebar, Quick Open, preview
   buffers, buffer strip, statusline/status bar, file panels, Settings, and About.
@@ -771,7 +767,7 @@ rather than a SuperlemonApp test target.
 | Area | Current risk or limitation | Current mitigation |
 |---|---|---|
 | Model/render synchronization | A bad damage or row-history decision can show stale pixels | Immutable row revisions, one-shot semantic deltas, authoritative-row assertions, extensive GridKit/SurfaceKit tests, atomic fallback |
-| Fast scrolling | Retained history cannot represent every true far jump or delayed compositor frame | One-line far cue, bounded debt, quarter-resolution velocity veil, diagnostics, Reduce Motion bypass |
+| Fast scrolling | Retained history cannot represent every true far jump or delayed compositor frame | Exact authoritative rows stay visible; one-line far cue, bounded debt, diagnostics, Reduce Motion bypass |
 | IOSurface lifetime | Reusing a surface still referenced by history/compositor corrupts rows | Revision leases, IOSurface use counts, compositor-use checks, bounded CGImage fallback |
 | IME | Clause editing and reconversion are incomplete | Keep marked text out of Neovim; use AppKit candidate placement; document current scope |
 | Externalized messages | Plugins may depend on TUI-specific hit-enter/message behavior | Typed model, native history, atomic editor grid; no claim of complete TUI-message emulation |
@@ -973,7 +969,8 @@ the GUI does not paint its own split separators.
 - Independent grids keep independent history and motion.
 - The cursor follows the same viewport residual as its text, clamps at viewport
   edges, and scroll-only frames do not restart blink.
-- Immediate mode and Reduce Motion leave no interpolated tail or velocity veil.
+- Immediate mode and Reduce Motion leave no interpolated tail; scrolling never
+  places synthetic imagery above the exact row filmstrip.
 - Keyboard and mouse input remain ordered and unpaced; wheel batching preserves
   exact notification count and order.
 - Native file panels choose paths, but Neovim performs buffer open/write/save-as
