@@ -229,6 +229,9 @@ package struct GridAccessoryDebugSnapshot {
     package var accumulatedLineCount: Int
     package var contentFrame: CGRect?
     package var displayRangeResidual: CGFloat
+    package var renderGeneration: UInt64
+    package var renderIsInFlight: Bool
+    package var contentLayerHasContents: Bool
     package var viewportFrame: CGRect?
     package var cursorFrame: CGRect?
     package var scrollerIsVisible: Bool
@@ -925,7 +928,7 @@ private final class GridEditorAccessoryState {
         install: @escaping @MainActor (Int, UInt64, CGImage?) -> Void
     ) {
         guard mapWidth > 0, var acceptedChunk else { return }
-        let alreadyMatches = acceptedChunk.renderWidth == mapWidth
+        let configurationMatches = acceptedChunk.renderWidth == mapWidth
             && acceptedChunk.renderScale == scale
             && acceptedChunk.minimapScale == minimapScale
             && acceptedChunk.minimapPitch == minimapPitch
@@ -934,8 +937,13 @@ private final class GridEditorAccessoryState {
             && acceptedChunk.backgroundRGB == backgroundRGB
             && acceptedChunk.foregroundRGB == foregroundRGB
             && acceptedChunk.fontName == fontName
-            && contentLayer.contents != nil
-        guard !alreadyMatches else {
+        if configurationMatches,
+            contentLayer.contents != nil || renderTask != nil
+        {
+            // Preserve identical detached work across ordinary redraw flushes.
+            // A 384-line CoreText job cannot be interrupted mid-CTLineDraw;
+            // cancel/restart here can otherwise starve installation forever
+            // while Neovim continues producing frames.
             positionContentLayer()
             return
         }
@@ -973,7 +981,9 @@ private final class GridEditorAccessoryState {
     }
 
     func installRenderedImage(_ image: CGImage?, serial: UInt64) {
-        guard serial == renderSerial, let image else { return }
+        guard serial == renderSerial else { return }
+        renderTask = nil
+        guard let image else { return }
         renderedImage = image
         contentLayer.contents = image
         contentLayer.contentsScale = scale
@@ -1004,6 +1014,18 @@ private final class GridEditorAccessoryState {
     func settleDisplayRangeMotion() {
         displayRangeMotion.settle()
         updateMotionLayers()
+    }
+
+    func presentedMinimapImage() -> CGImage? {
+        guard !minimapLayer.isHidden,
+            minimapLayer.bounds.width > 0, minimapLayer.bounds.height > 0,
+            let context = GridRenderer.makeContext(
+                width: max(1, Int(ceil(minimapLayer.bounds.width * scale))),
+                height: max(1, Int(ceil(minimapLayer.bounds.height * scale))),
+                scale: scale)
+        else { return nil }
+        minimapLayer.render(in: context)
+        return context.makeImage()
     }
 
     func positionContentLayer() {
@@ -1436,6 +1458,9 @@ final class GridAccessoryCoordinator {
             accumulatedLineCount: state.accumulatedLines.count,
             contentFrame: state.acceptedChunk == nil ? nil : state.contentLayer.frame,
             displayRangeResidual: state.displayRangeMotion.position,
+            renderGeneration: state.renderSerial,
+            renderIsInFlight: state.renderTask != nil,
+            contentLayerHasContents: state.contentLayer.contents != nil,
             viewportFrame: state.viewportLayer.isHidden ? nil : state.viewportLayer.frame,
             cursorFrame: state.cursorLayer.isHidden ? nil : state.cursorLayer.frame,
             scrollerIsVisible: !state.interactionView.scroller.isHidden,
@@ -1446,6 +1471,10 @@ final class GridAccessoryCoordinator {
 
     func scroller(gridID: Int) -> NSScroller? {
         states[gridID]?.interactionView.scroller
+    }
+
+    func presentedMinimapImage(gridID: Int) -> CGImage? {
+        states[gridID]?.presentedMinimapImage()
     }
 
     private func refreshContent(

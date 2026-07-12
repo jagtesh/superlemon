@@ -358,6 +358,11 @@ public final class GridSurfaceView: NSView {
         accessoryCoordinator.scroller(gridID: gridID)
     }
 
+    /// Deterministic layer-tree capture used by accessory integration tests.
+    package func editorAccessoryPresentedImage(gridID: Int) -> CGImage? {
+        accessoryCoordinator.presentedMinimapImage(gridID: gridID)
+    }
+
     public override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
         let newScale = window?.backingScaleFactor ?? 2

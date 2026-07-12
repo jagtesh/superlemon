@@ -62,6 +62,23 @@ private struct AccessoryHarness {
     }
 }
 
+private func dominantRedPixelCount(_ image: CGImage) -> Int {
+    let bytes = image.dataProvider!.data! as Data
+    var count = 0
+    for y in 0..<image.height {
+        for x in 0..<image.width {
+            let index = y * image.bytesPerRow + x * 4
+            let blue = Int(bytes[index])
+            let green = Int(bytes[index + 1])
+            let red = Int(bytes[index + 2])
+            if red > 70, red > green + 25, red > blue + 25 {
+                count += 1
+            }
+        }
+    }
+    return count
+}
+
 @Suite struct GridAccessoryPolicyTests {
     @Test func minimapThresholdUsesHysteresis() {
         let cellWidth: CGFloat = 8
@@ -335,6 +352,73 @@ private struct AccessoryHarness {
         #expect(snapshot.pendingRange == nil)
         #expect(snapshot.acceptedRange == request.lineRange,
                 "the final chunk publishes the complete prefetched window once")
+    }
+
+    @Test func fullChunkInstallsAndPresentsColoredMiniaturePixels() async throws {
+        let harness = AccessoryHarness()
+        var sizeRequest: GridAccessorySizeRequest?
+        var contentRequest: MinimapContentRangeRequest?
+        harness.view.onGridAccessorySizeRequest = { sizeRequest = $0 }
+        harness.view.onMinimapContentRangeRequest = { contentRequest = $0 }
+        harness.presentInitial()
+        harness.acknowledge(sizeRequest!)
+
+        guard let request = contentRequest else {
+            Issue.record("content request missing")
+            return
+        }
+        let lines = request.lineRange.map { line in
+            MinimapLine(
+                text: "let value\(line) = \(line)",
+                spans: [MinimapHighlightSpan(
+                    byteRange: 0..<3, foregroundRGB: 0xFF2020)])
+        }
+        harness.view.provideMinimapContent(MinimapContentChunk(
+            requestID: request.requestID, gridID: 2,
+            topology: request.topology,
+            firstLine: request.lineRange.lowerBound,
+            lastLine: request.lineRange.upperBound,
+            complete: true, lines: lines))
+
+        let startedGeneration = harness.view.editorAccessoryDebugSnapshot(
+            gridID: 2)!.renderGeneration
+        for _ in 0..<12 {
+            // Ordinary redraw/config refreshes with identical raster inputs
+            // must retain the in-flight CoreText job instead of starving it.
+            harness.view.updateMinimapTopology(request.topology)
+        }
+        #expect(harness.view.editorAccessoryDebugSnapshot(
+            gridID: 2)?.renderGeneration == startedGeneration)
+
+        var snapshot = harness.view.editorAccessoryDebugSnapshot(gridID: 2)!
+        for _ in 0..<200 where snapshot.minimapImage == nil {
+            try await Task.sleep(for: .milliseconds(5))
+            snapshot = harness.view.editorAccessoryDebugSnapshot(gridID: 2)!
+        }
+
+        guard let rendered = snapshot.minimapImage else {
+            Issue.record("detached minimap render never installed")
+            return
+        }
+        #expect(!snapshot.renderIsInFlight)
+        #expect(snapshot.contentLayerHasContents)
+        #expect(dominantRedPixelCount(rendered) > 0,
+                "authoritative minimap bitmap must contain syntax-colored glyphs")
+        if let gutter = snapshot.gutterFrame, let content = snapshot.contentFrame {
+            let localGutter = CGRect(origin: .zero, size: gutter.size)
+            #expect(content.intersects(localGutter),
+                    "installed content must intersect the clipped gutter")
+        } else {
+            Issue.record("presented minimap geometry missing")
+        }
+
+        guard let presented = harness.view.editorAccessoryPresentedImage(gridID: 2)
+        else {
+            Issue.record("minimap layer-tree capture failed")
+            return
+        }
+        #expect(dominantRedPixelCount(presented) > 0,
+                "the visible gutter crop must present colored glyph pixels")
     }
 
     @Test func minimapMarkersUseTheSameSnappedScrollResidual() {
