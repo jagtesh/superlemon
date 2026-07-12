@@ -7,8 +7,14 @@ app="$root/dist/Superlemon.app"
 contents="$app/Contents"
 
 cd "$root"
-swift build -c "$configuration"
-build_dir=$(swift build -c "$configuration" --show-bin-path)
+swift_arguments=(-c "$configuration")
+if [[ ${SUPERLEMON_SWIFTPM_DISABLE_SANDBOX:-0} == 1 ]]; then
+  # Homebrew already provides the build sandbox; SwiftPM cannot nest its own
+  # sandbox-exec process inside it.
+  swift_arguments+=(--disable-sandbox)
+fi
+swift build "${swift_arguments[@]}"
+build_dir=$(swift build "${swift_arguments[@]}" --show-bin-path)
 
 rm -rf "$app"
 mkdir -p "$contents/MacOS" "$contents/Resources" "$contents/Helpers"

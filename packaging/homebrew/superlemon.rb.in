@@ -30,6 +30,7 @@ class Superlemon < Formula
       odie "Neovim distribution is incomplete" unless (nvim_distribution/"bin/nvim").executable?
 
       ENV["SUPERLEMON_NVIM_DIST"] = nvim_distribution
+      ENV["SUPERLEMON_SWIFTPM_DISABLE_SANDBOX"] = "1"
       system source_root/"scripts/package-app.sh", "release"
     end
 
