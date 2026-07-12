@@ -194,6 +194,133 @@ private func lineText(_ event: UIEvent) -> String? {
             == .resize(cols: 121, rows: 41))
         #expect(NvimInputCommand.paste("hello").notifications.isEmpty)
     }
+
+    @Test func gridResizeCommandsEncodeExactlyAndCoalesceOnlyPerGrid() {
+        let resize = NvimInputCommand.resizeGrid(grid: 7, cols: 132, rows: 48)
+        #expect(resize.notifications == [
+            .init(
+                method: "nvim_ui_try_resize_grid",
+                params: [.int(7), .int(132), .int(48)])
+        ])
+
+        // Zero dimensions are meaningful to Neovim (they delegate layout),
+        // so this primitive must not rewrite them.
+        #expect(NvimInputCommand.resizeGrid(grid: 9, cols: 0, rows: 0).notifications == [
+            .init(
+                method: "nvim_ui_try_resize_grid",
+                params: [.int(9), .int(0), .int(0)])
+        ])
+
+        #expect(resize.coalesced(with: .resizeGrid(grid: 7, cols: 140, rows: 50))
+            == .resizeGrid(grid: 7, cols: 140, rows: 50))
+        #expect(resize.coalesced(with: .resizeGrid(grid: 8, cols: 140, rows: 50)) == nil)
+        #expect(resize.coalesced(with: .resize(cols: 140, rows: 50)) == nil)
+        #expect(NvimInputCommand.resize(cols: 132, rows: 48).coalesced(with: resize) == nil)
+    }
+
+    @Test func viewportTargetsEncodeValidatedZeroBasedViewportOperations() {
+        let lua = """
+            local window, expected_buffer, topline, activate = ...
+            if not vim.api.nvim_win_is_valid(window) then
+              return false
+            end
+            if vim.api.nvim_win_get_buf(window) ~= expected_buffer then
+              return false
+            end
+            if activate then
+              vim.api.nvim_set_current_win(window)
+            end
+            return vim.api.nvim_win_call(window, function()
+              if vim.api.nvim_get_current_buf() ~= expected_buffer then
+                return false
+              end
+              vim.fn.winrestview({ topline = topline + 1 })
+              return true
+            end)
+            """
+
+        let passive = NvimInputCommand.viewportTarget(
+            grid: 3, window: 42, buffer: 99, topline: 120)
+        #expect(passive.notifications == [
+            .init(
+                method: "nvim_exec_lua",
+                params: [
+                    .string(lua),
+                    .array([.int(42), .int(99), .int(120), .bool(false)]),
+                ])
+        ])
+
+        let activatingClamped = NvimInputCommand.viewportTarget(
+            grid: 4, window: 43, buffer: 100, topline: -12, activate: true)
+        #expect(activatingClamped.notifications == [
+            .init(
+                method: "nvim_exec_lua",
+                params: [
+                    .string(lua),
+                    .array([.int(43), .int(100), .int(0), .bool(true)]),
+                ])
+        ])
+    }
+
+    @Test func viewportAndGridCoalescingPreservesFIFOBarriers() {
+        let passiveA = NvimInputCommand.viewportTarget(
+            grid: 3, window: 30, buffer: 300, topline: 10)
+        let passiveANewer = NvimInputCommand.viewportTarget(
+            grid: 4, window: 30, buffer: 301, topline: 20)
+        let passiveB = NvimInputCommand.viewportTarget(
+            grid: 5, window: 31, buffer: 302, topline: 30)
+        let activeA = NvimInputCommand.viewportTarget(
+            grid: 4, window: 30, buffer: 301, topline: 20, activate: true)
+
+        // Window identity, rather than grid or buffer identity, owns a
+        // viewport target. The newest adjacent target fully replaces the old
+        // one, while activation semantics remain a hard ordering boundary.
+        #expect(passiveA.coalesced(with: passiveANewer) == passiveANewer)
+        #expect(passiveA.coalesced(with: passiveB) == nil)
+        #expect(passiveA.coalesced(with: activeA) == nil)
+        #expect(activeA.coalesced(with: passiveANewer) == nil)
+
+        let commands: [NvimInputCommand] = [
+            .resizeGrid(grid: 1, cols: 80, rows: 24),
+            .resizeGrid(grid: 1, cols: 90, rows: 30),
+            .keys("j"),
+            .resizeGrid(grid: 1, cols: 100, rows: 32),
+            .resizeGrid(grid: 2, cols: 60, rows: 20),
+            passiveA,
+            passiveB,
+            passiveANewer,
+            .mouse(
+                button: "left", action: "press", modifier: "",
+                grid: 3, row: 2, col: 4, repeatCount: 1),
+            activeA,
+            .paste("barrier"),
+            activeA,
+        ]
+
+        let coalesced = commands.reduce(into: [NvimInputCommand]()) { queue, command in
+            if let last = queue.last, let merged = last.coalesced(with: command) {
+                queue[queue.count - 1] = merged
+            } else {
+                queue.append(command)
+            }
+        }
+
+        #expect(coalesced == [
+            .resizeGrid(grid: 1, cols: 90, rows: 30),
+            .keys("j"),
+            .resizeGrid(grid: 1, cols: 100, rows: 32),
+            .resizeGrid(grid: 2, cols: 60, rows: 20),
+            passiveA,
+            passiveB,
+            passiveANewer,
+            .mouse(
+                button: "left", action: "press", modifier: "",
+                grid: 3, row: 2, col: 4, repeatCount: 1),
+            activeA,
+            .paste("barrier"),
+            activeA,
+        ])
+    }
 }
 
 // MARK: - Integration against real nvim

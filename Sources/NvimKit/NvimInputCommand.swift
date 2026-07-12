@@ -2,6 +2,29 @@
 /// `NvimSession` actor. Keeping repeat counts semantic until the queue drains
 /// avoids spawning work per wheel line while preserving the RPC sequence.
 package enum NvimInputCommand: Sendable, Equatable {
+    /// Lua receives Neovim's zero-based UI `topline`, validates that the
+    /// window still represents the expected buffer, then converts the line to
+    /// the one-based value accepted by `winrestview()`.
+    private static let viewportTargetLua = """
+        local window, expected_buffer, topline, activate = ...
+        if not vim.api.nvim_win_is_valid(window) then
+          return false
+        end
+        if vim.api.nvim_win_get_buf(window) ~= expected_buffer then
+          return false
+        end
+        if activate then
+          vim.api.nvim_set_current_win(window)
+        end
+        return vim.api.nvim_win_call(window, function()
+          if vim.api.nvim_get_current_buf() ~= expected_buffer then
+            return false
+          end
+          vim.fn.winrestview({ topline = topline + 1 })
+          return true
+        end)
+        """
+
     case keys(String)
     case mouse(
         button: String,
@@ -13,6 +36,14 @@ package enum NvimInputCommand: Sendable, Equatable {
         repeatCount: Int
     )
     case resize(cols: Int, rows: Int)
+    case resizeGrid(grid: Int, cols: Int, rows: Int)
+    case viewportTarget(
+        grid: Int,
+        window: Int,
+        buffer: Int,
+        topline: Int,
+        activate: Bool = false
+    )
     case paste(String)
 
     package var notifications: [NvimSession.OutgoingNotification] {
@@ -41,6 +72,30 @@ package enum NvimInputCommand: Sendable, Equatable {
                     params: [.int(Int64(cols)), .int(Int64(rows))])
             ]
 
+        case .resizeGrid(let grid, let cols, let rows):
+            return [
+                .init(
+                    method: "nvim_ui_try_resize_grid",
+                    params: [
+                        .int(Int64(grid)), .int(Int64(cols)), .int(Int64(rows)),
+                    ])
+            ]
+
+        case .viewportTarget(_, let window, let buffer, let topline, let activate):
+            return [
+                .init(
+                    method: "nvim_exec_lua",
+                    params: [
+                        .string(Self.viewportTargetLua),
+                        .array([
+                            .int(Int64(window)),
+                            .int(Int64(buffer)),
+                            .int(Int64(max(0, topline))),
+                            .bool(activate),
+                        ]),
+                    ])
+            ]
+
         case .paste:
             return []
         }
@@ -65,6 +120,25 @@ package enum NvimInputCommand: Sendable, Equatable {
             // Only the newest adjacent size matters; no coordinate-bearing
             // input can sit between two commands that are adjacent here.
             return .resize(cols: cols, rows: rows)
+
+        case let (
+            .resizeGrid(gridA, _, _),
+            .resizeGrid(gridB, cols, rows)
+        ) where gridA == gridB:
+            return .resizeGrid(grid: gridB, cols: cols, rows: rows)
+
+        case let (
+            .viewportTarget(_, windowA, _, _, activateA),
+            .viewportTarget(grid, windowB, buffer, topline, activateB)
+        ) where windowA == windowB && activateA == activateB:
+            // Activation is part of the identity: a required activation must
+            // never disappear into an adjacent passive viewport update.
+            return .viewportTarget(
+                grid: grid,
+                window: windowB,
+                buffer: buffer,
+                topline: topline,
+                activate: activateB)
 
         default:
             return nil
