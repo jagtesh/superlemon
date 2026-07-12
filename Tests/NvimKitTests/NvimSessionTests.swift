@@ -345,7 +345,8 @@ private func lineText(_ event: UIEvent) -> String? {
 
 // MARK: - Integration against real nvim
 
-private let nvimPath = "/opt/homebrew/bin/nvim"
+private let nvimPath =
+    ProcessInfo.processInfo.environment["SUPERLEMON_NVIM"] ?? "/opt/homebrew/bin/nvim"
 private var nvimAvailable: Bool { FileManager.default.isExecutableFile(atPath: nvimPath) }
 
 @Suite struct NvimIntegrationTests {

@@ -24,12 +24,15 @@ jobs:
         run: |
           nvim_distribution=$(scripts/fetch-neovim.sh)
           echo "$nvim_distribution/bin" >> "$GITHUB_PATH"
+          echo "SUPERLEMON_NVIM=$nvim_distribution/bin/nvim" >> "$GITHUB_ENV"
 
       - name: Build
         run: swift build
 
       - name: Test Swift packages
-        run: swift test
+        # SurfaceKit and ChromeKit animation tests require an active
+        # WindowServer and remain part of the full local test gate.
+        run: swift test --skip 'SurfaceKitTests|ChromeKitTests'
 
       - name: Test Neovim runtime
         run: bash runtime/tests/run.sh
