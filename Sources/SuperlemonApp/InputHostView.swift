@@ -33,6 +33,9 @@ final class InputHostView: NSView, @preconcurrency NSTextInputClient {
         surface.frame = bounds
         surface.autoresizingMask = [.width, .height]
         addSubview(surface)
+        surface.onGridAccessoryWheelRequest = { [weak self] request in
+            self?.handleAccessoryWheel(request)
+        }
     }
 
     @available(*, unavailable)
@@ -42,9 +45,12 @@ final class InputHostView: NSView, @preconcurrency NSTextInputClient {
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
-    /// The surface never takes events; this view owns input.
+    /// Grid pixels remain owned by this first-responder view. Explicit native
+    /// controls in an acknowledged accessory gutter are the sole exception.
     override func hitTest(_ point: NSPoint) -> NSView? {
-        super.hitTest(point) == nil ? nil : self
+        guard super.hitTest(point) != nil else { return nil }
+        let pointInSurface = surface.convert(point, from: self)
+        return surface.accessoryInteractionView(at: pointInSurface) ?? self
     }
 
     override func layout() {
@@ -267,6 +273,25 @@ final class InputHostView: NSView, @preconcurrency NSTextInputClient {
             isPrecise: event.hasPreciseScrollingDeltas)
         guard !steps.isEmpty, let cell = cellUnderPointer(event) else { return }
         let modifiers = Modifiers(rawValue: event.modifierFlags.rawValue)
+        emitWheel(.up, count: steps.up, modifiers: modifiers, cell: cell)
+        emitWheel(.down, count: steps.down, modifiers: modifiers, cell: cell)
+        emitWheel(.left, count: steps.left, modifiers: modifiers, cell: cell)
+        emitWheel(.right, count: steps.right, modifiers: modifiers, cell: cell)
+    }
+
+    /// Native minimap/scroller views forward wheel deltas here so there is
+    /// still exactly one accumulator and one ordered Neovim mouse route.
+    private func handleAccessoryWheel(_ request: GridAccessoryWheelRequest) {
+        guard let controller, controller.isMouseEnabled else { return }
+        let steps = scrollAccumulator.accumulate(
+            deltaX: request.deltaX,
+            deltaY: request.deltaY,
+            cellWidth: surface.cellSize.width,
+            cellHeight: surface.cellSize.height,
+            isPrecise: request.hasPreciseDeltas)
+        guard !steps.isEmpty else { return }
+        let modifiers = Modifiers(rawValue: request.modifierFlagsRawValue)
+        let cell = (grid: request.gridID, row: 0, col: 0)
         emitWheel(.up, count: steps.up, modifiers: modifiers, cell: cell)
         emitWheel(.down, count: steps.down, modifiers: modifiers, cell: cell)
         emitWheel(.left, count: steps.left, modifiers: modifiers, cell: cell)

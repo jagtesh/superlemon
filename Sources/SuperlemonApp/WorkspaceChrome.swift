@@ -25,12 +25,17 @@ final class WorkspaceChrome {
 
     /// Native-chrome toggles, mirrored from nvim (`superlemon.chrome` —
     /// nvim is the source of truth). The app delegate resizes the layout.
-    var onChromeModeChange: ((_ nativeTabs: Bool, _ nativeStatusbar: Bool) -> Void)?
+    var onChromeModeChange: ((
+        _ nativeTabs: Bool, _ nativeStatusbar: Bool,
+        _ nativeMinimap: Bool, _ nativeScrollbars: Bool
+    ) -> Void)?
     /// The default Neovim save mapping requests the native sheet for an
     /// unnamed buffer. AppDelegate supplies the document-panel presentation.
     var onSaveAsRequested: (() -> Void)?
     private(set) var nativeTabs = false
     private(set) var nativeStatusbar = false
+    private(set) var nativeMinimap = true
+    private(set) var nativeScrollbars = false
 
     private unowned let controller: NvimController
     private weak var window: NSWindow?
@@ -133,7 +138,10 @@ final class WorkspaceChrome {
             guard let payload = params.first else { return }
             nativeTabs = payload["native_tabs"]?.boolValue ?? false
             nativeStatusbar = payload["native_statusbar"]?.boolValue ?? false
-            onChromeModeChange?(nativeTabs, nativeStatusbar)
+            nativeMinimap = payload["native_minimap"]?.boolValue ?? true
+            nativeScrollbars = payload["native_scrollbars"]?.boolValue ?? false
+            onChromeModeChange?(
+                nativeTabs, nativeStatusbar, nativeMinimap, nativeScrollbars)
             syncChrome()  // re-route the cmdline if one is active
         case "superlemon.statusline":
             // The user's own statusline, evaluated by nvim_eval_statusline —

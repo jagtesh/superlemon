@@ -37,5 +37,8 @@ let package = Package(
         .testTarget(name: "SurfaceKitTests", dependencies: ["SurfaceKit"]),
         .testTarget(name: "ChromeKitTests", dependencies: ["ChromeKit"]),
         .testTarget(name: "ShellKitTests", dependencies: ["ShellKit"]),
+        .testTarget(
+            name: "SuperlemonAppTests",
+            dependencies: ["SuperlemonApp", "NvimKit", "SurfaceKit"]),
     ]
 )

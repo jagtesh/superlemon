@@ -140,7 +140,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             statusBar.bottomAnchor.constraint(equalTo: root.bottomAnchor),
             statusBarHeight,
         ])
-        chrome.onChromeModeChange = { [weak root, weak controller] nativeTabs, nativeStatusbar in
+        chrome.onChromeModeChange = {
+            [weak root, weak controller]
+            nativeTabs, nativeStatusbar, nativeMinimap, nativeScrollbars in
             tabStripHeight.constant = nativeTabs ? BufferTabStripView.stripHeight : 0
             statusBarHeight.constant = nativeStatusbar ? StatusBarView.barHeight : 0
             // isHidden alongside the collapse: a 0-height NSView still draws
@@ -148,6 +150,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             tabStrip.isHidden = !nativeTabs
             statusBar.isHidden = !nativeStatusbar
             root?.layoutSubtreeIfNeeded()
+            controller?.setEditorAccessories(
+                minimap: nativeMinimap, scrollbars: nativeScrollbars)
             // The grid gains/loses rows with the bands; don't wait for the
             // next natural layout pass to tell nvim.
             controller?.surfaceLayoutChanged()
@@ -320,6 +324,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         controller?.toggleNativeChrome("statusbar")
     }
 
+    @objc private func toggleMinimap(_ sender: Any?) {
+        controller?.toggleNativeChrome("minimap")
+    }
+
+    @objc private func toggleNativeScrollbars(_ sender: Any?) {
+        controller?.toggleNativeChrome("scrollbars")
+    }
+
     /// Configuration-source selector retained for the Settings-owned managed
     /// versus user-init preference; changes take effect at launch.
     @objc private func toggleManagedConfig(_ sender: Any?) {
@@ -360,6 +372,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             menuItem.state = (chrome?.nativeTabs ?? false) ? .on : .off
         case #selector(toggleNativeStatusBar(_:)):
             menuItem.state = (chrome?.nativeStatusbar ?? false) ? .on : .off
+        case #selector(toggleMinimap(_:)):
+            menuItem.state = (chrome?.nativeMinimap ?? true) ? .on : .off
+        case #selector(toggleNativeScrollbars(_:)):
+            menuItem.state = (chrome?.nativeScrollbars ?? false) ? .on : .off
         default:
             break
         }
@@ -500,6 +516,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             keyEquivalent: "")
         nativeBarItem.target = self
         viewMenu.addItem(nativeBarItem)
+        let minimapItem = NSMenuItem(
+            title: "Minimap",
+            action: #selector(toggleMinimap(_:)),
+            keyEquivalent: "")
+        minimapItem.target = self
+        viewMenu.addItem(minimapItem)
+        let nativeScrollbarsItem = NSMenuItem(
+            title: "Native Scroll Bars",
+            action: #selector(toggleNativeScrollbars(_:)),
+            keyEquivalent: "")
+        nativeScrollbarsItem.target = self
+        viewMenu.addItem(nativeScrollbarsItem)
         viewMenu.addItem(.separator())
         let historyItem = NSMenuItem(
             title: "Message History…",

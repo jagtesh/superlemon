@@ -16,7 +16,13 @@ final class NvimController {
 
     private(set) var session: NvimSession?
     weak var window: NSWindow?
-    var surface: GridSurfaceView?
+    var surface: GridSurfaceView? {
+        didSet {
+            oldValue?.onGridAccessorySizeRequest = nil
+            oldValue?.onGridAccessoryViewportTargetRequest = nil
+            configureEditorAccessoryBridge()
+        }
+    }
     /// Native ChromeKit + ShellKit workspace UI; nil in smoke mode.
     var chrome: WorkspaceChrome?
 
@@ -58,6 +64,10 @@ final class NvimController {
         var ligatures = true
         var useSymbolFont = false
         var forceGlyphFallback = false
+        var minimapWidth: CGFloat = 88
+        var minimapScale: CGFloat = 0.20
+        var minimapPitch: CGFloat = 3.0
+        var minimapMinEditorColumns = 40
 
         init() {}
 
@@ -66,6 +76,14 @@ final class NvimController {
             ligatures = payload["ligatures"]?.boolValue ?? true
             useSymbolFont = payload["use_symbol_font"]?.boolValue ?? false
             forceGlyphFallback = payload["force_glyph_fallback"]?.boolValue ?? false
+            minimapWidth = max(
+                48, min(160, CGFloat(payload["minimap_width"]?.doubleValue ?? 88)))
+            minimapScale = max(
+                0.10, min(0.50, CGFloat(payload["minimap_scale"]?.doubleValue ?? 0.20)))
+            minimapPitch = max(
+                1, min(6, CGFloat(payload["minimap_pitch"]?.doubleValue ?? 3.0)))
+            minimapMinEditorColumns = max(
+                20, min(120, payload["minimap_min_editor_columns"]?.intValue ?? 40))
         }
 
         func apply(to spec: inout FontSpec) {
@@ -77,6 +95,9 @@ final class NvimController {
     }
 
     private var renderingSettings = RenderingSettings()
+    private var nativeMinimapEnabled = true
+    private var nativeScrollbarsEnabled = false
+    private var minimapBridge: MinimapBridge!
     /// Font name/size/spacing derived only from Neovim's guifont/linespace.
     /// Command-0 returns to this value after temporary native zooming.
     private var configuredFontSpec = FontSpec()
@@ -90,6 +111,15 @@ final class NvimController {
     private var pendingInputCommands: [NvimInputCommand] = []
     private var inputDrainTask: Task<Void, Never>?
     private var inputReady = false
+
+    init() {
+        minimapBridge = MinimapBridge(
+            surface: nil,
+            notify: { [weak self] method, params in
+                guard let session = self?.session else { return }
+                Task { await session.notify(method, params) }
+            })
+    }
 
     // MARK: - Startup
 
@@ -196,6 +226,47 @@ final class NvimController {
         var spec = configuredFontSpec
         renderingSettings.apply(to: &spec)
         applyFontSpec(spec)
+        applyEditorAccessorySettings()
+    }
+
+    /// Live View-menu/config state. SurfaceKit owns the concrete accessory
+    /// presentation; keeping the state here also covers notifications that
+    /// arrive before the window surface is attached.
+    func setEditorAccessories(minimap: Bool, scrollbars: Bool) {
+        nativeMinimapEnabled = minimap
+        nativeScrollbarsEnabled = scrollbars
+        applyEditorAccessorySettings()
+    }
+
+    private func applyEditorAccessorySettings() {
+        guard let surface else { return }
+        surface.showsMinimap = nativeMinimapEnabled
+        surface.showsNativeScrollbars = nativeScrollbarsEnabled
+        surface.minimapWidth = renderingSettings.minimapWidth
+        surface.minimapScale = renderingSettings.minimapScale
+        surface.minimapPitch = renderingSettings.minimapPitch
+        surface.minimapMinEditorColumns = renderingSettings.minimapMinEditorColumns
+    }
+
+    private func configureEditorAccessoryBridge() {
+        minimapBridge.attach(to: surface)
+        guard let surface else { return }
+        surface.onGridAccessorySizeRequest = { [weak self] request in
+            self?.enqueueInput(
+                .resizeGrid(
+                    grid: request.gridID, cols: request.cols, rows: request.rows))
+        }
+        surface.onGridAccessoryViewportTargetRequest = { [weak self] request in
+            guard let buffer = request.bufferHandle else { return }
+            self?.enqueueInput(
+                .viewportTarget(
+                    grid: request.gridID,
+                    window: request.windowHandle,
+                    buffer: buffer,
+                    topline: request.targetTopline,
+                    activate: request.phase == .began))
+        }
+        applyEditorAccessorySettings()
     }
 
     /// The runtime/ directory: env override → repo-relative to the executable
@@ -333,6 +404,11 @@ final class NvimController {
         notificationTask = Task { [weak self] in
             for await notification in session.notifications {
                 guard let self else { return }
+                if self.minimapBridge.handleNotification(
+                    notification.method, params: notification.params)
+                {
+                    continue
+                }
                 self.chrome?.handleNotification(notification.method, notification.params)
             }
         }
