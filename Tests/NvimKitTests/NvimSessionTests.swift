@@ -232,7 +232,12 @@ private func lineText(_ event: UIEvent) -> String? {
         let session = NvimSession(
             configuration: NvimLaunchConfiguration(
                 binaryURL: URL(fileURLWithPath: "/bin/sh"),
-                arguments: ["-c", "sleep 0.15; printf '\\301'; exec /bin/sleep 30"]))
+                // Emit the malformed byte only after one byte of the request
+                // frame arrives on stdin: the request is then guaranteed to
+                // be in flight, with no wall-clock timing to race against.
+                arguments: [
+                    "-c", "dd bs=1 count=1 >/dev/null 2>&1; printf '\\301'; exec /bin/sleep 30",
+                ]))
         let lifecycleCount = Task {
             var count = 0
             for await _ in session.lifecycleEvents { count += 1 }
@@ -248,7 +253,6 @@ private func lineText(_ event: UIEvent) -> String? {
         let pending = Task {
             try await session.request("will-fail", [], timeout: .seconds(10))
         }
-        try await waitUntil { await session.pendingRequestCount == 1 }
         await #expect(throws: NvimError.protocolError("invalidFormatByte(193)")) {
             _ = try await pending.value
         }
@@ -275,7 +279,9 @@ private func lineText(_ event: UIEvent) -> String? {
             configuration: NvimLaunchConfiguration(
                 binaryURL: URL(fileURLWithPath: "/bin/sh"),
                 arguments: [
-                    "-c", "sleep 0.15; printf '\\221\\003'; exec /bin/sleep 30",
+                    // As in the malformed-msgpack test: the invalid frame is
+                    // sent only once a byte of the pending request arrives.
+                    "-c", "dd bs=1 count=1 >/dev/null 2>&1; printf '\\221\\003'; exec /bin/sleep 30",
                 ]))
         let lifecycleCount = Task {
             var count = 0
@@ -292,7 +298,6 @@ private func lineText(_ event: UIEvent) -> String? {
         let pending = Task {
             try await session.request("will-fail", [], timeout: .seconds(10))
         }
-        try await waitUntil { await session.pendingRequestCount == 1 }
         await #expect(throws: NvimError.protocolError("unknownMessageType(3)")) {
             _ = try await pending.value
         }
