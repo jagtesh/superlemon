@@ -102,7 +102,7 @@ fi
 # The checksum authenticates the bytes. Before extraction, independently
 # constrain every member and symlink/hardlink target to the one expected
 # top-level directory; device nodes and other special members are rejected.
-python3 "$root/scripts/validate-tar-archive.py" "$archive" "$asset"
+python3 "$root/scripts/validate-tar-archive.py" "$archive" "$asset" >&2
 
 tar -xzf "$archive" -C "$extract_dir" --no-same-owner
 candidate="$extract_dir/$asset"
