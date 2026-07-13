@@ -26,6 +26,15 @@ fi
 workdir=$(mktemp -d "${TMPDIR:-/tmp}/superlemon-homebrew.XXXXXX")
 trap 'rm -rf "$workdir"' EXIT
 
+manifest="$root/packaging/dependencies.json"
+manifest_value() {
+  /usr/bin/plutil -extract "$1" raw -o - "$manifest"
+}
+neovim_arm64_url=$(manifest_value neovim.architectures.arm64.url)
+neovim_arm64_sha256=$(manifest_value neovim.architectures.arm64.sha256)
+neovim_x86_64_url=$(manifest_value neovim.architectures.x86_64.url)
+neovim_x86_64_sha256=$(manifest_value neovim.architectures.x86_64.sha256)
+
 source_archive="$workdir/superlemon-$version.tar.gz"
 curl --fail --location --retry 3 \
   "https://github.com/jagtesh/superlemon/archive/refs/tags/v$version.tar.gz" \
@@ -38,6 +47,10 @@ mkdir -p "$workdir/tap/Formula"
 sed \
   -e "s/@VERSION@/$version/g" \
   -e "s/@SOURCE_SHA256@/$source_sha256/g" \
+  -e "s|@NEOVIM_ARM64_URL@|$neovim_arm64_url|g" \
+  -e "s/@NEOVIM_ARM64_SHA256@/$neovim_arm64_sha256/g" \
+  -e "s|@NEOVIM_X86_64_URL@|$neovim_x86_64_url|g" \
+  -e "s/@NEOVIM_X86_64_SHA256@/$neovim_x86_64_sha256/g" \
   "$root/packaging/homebrew/superlemon.rb.in" \
   > "$workdir/tap/Formula/superlemon.rb"
 rm -f "$workdir/tap/Casks/superlemon.rb"

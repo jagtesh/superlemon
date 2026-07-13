@@ -1,0 +1,131 @@
+{
+  "$schema": "./release-acceptance.schema.json",
+  "schema_version": 1,
+  "candidate": {
+    "tag": "v0.0.0",
+    "commit_sha": "0000000000000000000000000000000000000000",
+    "artifact_filename": "Superlemon-0.0.0-macOS-arm64-unsigned.zip",
+    "archive_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "architecture": "arm64",
+    "packaged_neovim_version": "0.0.0"
+  },
+  "tester": {
+    "name": "NOT RUN",
+    "tested_at": "1970-01-01T00:00:00Z",
+    "macos_version_build": "NOT RUN",
+    "hardware": "NOT RUN",
+    "display": "NOT RUN",
+    "input_sources": ["NOT RUN", "NOT RUN", "NOT RUN"]
+  },
+  "evidence_root": "NOT RUN",
+  "performance": {
+    "redraw_search": {
+      "duration_seconds": 0,
+      "sample_count": 0,
+      "rss_growth_budget_mib": 0,
+      "observed_rss_growth_mib": 0,
+      "unresponsive_budget_ms": 0,
+      "observed_max_unresponsive_ms": 0
+    },
+    "filesystem_stress": {
+      "file_count": 0,
+      "mutation_count": 0,
+      "stall_budget_ms": 0,
+      "observed_max_stall_ms": 0
+    }
+  },
+  "checks": {
+    "disposable_workspace": {
+      "status": "NOT RUN",
+      "evidence": ["NOT RUN"],
+      "notes": ""
+    },
+    "input_sources_installed": {
+      "status": "NOT RUN",
+      "evidence": ["NOT RUN"],
+      "notes": ""
+    },
+    "performance_budgets_recorded": {
+      "status": "NOT RUN",
+      "evidence": ["NOT RUN"],
+      "notes": ""
+    },
+    "dead_key": {
+      "status": "NOT RUN",
+      "evidence": ["NOT RUN"],
+      "notes": ""
+    },
+    "emoji": {
+      "status": "NOT RUN",
+      "evidence": ["NOT RUN"],
+      "notes": ""
+    },
+    "japanese_romaji": {
+      "status": "NOT RUN",
+      "evidence": ["NOT RUN"],
+      "notes": ""
+    },
+    "simplified_chinese_pinyin": {
+      "status": "NOT RUN",
+      "evidence": ["NOT RUN"],
+      "notes": ""
+    },
+    "korean_2_set": {
+      "status": "NOT RUN",
+      "evidence": ["NOT RUN"],
+      "notes": ""
+    },
+    "voiceover": {
+      "status": "NOT RUN",
+      "evidence": ["NOT RUN"],
+      "notes": ""
+    },
+    "five_minute_redraw_search": {
+      "status": "NOT RUN",
+      "evidence": ["NOT RUN"],
+      "notes": ""
+    },
+    "main_thread_filesystem_stress": {
+      "status": "NOT RUN",
+      "evidence": ["NOT RUN"],
+      "notes": ""
+    },
+    "open_edit_save_reopen": {
+      "status": "NOT RUN",
+      "evidence": ["NOT RUN"],
+      "notes": ""
+    },
+    "quit_modified_buffer_matrix": {
+      "status": "NOT RUN",
+      "evidence": ["NOT RUN"],
+      "notes": ""
+    },
+    "sidebar_operations_and_error_recovery": {
+      "status": "NOT RUN",
+      "evidence": ["NOT RUN"],
+      "notes": ""
+    },
+    "sidebar_layout_state_preserved": {
+      "status": "NOT RUN",
+      "evidence": ["NOT RUN"],
+      "notes": ""
+    },
+    "quick_open_and_editor_chrome": {
+      "status": "NOT RUN",
+      "evidence": ["NOT RUN"],
+      "notes": ""
+    },
+    "reduce_motion_and_appearance": {
+      "status": "NOT RUN",
+      "evidence": ["NOT RUN"],
+      "notes": ""
+    }
+  },
+  "decision": {
+    "status": "NOT RUN",
+    "release_owner": "NOT RUN",
+    "signed_off_at": "1970-01-01T00:00:00Z",
+    "evidence": ["NOT RUN"],
+    "blocking_issues": []
+  }
+}
