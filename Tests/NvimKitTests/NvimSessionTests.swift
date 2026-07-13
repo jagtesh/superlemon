@@ -33,6 +33,11 @@ private actor ExitBox {
     func set(_ e: NvimSession.LifecycleEvent) { event = e }
 }
 
+private actor TerminationBox {
+    private(set) var outcome: NvimTermination?
+    func set(_ value: NvimTermination) { outcome = value }
+}
+
 private actor NotificationSink {
     private(set) var notifications: [NvimSession.Notification] = []
     func add(_ notification: NvimSession.Notification) { notifications.append(notification) }
@@ -56,16 +61,20 @@ private func lineText(_ event: UIEvent) -> String? {
     }
 
     @Test func processExitFailsInFlightRequests() async throws {
-        // /bin/cat speaks no msgpack-RPC: the request stays in flight until
-        // the process is killed, at which point it must fail.
+        // The child drains stdin without answering, so the request stays in
+        // flight until controlled shutdown and must then fail.
         let session = NvimSession(
             configuration: NvimLaunchConfiguration(
-                binaryURL: URL(fileURLWithPath: "/bin/cat"), arguments: []))
+                binaryURL: URL(fileURLWithPath: "/bin/sh"),
+                arguments: ["-c", "exec /bin/cat >/dev/null"]))
         try await session.start()
 
-        let pending = Task { try await session.request("nvim_get_api_info", []) }
-        try await Task.sleep(for: .milliseconds(100))
-        await session.terminate()
+        let pending = Task {
+            try await session.request("nvim_get_api_info", [], timeout: .seconds(10))
+        }
+        try await waitUntil { await session.pendingRequestCount == 1 }
+        _ = await session.shutdown(
+            termGrace: .milliseconds(100), killGrace: .seconds(1))
 
         await #expect(throws: NvimError.self) { _ = try await pending.value }
 
@@ -78,6 +87,67 @@ private func lineText(_ event: UIEvent) -> String? {
                 return true
             }
         }
+    }
+
+    @Test func requestTimeoutRemovesPendingEntry() async throws {
+        let session = NvimSession(
+            configuration: NvimLaunchConfiguration(
+                binaryURL: URL(fileURLWithPath: "/bin/sh"),
+                arguments: ["-c", "exec /bin/cat >/dev/null"]))
+        try await session.start()
+
+        await #expect(throws: NvimError.requestTimedOut(method: "never")) {
+            _ = try await session.request("never", [], timeout: .milliseconds(50))
+        }
+        #expect(await session.pendingRequestCount == 0)
+
+        _ = await session.shutdown(
+            termGrace: .milliseconds(100), killGrace: .seconds(1))
+    }
+
+    @Test func requestCancellationIsImmediateAndRemovesPendingEntry() async throws {
+        let session = NvimSession(
+            configuration: NvimLaunchConfiguration(
+                binaryURL: URL(fileURLWithPath: "/bin/sh"),
+                arguments: ["-c", "exec /bin/cat >/dev/null"]))
+        try await session.start()
+
+        let request = Task {
+            try await session.request("cancel-me", [], timeout: .seconds(10))
+        }
+        try await waitUntil { await session.pendingRequestCount == 1 }
+        request.cancel()
+        await #expect(throws: CancellationError.self) { _ = try await request.value }
+        #expect(await session.pendingRequestCount == 0)
+
+        _ = await session.shutdown(
+            termGrace: .milliseconds(100), killGrace: .seconds(1))
+    }
+
+    @Test func lateResponseAfterTimeoutIsIgnoredAndNextRequestSucceeds() async throws {
+        // cat reflects our request as an incoming RPC request and reflects the
+        // handler response back as the correlated response. Delaying one
+        // handler creates a deterministic late-response race without a fixture
+        // executable.
+        let session = NvimSession(
+            configuration: NvimLaunchConfiguration(
+                binaryURL: URL(fileURLWithPath: "/bin/cat"), arguments: []))
+        await session.setRequestHandler { method, _ in
+            if method == "slow" { try? await Task.sleep(for: .milliseconds(150)) }
+            return .success(.string("reply-\(method)"))
+        }
+        try await session.start()
+
+        await #expect(throws: NvimError.requestTimedOut(method: "slow")) {
+            _ = try await session.request("slow", [], timeout: .milliseconds(30))
+        }
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(await session.pendingRequestCount == 0)
+
+        let reply = try await session.request("fast", [], timeout: .seconds(1))
+        #expect(reply == .string("reply-fast"))
+        _ = await session.shutdown(
+            termGrace: .milliseconds(100), killGrace: .seconds(1))
     }
 
     @Test func stderrIsCapturedInTail() async throws {
@@ -112,6 +182,250 @@ private func lineText(_ event: UIEvent) -> String? {
         #expect(tail.contains("bye"))
     }
 
+    @Test func shutdownReturnsReapedSIGTERMOutcomeWithoutEscalation() async throws {
+        let session = NvimSession(
+            configuration: NvimLaunchConfiguration(
+                binaryURL: URL(fileURLWithPath: "/bin/sleep"), arguments: ["30"]))
+        try await session.start()
+
+        let outcome = await session.shutdown(
+            termGrace: .milliseconds(100), killGrace: .seconds(1))
+        #expect(outcome.cause == .requestedShutdown)
+        #expect(outcome.exitCode != nil)
+        #expect(!outcome.didForceKill)
+    }
+
+    @Test func shutdownEscalatesIgnoredSIGTERMAndEmitsExactlyOnce() async throws {
+        let session = NvimSession(
+            configuration: NvimLaunchConfiguration(
+                binaryURL: URL(fileURLWithPath: "/bin/sh"),
+                arguments: ["-c", "trap '' TERM; exec /bin/sleep 30"]))
+        let lifecycleCount = Task {
+            var count = 0
+            for await _ in session.lifecycleEvents { count += 1 }
+            return count
+        }
+        let terminationOutcomes = Task {
+            var outcomes: [NvimTermination] = []
+            for await outcome in session.terminationEvents { outcomes.append(outcome) }
+            return outcomes
+        }
+        try await session.start()
+        // Give /bin/sh time to install SIG_IGN and exec sleep.
+        try await Task.sleep(for: .milliseconds(50))
+
+        async let first = session.shutdown(
+            termGrace: .milliseconds(50), killGrace: .seconds(1))
+        async let second = session.shutdown(
+            termGrace: .milliseconds(50), killGrace: .seconds(1))
+        let outcomes = await [first, second]
+
+        #expect(outcomes[0] == outcomes[1])
+        #expect(outcomes[0].cause == .requestedShutdown)
+        #expect(outcomes[0].didForceKill)
+        #expect(await lifecycleCount.value == 1)
+        let emitted = await terminationOutcomes.value
+        #expect(emitted == [outcomes[0]])
+    }
+
+    @Test func malformedMsgpackFailsPendingAndStillEmitsOneExitAndOutcome() async throws {
+        let session = NvimSession(
+            configuration: NvimLaunchConfiguration(
+                binaryURL: URL(fileURLWithPath: "/bin/sh"),
+                arguments: ["-c", "sleep 0.15; printf '\\301'; exec /bin/sleep 30"]))
+        let lifecycleCount = Task {
+            var count = 0
+            for await _ in session.lifecycleEvents { count += 1 }
+            return count
+        }
+        let terminationOutcomes = Task {
+            var outcomes: [NvimTermination] = []
+            for await outcome in session.terminationEvents { outcomes.append(outcome) }
+            return outcomes
+        }
+        try await session.start()
+
+        let pending = Task {
+            try await session.request("will-fail", [], timeout: .seconds(10))
+        }
+        try await waitUntil { await session.pendingRequestCount == 1 }
+        await #expect(throws: NvimError.protocolError("invalidFormatByte(193)")) {
+            _ = try await pending.value
+        }
+
+        let emitted = await terminationOutcomes.value
+        #expect(emitted.count == 1)
+        guard let outcome = emitted.first else { return }
+        guard case .protocolError(let message) = outcome.cause else {
+            Issue.record("expected protocol-error termination")
+            return
+        }
+        #expect(message.contains("invalidFormatByte"))
+        #expect(await lifecycleCount.value == 1)
+        #expect(await session.pendingRequestCount == 0)
+
+        await #expect(throws: NvimError.protocolError("invalidFormatByte(193)")) {
+            _ = try await session.request("after-failure", [])
+        }
+    }
+
+    @Test func structurallyInvalidRPCFrameUsesProtocolFailureFunnel() async throws {
+        // [3] is valid MessagePack but not a valid msgpack-RPC message type.
+        let session = NvimSession(
+            configuration: NvimLaunchConfiguration(
+                binaryURL: URL(fileURLWithPath: "/bin/sh"),
+                arguments: [
+                    "-c", "sleep 0.15; printf '\\221\\003'; exec /bin/sleep 30",
+                ]))
+        let lifecycleCount = Task {
+            var count = 0
+            for await _ in session.lifecycleEvents { count += 1 }
+            return count
+        }
+        let terminationOutcomes = Task {
+            var outcomes: [NvimTermination] = []
+            for await outcome in session.terminationEvents { outcomes.append(outcome) }
+            return outcomes
+        }
+        try await session.start()
+
+        let pending = Task {
+            try await session.request("will-fail", [], timeout: .seconds(10))
+        }
+        try await waitUntil { await session.pendingRequestCount == 1 }
+        await #expect(throws: NvimError.protocolError("unknownMessageType(3)")) {
+            _ = try await pending.value
+        }
+
+        let emitted = await terminationOutcomes.value
+        #expect(emitted.count == 1)
+        guard case .protocolError(let detail)? = emitted.first?.cause else {
+            Issue.record("expected protocol-error termination")
+            return
+        }
+        #expect(detail.contains("unknownMessageType(3)"))
+        #expect(await lifecycleCount.value == 1)
+        #expect(await session.pendingRequestCount == 0)
+    }
+
+    @Test func liveChildStdoutEOFFailsPendingAndTerminatesExactlyOnce() async throws {
+        let session = NvimSession(
+            configuration: NvimLaunchConfiguration(
+                binaryURL: URL(fileURLWithPath: "/bin/sh"),
+                arguments: [
+                    "-c", "sleep 0.15; exec 1>&-; exec /bin/cat >/dev/null",
+                ]))
+        let lifecycleCount = Task {
+            var count = 0
+            for await _ in session.lifecycleEvents { count += 1 }
+            return count
+        }
+        let terminationOutcomes = Task {
+            var outcomes: [NvimTermination] = []
+            for await outcome in session.terminationEvents { outcomes.append(outcome) }
+            return outcomes
+        }
+        try await session.start()
+
+        let pending = Task {
+            try await session.request("will-lose-transport", [], timeout: .seconds(10))
+        }
+        try await waitUntil { await session.pendingRequestCount == 1 }
+        let expected = NvimError.ioFailure(
+            "stdout closed while nvim process was still running")
+        await #expect(throws: expected) { _ = try await pending.value }
+
+        let emitted = await terminationOutcomes.value
+        #expect(emitted.count == 1)
+        #expect(
+            emitted.first?.cause
+                == .ioFailure("stdout closed while nvim process was still running"))
+        #expect(await lifecycleCount.value == 1)
+        #expect(await session.pendingRequestCount == 0)
+    }
+
+    @Test func ordinaryExitEOFRemainsOneProcessExitOutcome() async throws {
+        let session = NvimSession(
+            configuration: NvimLaunchConfiguration(
+                binaryURL: URL(fileURLWithPath: "/bin/sh"),
+                arguments: ["-c", "exit 0"]))
+        let lifecycleEvents = Task {
+            var events: [NvimSession.LifecycleEvent] = []
+            for await event in session.lifecycleEvents { events.append(event) }
+            return events
+        }
+        let terminationOutcomes = Task {
+            var outcomes: [NvimTermination] = []
+            for await outcome in session.terminationEvents { outcomes.append(outcome) }
+            return outcomes
+        }
+
+        try await session.start()
+        let outcomes = await terminationOutcomes.value
+        #expect(outcomes.count == 1)
+        #expect(outcomes.first?.cause == .processExit)
+        #expect(outcomes.first?.exitCode == 0)
+        #expect(await lifecycleEvents.value.count == 1)
+    }
+
+    @Test func missingProcessExitCallbackCannotStrandShutdownWaiters() async throws {
+        let session = NvimSession(
+            configuration: NvimLaunchConfiguration(
+                binaryURL: URL(fileURLWithPath: "/bin/sh"),
+                arguments: ["-c", "trap '' TERM; exec /bin/sleep 30"]))
+        await session.suppressProcessExitHandling()
+        let terminationOutcomes = Task {
+            var outcomes: [NvimTermination] = []
+            for await outcome in session.terminationEvents { outcomes.append(outcome) }
+            return outcomes
+        }
+        try await session.start()
+        try await Task.sleep(for: .milliseconds(50))
+
+        let clock = ContinuousClock()
+        let start = clock.now
+        async let first = session.shutdown(
+            termGrace: .milliseconds(50), killGrace: .milliseconds(80))
+        async let second = session.shutdown(
+            termGrace: .milliseconds(50), killGrace: .milliseconds(80))
+        let outcomes = await [first, second]
+        let elapsed = start.duration(to: clock.now)
+
+        #expect(elapsed >= .milliseconds(100))
+        #expect(elapsed < .seconds(2))
+        #expect(outcomes[0] == outcomes[1])
+        #expect(outcomes[0].cause == .requestedShutdown)
+        #expect(outcomes[0].didForceKill)
+        #expect(await terminationOutcomes.value == [outcomes[0]])
+        #expect(await session.shutdown() == outcomes[0])
+    }
+
+    @Test func declaredOversizeBecomesProtocolTermination() async throws {
+        let limits = MsgpackDecodingLimits(
+            maximumMessageBytes: 32,
+            maximumContainerElements: 100,
+            maximumNestingDepth: 10)
+        let session = NvimSession(
+            configuration: NvimLaunchConfiguration(
+                binaryURL: URL(fileURLWithPath: "/bin/sh"),
+                arguments: [
+                    "-c", "printf '\\333\\000\\000\\001\\000'; exec /bin/sleep 30",
+                ]),
+            decodingLimits: limits)
+        let outcomeTask = Task<NvimTermination?, Never> {
+            for await outcome in session.terminationEvents { return outcome }
+            return nil
+        }
+        try await session.start()
+
+        let outcome = try #require(await outcomeTask.value)
+        guard case .protocolError(let message) = outcome.cause else {
+            Issue.record("expected protocol-error termination")
+            return
+        }
+        #expect(message.contains("messageTooLarge"))
+    }
+
     @Test func closedChildInputDoesNotRaiseSIGPIPE() async throws {
         // Keep the child alive briefly after closing stdin. This makes the
         // session write while its pipe has no reader: write(2) must return
@@ -119,26 +433,65 @@ private func lineText(_ event: UIEvent) -> String? {
         let session = NvimSession(
             configuration: NvimLaunchConfiguration(
                 binaryURL: URL(fileURLWithPath: "/bin/sh"),
-                arguments: ["-c", "exec 0<&-; sleep 0.2"]))
+                arguments: ["-c", "exec 0<&-; exec /bin/sleep 5"]))
         let exitBox = ExitBox()
+        let terminationBox = TerminationBox()
         let watcher = Task {
             for await event in session.lifecycleEvents {
                 await exitBox.set(event)
                 break
             }
         }
-        defer { watcher.cancel() }
+        let terminationWatcher = Task {
+            for await outcome in session.terminationEvents {
+                await terminationBox.set(outcome)
+                break
+            }
+        }
+        defer {
+            watcher.cancel()
+            terminationWatcher.cancel()
+        }
 
         try await session.start()
         try await Task.sleep(for: .milliseconds(50))
         await session.notify("write_to_closed_pipe", [])
         try await waitUntil { await exitBox.event != nil }
 
-        guard case .exited(let code, _)? = await exitBox.event else {
+        guard case .exited(_, _)? = await exitBox.event else {
             Issue.record("expected lifecycle exit event")
             return
         }
-        #expect(code == 0)
+        try await waitUntil { await terminationBox.outcome != nil }
+        guard case .ioFailure? = await terminationBox.outcome?.cause else {
+            Issue.record("expected stdin write failure outcome")
+            return
+        }
+    }
+
+    @Test func notificationStreamBackpressuresWithoutDroppingBurst() async throws {
+        let session = NvimSession(
+            configuration: NvimLaunchConfiguration(
+                binaryURL: URL(fileURLWithPath: "/bin/cat"), arguments: []))
+        try await session.start()
+
+        for index in 0..<100 {
+            await session.notify("event-\(index)", [])
+        }
+        // Let the pipe reader reach the channel's capacity before attaching a
+        // consumer. The remaining protocol bytes must wait upstream rather
+        // than being dropped or growing an unbounded in-memory queue.
+        try await Task.sleep(for: .milliseconds(100))
+
+        var received: [String] = []
+        for await notification in session.notifications {
+            received.append(notification.method)
+            if received.count == 100 { break }
+        }
+
+        #expect(received == (0..<100).map { "event-\($0)" })
+        _ = await session.shutdown(
+            termGrace: .milliseconds(100), killGrace: .seconds(1))
     }
 
     @Test func notificationBatchPreservesFrameOrder() async throws {
