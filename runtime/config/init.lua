@@ -5,7 +5,8 @@
 -- statusline / bufferline plugins) never loads. This is the fully-native
 -- experience — Superlemon's chrome replaces the in-grid equivalents.
 --
--- Deliberately small: ordinary editor defaults and one example plugin.
+-- Deliberately small: ordinary editor defaults, followed by the documented
+-- Superlemon baseline and one optional personal override.
 -- Superlemon-specific behavior lives in the annotated sibling
 -- `superlemon.vim`, which is sourced at the end of this file.
 
@@ -28,21 +29,6 @@ vim.cmd("syntax enable")
 -- Ships with nvim; calm and readable in both appearances.
 vim.cmd.colorscheme("habamax")
 
----------------------------------------------------------------------------
--- Plugins ─────────────────────────────────────────────────────────────────
---
--- Managed with nvim's BUILT-IN package manager (:h vim.pack, nvim 0.12+):
--- add/remove entries here like any vimrc — plugins are fetched on first
--- launch and loaded on every launch after. `:checkhealth vim.pack` to
--- inspect. nvim-surround gives Sublime-style ys/cs/ds surround editing.
----------------------------------------------------------------------------
-pcall(function()
-  vim.pack.add({
-    { src = "https://github.com/kylechui/nvim-surround" },
-  })
-  require("nvim-surround").setup()
-end)
-
 -- Source the managed Superlemon settings by absolute path. The bundled
 -- runtime is added to 'runtimepath' only after Neovim starts, so :runtime
 -- cannot locate this sibling during init processing.
@@ -57,7 +43,34 @@ if config_home == nil or config_home == "" then
   config_home = vim.fs.joinpath(vim.uv.os_homedir(), ".config")
 end
 local user_superlemon_config = vim.fs.joinpath(config_home, "superlemon", "init.vim")
-if vim.fn.filereadable(user_superlemon_config) == 1 then
-  vim.cmd("source " .. vim.fn.fnameescape(user_superlemon_config))
-  vim.g.superlemon_user_config_loaded = user_superlemon_config
+vim.g.superlemon_config_mode = "managed"
+vim.g.superlemon_config_path = user_superlemon_config
+
+-- Set state before :source so recursive setup/config helpers cannot source the
+-- same executable file again. A broken personal file does not prevent bridge
+-- startup: retain its diagnostic and continue with the bundled baseline.
+if vim.env.SUPERLEMON_SAFE_START == "1" then
+  vim.g.superlemon_user_config_state = "safe_start"
+  vim.g.superlemon_config_error = nil
+elseif vim.g.superlemon_user_config_state == nil then
+  if vim.fn.filereadable(user_superlemon_config) ~= 1 then
+    vim.g.superlemon_user_config_state = "missing"
+  else
+    vim.g.superlemon_user_config_state = "loading"
+    local ok, err = pcall(
+      vim.cmd,
+      "source " .. vim.fn.fnameescape(user_superlemon_config)
+    )
+    if ok then
+      vim.g.superlemon_user_config_state = "loaded"
+      vim.g.superlemon_user_config_loaded = user_superlemon_config
+      vim.g.superlemon_config_error = nil
+    else
+      vim.g.superlemon_user_config_state = "error"
+      vim.g.superlemon_config_error = {
+        path = user_superlemon_config,
+        message = tostring(err),
+      }
+    end
+  end
 end

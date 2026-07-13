@@ -18,6 +18,11 @@ local p = last.args[1]
 H.eq(p.mode, "n", "mode is raw nvim_get_mode() value")
 H.eq(p.file, "foo.txt", "file is relative to cwd")
 H.eq(p.modified, false, "modified false on fresh buffer")
+H.eq(p.modifiable, true, "normal buffer is modifiable")
+H.eq(p.readonly, false, "normal buffer is not readonly")
+H.eq(p.buftype, "", "normal buffer has no special type")
+H.eq(p.can_undo, false, "fresh buffer has no undo history")
+H.eq(p.can_redo, false, "fresh buffer has no redo history")
 H.eq(p.line, 1, "line 1-based")
 H.eq(p.col, 1, "col 1-based")
 H.eq(p.total_lines, 3, "total_lines")
@@ -39,11 +44,44 @@ vim.api.nvim_exec_autocmds("BufModifiedSet", {})
 p = calls.notify[#calls.notify].args[1]
 H.eq(p.modified, true, "modified true after edit (BufModifiedSet)")
 H.eq(p.total_lines, 4, "total_lines tracks edits")
+H.eq(p.can_undo, true, "edited buffer exposes undo availability")
+vim.cmd.undo()
+p = require("superlemon.status").payload()
+H.eq(p.can_redo, true, "undone edit exposes redo availability")
+vim.cmd.redo()
+
+-- Text changes can alter undo/redo availability without moving the cursor or
+-- flipping 'modified'. The debounced handler must still update native menus.
+vim.api.nvim_buf_set_lines(0, 0, 0, false, { "another" })
+vim.cmd.undo()
+vim.api.nvim_exec_autocmds("TextChanged", {})
+vim.wait(1000, function()
+  return calls.notify[#calls.notify].args[1].can_redo == true
+end)
+p = calls.notify[#calls.notify].args[1]
+H.eq(p.modified, true, "undo can leave the buffer modified")
+H.eq(p.can_redo, true, "TextChanged refreshes redo availability")
 
 -- Unnamed buffer → file == "".
 vim.cmd.enew()
 p = calls.notify[#calls.notify].args[1]
 H.eq(p.file, "", 'unnamed buffer reports file == ""')
+
+vim.cmd.file("named-later.txt")
+vim.api.nvim_exec_autocmds("BufFilePost", {})
+p = calls.notify[#calls.notify].args[1]
+H.eq(p.file, "named-later.txt", "BufFilePost refreshes save capability")
+
+vim.bo.modifiable = false
+vim.api.nvim_exec_autocmds("OptionSet", { pattern = "modifiable" })
+p = calls.notify[#calls.notify].args[1]
+H.eq(p.modifiable, false, "OptionSet refreshes modifiable capability")
+vim.bo.modifiable = true
+vim.bo.readonly = true
+vim.api.nvim_exec_autocmds("OptionSet", { pattern = "readonly" })
+p = calls.notify[#calls.notify].args[1]
+H.eq(p.readonly, true, "OptionSet refreshes readonly capability")
+vim.bo.readonly = false
 
 -- DirChanged pushes and re-reads project.
 local dir2 = H.tmpdir()

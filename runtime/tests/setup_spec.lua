@@ -16,8 +16,14 @@ H.eq(vim.g.superlemon_channel, nil, "bad setup stores no channel")
 
 -- GUI attach.
 local calls = H.stub_gui()
-local ok1, err1 = pcall(sl.setup, 3)
+local setup1
+local ok1, err1 = pcall(function() setup1 = sl.setup(3) end)
 H.ok(ok1, "first setup() succeeds" .. (ok1 and "" or (": " .. tostring(err1))))
+H.eq(setup1, {
+  ready = true,
+  runtime_api = 1,
+  config = { mode = "external", state = "not_applicable" },
+}, "setup returns structured bridge readiness")
 H.eq(vim.g.superlemon_channel, 3, "channel stored in g:superlemon_channel")
 H.eq(sl.active(), true, "active() true after setup with UI")
 
