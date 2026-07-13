@@ -1,4 +1,5 @@
 import NvimKit
+import os.signpost
 
 /// How urgently an accumulated redraw frame must be handed to SurfaceKit.
 ///
@@ -116,6 +117,9 @@ public struct FlushResult: Sendable {
 ///   cell storage unless the model mutates afterward.
 @MainActor
 public final class GridStore {
+    private static let performanceLog = OSLog(
+        subsystem: "com.superlemon.editor",
+        category: OSLog.Category.pointsOfInterest.rawValue)
     public private(set) var grids: [Int: Grid] = [:]
     public private(set) var highlights = HighlightTable()
     public private(set) var cursor = CursorPosition(grid: 1, row: 0, col: 0)
@@ -191,6 +195,15 @@ public final class GridStore {
     /// display link or drain the accumulated state immediately.
     @discardableResult
     package func applyDeferred(_ batch: RedrawBatch) -> PresentationDisposition {
+        let signpostID = OSSignpostID(log: Self.performanceLog)
+        os_signpost(
+            .begin, log: Self.performanceLog, name: "ModelApply",
+            signpostID: signpostID, "events=%{public}d", batch.events.count)
+        defer {
+            os_signpost(
+                .end, log: Self.performanceLog, name: "ModelApply",
+                signpostID: signpostID)
+        }
         var result: PresentationDisposition = .none
         for event in batch.events {
             if case .flush = event {

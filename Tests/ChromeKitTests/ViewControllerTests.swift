@@ -278,14 +278,14 @@ private func allText(in view: NSView) -> [String] {
         controller.fadeDuration = 0  // immediate removal for deterministic timing
         controller.render([message("transient info")])
         #expect(controller.activeToastCount == 1)
-        try await Task.sleep(nanoseconds: 300_000_000)
+        await controller.waitForPendingDismissal()
         #expect(controller.activeToastCount == 0, "info fades away")
 
         controller.render([
             message("transient info"),
             message("E123: errors fade too — history is the record", kind: "emsg"),
         ])
-        try await Task.sleep(nanoseconds: 300_000_000)
+        await controller.waitForPendingDismissal()
         #expect(controller.activeToastCount == 0, "errors fade after the interval too")
         #expect(controller.history.contains { $0.isError }, "…but stay in history")
     }

@@ -19,16 +19,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private var appearanceObservation: NSKeyValueObservation?
     private var settings: SettingsWindowController?
     private var savePanelIsOpen = false
+    private var smokeDeadlineTask: Task<Void, Never>?
 
     @objc private func showSettings(_ sender: Any?) {
         guard let controller else { return }
         if settings == nil {
             let settings = SettingsWindowController()
-            settings.onEditSuperlemonConfig = { [weak controller] in
-                if let managed = NvimController.runtimeDirectory()?
-                    .appendingPathComponent("config/superlemon.vim")
+            settings.onEditConfiguration = { [weak controller] selection in
+                if let template = NvimController.runtimeDirectory()?
+                    .appendingPathComponent("config/user-init.vim")
                 {
-                    controller?.openSuperlemonConfig(templatePath: managed.path)
+                    controller?.openConfiguration(
+                        selection,
+                        managedTemplatePath: template.path)
                 }
             }
             settings.onRelaunch = { [weak self] in self?.relaunch() }
@@ -164,6 +167,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
         controller.window = window
         controller.surface = surface
+        controller.inputHost = host
         chrome.attach(window: window, surface: surface)
         chrome.restoreFocus = { [weak window, weak host] in
             window?.makeFirstResponder(host)
@@ -270,10 +274,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         }
     }
 
-    /// Keep File ▸ Save in the same remappable namespace as keyboard input.
-    /// The bundled mapping saves by default; a user's `<D-s>` mapping wins.
+    /// File ▸ Save is semantic even when a user remaps <D-s> in Neovim.
     @objc private func saveFile(_ sender: Any?) {
-        controller?.sendInput("<D-s>")
+        controller?.saveCurrentBuffer()
     }
 
     @objc private func saveFileAs(_ sender: Any?) {
@@ -333,52 +336,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         controller?.toggleNativeChrome("minimap")
     }
 
-    /// Configuration-source selector retained for the Settings-owned managed
-    /// versus user-init preference; changes take effect at launch.
-    @objc private func toggleManagedConfig(_ sender: Any?) {
-        let defaults = UserDefaults.standard
-        let key = NvimController.managedConfigDefaultsKey
-        defaults.set(!defaults.bool(forKey: key), forKey: key)
-
-        let alert = NSAlert()
-        alert.messageText =
-            defaults.bool(forKey: key)
-            ? "Superlemon will use its built-in configuration"
-            : "Superlemon will use your own Neovim configuration (init.vim/init.lua)"
-        alert.informativeText = "The change applies when Superlemon relaunches."
-        alert.addButton(withTitle: "Relaunch Now")
-        alert.addButton(withTitle: "Later")
-        if alert.runModal() == .alertFirstButtonReturn {
-            relaunch()
+    private func relaunch() {
+        controller?.requestRelaunch {
+            let process = Process()
+            process.executableURL = URL(
+                fileURLWithPath: Bundle.main.executablePath ?? CommandLine.arguments[0])
+            process.arguments = []
+            try process.run()
         }
     }
 
-    private func relaunch() {
-        let process = Process()
-        process.executableURL = URL(
-            fileURLWithPath: Bundle.main.executablePath ?? CommandLine.arguments[0])
-        // Give the current instance a moment to run its quit flow.
-        process.arguments = []
-        let path = process.executableURL!.path
-        let relauncher = Process()
-        relauncher.executableURL = URL(fileURLWithPath: "/bin/sh")
-        relauncher.arguments = ["-c", "sleep 0.8; exec \"\(path)\""]
-        try? relauncher.run()
-        NSApp.terminate(nil)
+    @objc private func showHelp(_ sender: Any?) {
+        guard let url = URL(string: "https://github.com/jagtesh/superlemon") else { return }
+        NSWorkspace.shared.open(url)
     }
 
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         switch menuItem.action {
+        case #selector(openFile(_:)), #selector(openFolder(_:)),
+            #selector(presentQuickOpen(_:)):
+            return controller?.editorCommandsAvailable ?? false
+        case #selector(saveFile(_:)):
+            return controller?.canSaveCurrentBuffer ?? false
+        case #selector(saveFileAs(_:)):
+            return (controller?.editorCommandsAvailable ?? false) && !savePanelIsOpen
         case #selector(toggleNativeTabs(_:)):
             menuItem.state = (chrome?.nativeTabs ?? false) ? .on : .off
+            return controller?.editorCommandsAvailable ?? false
         case #selector(toggleNativeStatusBar(_:)):
             menuItem.state = (chrome?.nativeStatusbar ?? false) ? .on : .off
+            return controller?.editorCommandsAvailable ?? false
         case #selector(toggleMinimap(_:)):
             menuItem.state = (chrome?.nativeMinimap ?? true) ? .on : .off
+            return controller?.editorCommandsAvailable ?? false
         default:
-            break
+            return true
         }
-        return true
     }
 
     // MARK: - Smoke mode (--smoke)
@@ -387,20 +380,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     /// (no WindowServer dependency). Prints "SMOKE OK: <rows>x<cols>
     /// title=<title>" after the first flush, then quits via the quit flow.
     private func configureSmokeMode(_ controller: NvimController) {
+        smokeDeadlineTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(30))
+            } catch {
+                return
+            }
+            guard self != nil else { return }
+            FileHandle.standardError.write(
+                Data("SMOKE FAIL: readiness deadline exceeded\n".utf8))
+            fflush(stderr)
+            exit(1)
+        }
         controller.onFirstFlush = { [weak controller] flush in
             let grid = flush.grids[1]
             print("SMOKE OK: \(grid?.rows ?? 0)x\(grid?.cols ?? 0) title=\(flush.title)")
             fflush(stdout)
             controller?.requestQuit()
         }
-        controller.exitHandler = { code, stderrTail in
+        controller.exitHandler = { [weak self] code, stderrTail in
+            self?.smokeDeadlineTask?.cancel()
             if code != 0 {
                 FileHandle.standardError.write(
                     Data("SMOKE FAIL: nvim exited \(code)\n\(stderrTail)\n".utf8))
             }
             exit(code == 0 ? 0 : 1)
         }
-        controller.startupFailureHandler = { message in
+        controller.startupFailureHandler = { [weak self] message in
+            self?.smokeDeadlineTask?.cancel()
             FileHandle.standardError.write(Data("SMOKE FAIL: \(message)\n".utf8))
             exit(1)
         }
@@ -429,6 +436,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             keyEquivalent: ",")
         settingsItem.target = self
         appMenu.addItem(settingsItem)
+        appMenu.addItem(.separator())
+        appMenu.addItem(
+            NSMenuItem(
+                title: "Hide Superlemon",
+                action: #selector(NSApplication.hide(_:)),
+                keyEquivalent: "h"))
+        let hideOthers = NSMenuItem(
+            title: "Hide Others",
+            action: #selector(NSApplication.hideOtherApplications(_:)),
+            keyEquivalent: "h")
+        hideOthers.keyEquivalentModifierMask = [.command, .option]
+        appMenu.addItem(hideOthers)
+        appMenu.addItem(
+            NSMenuItem(
+                title: "Show All",
+                action: #selector(NSApplication.unhideAllApplications(_:)),
+                keyEquivalent: ""))
+        appMenu.addItem(.separator())
+        let servicesItem = NSMenuItem(title: "Services", action: nil, keyEquivalent: "")
+        let servicesMenu = NSMenu(title: "Services")
+        servicesItem.submenu = servicesMenu
+        NSApp.servicesMenu = servicesMenu
+        appMenu.addItem(servicesItem)
+        appMenu.addItem(.separator())
         appMenu.addItem(
             NSMenuItem(
                 title: "Quit Superlemon",
@@ -480,16 +511,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                 action: #selector(NSWindow.performClose(_:)),
                 keyEquivalent: "w"))
 
-        // Edit menu: Paste → nvim_paste (first responder: InputHostView).
+        // Standard responder-chain selectors keep native text fields, save
+        // panels, and inline rename controls native. InputHostView implements
+        // the same selectors semantically for Neovim and validates them from
+        // the latest status snapshot.
         let editItem = NSMenuItem()
         mainMenu.addItem(editItem)
         let editMenu = NSMenu(title: "Edit")
         editItem.submenu = editMenu
-        editMenu.addItem(
-            NSMenuItem(
-                title: "Paste",
-                action: NSSelectorFromString("paste:"),
-                keyEquivalent: "v"))
+        let undoItem = NSMenuItem(
+            title: "Undo", action: #selector(InputHostView.undo(_:)), keyEquivalent: "z")
+        editMenu.addItem(undoItem)
+        let redoItem = NSMenuItem(
+            title: "Redo", action: #selector(InputHostView.redo(_:)), keyEquivalent: "z")
+        redoItem.keyEquivalentModifierMask = [.command, .shift]
+        editMenu.addItem(redoItem)
+        editMenu.addItem(.separator())
+        let cutItem = NSMenuItem(
+            title: "Cut", action: #selector(InputHostView.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(cutItem)
+        let copyItem = NSMenuItem(
+            title: "Copy", action: #selector(InputHostView.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(copyItem)
+        let pasteItem = NSMenuItem(
+            title: "Paste", action: #selector(InputHostView.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(pasteItem)
+        let selectAllItem = NSMenuItem(
+            title: "Select All", action: #selector(InputHostView.selectAll(_:)), keyEquivalent: "a")
+        editMenu.addItem(selectAllItem)
+        editMenu.addItem(.separator())
+        let findItem = NSMenuItem(
+            title: "Find…", action: #selector(InputHostView.performFindPanelAction(_:)),
+            keyEquivalent: "f")
+        editMenu.addItem(findItem)
 
         // View menu: sidebar toggle.
         let viewItem = NSMenuItem()
@@ -545,6 +599,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             keyEquivalent: "p")
         quickOpenItem.target = self
         goMenu.addItem(quickOpenItem)
+
+        let windowItem = NSMenuItem()
+        mainMenu.addItem(windowItem)
+        let windowMenu = NSMenu(title: "Window")
+        windowItem.submenu = windowMenu
+        windowMenu.addItem(
+            NSMenuItem(
+                title: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)),
+                keyEquivalent: "m"))
+        windowMenu.addItem(
+            NSMenuItem(title: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: ""))
+        windowMenu.addItem(.separator())
+        windowMenu.addItem(
+            NSMenuItem(
+                title: "Bring All to Front",
+                action: #selector(NSApplication.arrangeInFront(_:)), keyEquivalent: ""))
+        NSApp.windowsMenu = windowMenu
+
+        let helpItem = NSMenuItem()
+        mainMenu.addItem(helpItem)
+        let helpMenu = NSMenu(title: "Help")
+        helpItem.submenu = helpMenu
+        let help = NSMenuItem(
+            title: "Superlemon Help", action: #selector(showHelp(_:)), keyEquivalent: "?")
+        help.target = self
+        helpMenu.addItem(help)
+        NSApp.helpMenu = helpMenu
 
         return mainMenu
     }

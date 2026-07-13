@@ -5,12 +5,14 @@
 // nvim_input; everything else → interpretKeyEvents → insertText/setMarkedText.
 
 import AppKit
+import CoreText
+import GridKit
 import InputKit
 import QuartzCore
 import SurfaceKit
 
 @MainActor
-final class InputHostView: NSView, @preconcurrency NSTextInputClient {
+final class InputHostView: NSView, @preconcurrency NSTextInputClient, NSMenuItemValidation {
     weak var controller: NvimController?
     let surface: GridSurfaceView
 
@@ -21,9 +23,20 @@ final class InputHostView: NSView, @preconcurrency NSTextInputClient {
     private let mouseTranslator = MouseTranslator()
     private var scrollAccumulator = ScrollAccumulator()
 
-    private var markedText = ""
+    /// A small, coherent text-storage window for the active composition. The
+    /// actual Neovim buffer is deliberately not mirrored: ordinary committed
+    /// input still travels through nvim_input, while AppKit can query and
+    /// replace the marked range without being told that every screen point is
+    /// document index zero.
+    private var markedText = NSAttributedString(string: "")
+    private var markedDocumentRange = NSRange(location: NSNotFound, length: 0)
     private var markedSelectedRange = NSRange(location: NSNotFound, length: 0)
+    private var suppressUnmarkCommit = false
     private var preeditLayer: CATextLayer?
+
+    private var accessibleText = ""
+    private var accessibleSelection = NSRange(location: 0, length: 0)
+    private var accessibilityUpdateScheduled = false
 
     init(frame frameRect: NSRect, surface: GridSurfaceView, controller: NvimController) {
         self.surface = surface
@@ -44,6 +57,13 @@ final class InputHostView: NSView, @preconcurrency NSTextInputClient {
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func resignFirstResponder() -> Bool {
+        // A focus change should not silently throw away an in-progress word.
+        // Session teardown uses discardMarkedTextForSessionChange() instead.
+        if hasMarkedText() { unmarkText() }
+        return super.resignFirstResponder()
+    }
 
     /// Grid pixels remain owned by this first-responder view. Explicit native
     /// controls in an acknowledged accessory gutter are the sole exception.
@@ -93,28 +113,61 @@ final class InputHostView: NSView, @preconcurrency NSTextInputClient {
     }
 
     func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
-        let text = Self.plainString(from: string)
-        if text.isEmpty {
+        let attributed = Self.attributedString(from: string)
+        if attributed.length == 0 {
             clearMarkedText()
             return
         }
-        markedText = text
-        markedSelectedRange = selectedRange
+
+        let origin: Int
+        let selectionOffset: Int
+        if hasMarkedText(), Self.range(replacementRange, isContainedIn: markedDocumentRange) {
+            // This is the replacement case we can honor without pretending to
+            // mirror the Neovim document: replace a UTF-16 slice of the active
+            // composition and preserve its surrounding attributed clauses.
+            let localReplacement = NSRange(
+                location: replacementRange.location - markedDocumentRange.location,
+                length: replacementRange.length)
+            let updated = NSMutableAttributedString(attributedString: markedText)
+            updated.replaceCharacters(in: localReplacement, with: attributed)
+            origin = markedDocumentRange.location
+            selectionOffset = localReplacement.location
+            markedText = updated
+        } else {
+            // Arbitrary-buffer reconversion is deliberately unsupported until
+            // there is a changedtick-validated Neovim text snapshot. Keep a
+            // local composition coordinate space instead of inventing one.
+            origin = markedDocumentRange.location == NSNotFound
+                ? 0 : markedDocumentRange.location
+            selectionOffset = 0
+            markedText = attributed
+        }
+        markedDocumentRange = NSRange(location: origin, length: markedText.length)
+        let relativeLocation = selectedRange.location == NSNotFound
+            ? attributed.length
+            : min(max(0, selectedRange.location), attributed.length)
+        let relativeLength = min(
+            max(0, selectedRange.length), attributed.length - relativeLocation)
+        markedSelectedRange = NSRange(
+            location: origin + selectionOffset + relativeLocation,
+            length: relativeLength)
         updatePreeditLayer()
     }
 
     func unmarkText() {
+        let committed = markedText.string
         clearMarkedText()
+        if !suppressUnmarkCommit, !committed.isEmpty {
+            controller?.sendInput(KeyTranslator.escapeForInput(committed))
+        }
     }
 
     func hasMarkedText() -> Bool {
-        !markedText.isEmpty
+        markedText.length > 0
     }
 
     func markedRange() -> NSRange {
-        hasMarkedText()
-            ? NSRange(location: 0, length: (markedText as NSString).length)
-            : NSRange(location: NSNotFound, length: 0)
+        hasMarkedText() ? markedDocumentRange : NSRange(location: NSNotFound, length: 0)
     }
 
     func selectedRange() -> NSRange {
@@ -124,11 +177,18 @@ final class InputHostView: NSView, @preconcurrency NSTextInputClient {
     func attributedSubstring(forProposedRange range: NSRange, actualRange: NSRangePointer?)
         -> NSAttributedString?
     {
-        nil
+        guard hasMarkedText(), range.location != NSNotFound else { return nil }
+        let intersection = NSIntersectionRange(range, markedDocumentRange)
+        guard intersection.length > 0 else { return nil }
+        actualRange?.pointee = intersection
+        let local = NSRange(
+            location: intersection.location - markedDocumentRange.location,
+            length: intersection.length)
+        return markedText.attributedSubstring(from: local)
     }
 
     func validAttributesForMarkedText() -> [NSAttributedString.Key] {
-        [.underlineStyle]
+        [.underlineStyle, .underlineColor, .markedClauseSegment, .textAlternatives]
     }
 
     /// Anchors the IME candidate window at the cursor cell (view → window →
@@ -137,16 +197,57 @@ final class InputHostView: NSView, @preconcurrency NSTextInputClient {
         let cellRect =
             surface.cursorRect
             ?? NSRect(x: 0, y: 0, width: surface.cellSize.width, height: surface.cellSize.height)
-        let rectInSelf = convert(cellRect, from: surface)
+        var rectInSelf = convert(cellRect, from: surface)
+        if hasMarkedText() {
+            let requested: NSRange
+            if range.location == NSNotFound {
+                requested = markedSelectedRange
+            } else if range.length == 0,
+                range.location >= markedDocumentRange.location,
+                range.location <= NSMaxRange(markedDocumentRange)
+            {
+                requested = NSRange(location: range.location, length: 0)
+            } else {
+                let intersection = NSIntersectionRange(range, markedDocumentRange)
+                requested = intersection.length > 0 ? intersection : markedSelectedRange
+            }
+            actualRange?.pointee = requested
+            let localLocation = min(
+                max(0, requested.location - markedDocumentRange.location), markedText.length)
+            let prefix = markedText.attributedSubstring(
+                from: NSRange(location: 0, length: localLocation))
+            rectInSelf.origin.x += ceil(prefix.size().width)
+            rectInSelf.size.width = max(1, surface.cellSize.width)
+        } else {
+            actualRange?.pointee = NSRange(location: NSNotFound, length: 0)
+        }
         let rectInWindow = convert(rectInSelf, to: nil)
         return window?.convertToScreen(rectInWindow) ?? rectInWindow
     }
 
     func characterIndex(for point: NSPoint) -> Int {
-        0
+        guard hasMarkedText(), let window, let preeditLayer else { return NSNotFound }
+        let pointInWindow = window.convertPoint(fromScreen: point)
+        let pointInSelf = convert(pointInWindow, from: nil)
+        let frame = preeditLayer.frame
+        guard frame.insetBy(dx: -2, dy: -2).contains(pointInSelf) else { return NSNotFound }
+
+        let line = CTLineCreateWithAttributedString(markedText)
+        let localX = min(max(0, pointInSelf.x - frame.minX), frame.width)
+        let index = CTLineGetStringIndexForPosition(line, CGPoint(x: localX, y: 0))
+        let bounded = index == kCFNotFound ? markedText.length : min(max(0, index), markedText.length)
+        return markedDocumentRange.location + bounded
     }
 
     override func doCommand(by selector: Selector) {
+        if hasMarkedText() {
+            // Commands emitted by an input manager while it owns marked text
+            // must not leak to Neovim and move/delete unrelated buffer text.
+            if selector == NSSelectorFromString("cancelOperation:") {
+                discardMarkedTextForSessionChange()
+            }
+            return
+        }
         // Prefer translating the triggering key event — it carries the real
         // modifiers — falling back to a map of common selectors.
         if let event = NSApp.currentEvent, event.type == .keyDown,
@@ -167,10 +268,20 @@ final class InputHostView: NSView, @preconcurrency NSTextInputClient {
     // MARK: - Preedit overlay (minimal, DESIGN §7.2)
 
     private func clearMarkedText() {
-        markedText = ""
+        markedText = NSAttributedString(string: "")
+        markedDocumentRange = NSRange(location: NSNotFound, length: 0)
         markedSelectedRange = NSRange(location: NSNotFound, length: 0)
         preeditLayer?.removeFromSuperlayer()
         preeditLayer = nil
+    }
+
+    /// Cancel composition without committing it. Used when the embedded
+    /// session is being replaced or torn down; ordinary focus loss commits.
+    func discardMarkedTextForSessionChange() {
+        suppressUnmarkCommit = true
+        inputContext?.discardMarkedText()
+        clearMarkedText()
+        suppressUnmarkCommit = false
     }
 
     private func updatePreeditLayer() {
@@ -190,14 +301,17 @@ final class InputHostView: NSView, @preconcurrency NSTextInputClient {
         let font =
             spec.name.flatMap { NSFont(name: $0, size: spec.size) }
             ?? NSFont.monospacedSystemFont(ofSize: spec.size, weight: .regular)
-        let attributed = NSAttributedString(
-            string: markedText,
-            attributes: [
-                .font: font,
-                .foregroundColor: NSColor.textColor,
-                .backgroundColor: NSColor.textBackgroundColor,
-                .underlineStyle: NSUnderlineStyle.single.rawValue,
-            ])
+        let attributed = NSMutableAttributedString(attributedString: markedText)
+        let fullRange = NSRange(location: 0, length: attributed.length)
+        attributed.addAttributes([
+            .font: font,
+            .foregroundColor: NSColor.textColor,
+            .backgroundColor: NSColor.textBackgroundColor,
+        ], range: fullRange)
+        if attributed.attribute(.underlineStyle, at: 0, effectiveRange: nil) == nil {
+            attributed.addAttribute(
+                .underlineStyle, value: NSUnderlineStyle.single.rawValue, range: fullRange)
+        }
         textLayer.string = attributed
 
         let textSize = attributed.size()
@@ -215,17 +329,92 @@ final class InputHostView: NSView, @preconcurrency NSTextInputClient {
         (string as? NSAttributedString)?.string ?? (string as? String) ?? ""
     }
 
+    private static func attributedString(from string: Any) -> NSAttributedString {
+        if let attributed = string as? NSAttributedString { return attributed.copy() as! NSAttributedString }
+        return NSAttributedString(string: (string as? String) ?? "")
+    }
+
+    private static func range(_ candidate: NSRange, isContainedIn container: NSRange) -> Bool {
+        guard candidate.location != NSNotFound, container.location != NSNotFound else {
+            return false
+        }
+        let (candidateEnd, candidateOverflow) = candidate.location.addingReportingOverflow(
+            candidate.length)
+        let (containerEnd, containerOverflow) = container.location.addingReportingOverflow(
+            container.length)
+        return !candidateOverflow && !containerOverflow
+            && candidate.location >= container.location
+            && candidateEnd <= containerEnd
+    }
+
+    // MARK: - Accessibility
+
+    /// Expose the active Neovim grid as a coherent visible text snapshot.
+    /// This is intentionally viewport-scoped; claiming a synthetic full
+    /// document would make VoiceOver navigation less trustworthy, not more.
+    func updateAccessibility(with flush: FlushResult) {
+        guard let grid = flush.grids[flush.cursor.grid] else { return }
+        var lines: [String] = []
+        lines.reserveCapacity(grid.rows)
+        for row in 0..<grid.rows {
+            lines.append(grid.rowText(row).replacingOccurrences(of: "\0", with: ""))
+        }
+        accessibleText = lines.joined(separator: "\n")
+
+        var location = 0
+        for row in 0..<min(flush.cursor.row, grid.rows) {
+            location += (lines[row] as NSString).length + 1
+        }
+        if flush.cursor.row < grid.rows {
+            let prefix = grid.rowCells(flush.cursor.row).prefix(max(0, flush.cursor.col))
+                .map(\.text).joined()
+            location += (prefix as NSString).length
+        }
+        accessibleSelection = NSRange(
+            location: min(location, (accessibleText as NSString).length), length: 0)
+
+        guard !accessibilityUpdateScheduled else { return }
+        accessibilityUpdateScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.accessibilityUpdateScheduled = false
+            NSAccessibility.post(element: self, notification: .valueChanged)
+            NSAccessibility.post(element: self, notification: .selectedTextChanged)
+        }
+    }
+
+    override func isAccessibilityElement() -> Bool { true }
+    override func accessibilityRole() -> NSAccessibility.Role? { .textArea }
+    override func accessibilityLabel() -> String? { "Neovim editor" }
+    override func accessibilityValue() -> Any? { accessibleText }
+    override func accessibilitySelectedTextRange() -> NSRange { accessibleSelection }
+    override func accessibilityVisibleCharacterRange() -> NSRange {
+        NSRange(location: 0, length: (accessibleText as NSString).length)
+    }
+    override func accessibilityNumberOfCharacters() -> Int {
+        (accessibleText as NSString).length
+    }
+
     // MARK: - Mouse (DESIGN §7.4)
 
-    override func mouseDown(with event: NSEvent) { sendMouse(event, button: .left, action: .press) }
+    override func mouseDown(with event: NSEvent) {
+        acquireEditorFocus()
+        sendMouse(event, button: .left, action: .press)
+    }
     override func mouseDragged(with event: NSEvent) { sendMouse(event, button: .left, action: .drag) }
     override func mouseUp(with event: NSEvent) { sendMouse(event, button: .left, action: .release) }
 
-    override func rightMouseDown(with event: NSEvent) { sendMouse(event, button: .right, action: .press) }
+    override func rightMouseDown(with event: NSEvent) {
+        acquireEditorFocus()
+        sendMouse(event, button: .right, action: .press)
+    }
     override func rightMouseDragged(with event: NSEvent) { sendMouse(event, button: .right, action: .drag) }
     override func rightMouseUp(with event: NSEvent) { sendMouse(event, button: .right, action: .release) }
 
-    override func otherMouseDown(with event: NSEvent) { sendMouse(event, button: .middle, action: .press) }
+    override func otherMouseDown(with event: NSEvent) {
+        acquireEditorFocus()
+        sendMouse(event, button: .middle, action: .press)
+    }
     override func otherMouseDragged(with event: NSEvent) { sendMouse(event, button: .middle, action: .drag) }
     override func otherMouseUp(with event: NSEvent) { sendMouse(event, button: .middle, action: .release) }
 
@@ -320,9 +509,46 @@ final class InputHostView: NSView, @preconcurrency NSTextInputClient {
         surface.cell(at: surface.convert(event.locationInWindow, from: nil))
     }
 
+    private func acquireEditorFocus() {
+        window?.makeFirstResponder(self)
+        if hasMarkedText() { unmarkText() }
+    }
+
     // MARK: - Menu actions
+
+    @objc func undo(_ sender: Any?) { controller?.performUndo() }
+
+    @objc func redo(_ sender: Any?) { controller?.performRedo() }
+
+    @objc func cut(_ sender: Any?) { controller?.copySelection(cut: true) }
+
+    @objc func copy(_ sender: Any?) { controller?.copySelection(cut: false) }
 
     @objc func paste(_ sender: Any?) {
         controller?.pasteFromPasteboard()
+    }
+
+    override func selectAll(_ sender: Any?) { controller?.selectAllText() }
+
+    @objc func performFindPanelAction(_ sender: Any?) { controller?.beginFind() }
+
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        switch menuItem.action {
+        case #selector(undo(_:)):
+            return controller?.canUndo ?? false
+        case #selector(redo(_:)):
+            return controller?.canRedo ?? false
+        case #selector(cut(_:)):
+            return controller?.canCutSelection ?? false
+        case #selector(copy(_:)):
+            return controller?.canCopySelection ?? false
+        case #selector(paste(_:)):
+            return (controller?.editorCommandsAvailable ?? false)
+                && !(NSPasteboard.general.string(forType: .string) ?? "").isEmpty
+        case #selector(selectAll(_:)), #selector(performFindPanelAction(_:)):
+            return controller?.editorCommandsAvailable ?? false
+        default:
+            return true
+        }
     }
 }

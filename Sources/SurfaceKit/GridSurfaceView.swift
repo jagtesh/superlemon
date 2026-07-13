@@ -418,6 +418,9 @@ public final class GridSurfaceView: NSView {
     private static let scrollSignpostLog = OSLog(
         subsystem: "com.superlemon.editor",
         category: OSLog.Category.pointsOfInterest.rawValue)
+    private static let performanceSignpostLog = OSLog(
+        subsystem: "com.superlemon.editor",
+        category: OSLog.Category.pointsOfInterest.rawValue)
 
     /// Queue one accumulated model presentation for the next shared display
     /// callback. Returning false preserves immediate first-scroll response and
@@ -446,6 +449,17 @@ public final class GridSurfaceView: NSView {
     }
 
     private func commit(_ flush: FlushResult, redrawAll: Bool) {
+        let commitSignpostID = OSSignpostID(log: Self.performanceSignpostLog)
+        os_signpost(
+            .begin, log: Self.performanceSignpostLog, name: "DisplayCommit",
+            signpostID: commitSignpostID,
+            "grids=%{public}d damaged=%{public}d",
+            flush.grids.count, flush.damagedGrids.count)
+        defer {
+            os_signpost(
+                .end, log: Self.performanceSignpostLog, name: "DisplayCommit",
+                signpostID: commitSignpostID)
+        }
         let previousFrames = Dictionary(
             uniqueKeysWithValues: lastFrames.map { ($0.gridID, $0) })
         let outer = flush.grids[1]
@@ -465,6 +479,12 @@ public final class GridSurfaceView: NSView {
 
         // 1. Update row backing stores. Compatible vertical motion rotates
         // immutable row revisions and rasterizes only exposed/damaged rows.
+        let rasterSignpostID = OSSignpostID(log: Self.performanceSignpostLog)
+        os_signpost(
+            .begin, log: Self.performanceSignpostLog, name: "Rasterization",
+            signpostID: rasterSignpostID,
+            "full=%{public}d damaged=%{public}d",
+            redrawAll ? 1 : 0, flush.damagedGrids.count)
         var updatedContents: Set<Int> = []
         if redrawAll {
             for (id, grid) in flush.grids {
@@ -479,6 +499,9 @@ public final class GridSurfaceView: NSView {
                 updatedContents.insert(damaged.grid.id)
             }
         }
+        os_signpost(
+            .end, log: Self.performanceSignpostLog, name: "Rasterization",
+            signpostID: rasterSignpostID)
 
         // 2. Sync the layer tree to the resolved frames (back-to-front order).
         let cw = cellSize.width
