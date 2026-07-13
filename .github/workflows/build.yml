@@ -48,6 +48,10 @@ jobs:
         run: swift build
 
       - name: Test all Swift packages
+        env:
+          # Runners enable Reduce Motion, which silently disables the
+          # animation paths the SurfaceKit behavior tests exercise.
+          SUPERLEMON_REDUCE_MOTION: "0"
         run: swift test
 
       - name: Test Neovim runtime

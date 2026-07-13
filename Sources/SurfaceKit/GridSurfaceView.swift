@@ -176,7 +176,7 @@ public final class GridSurfaceView: NSView {
         layerContentsRedrawPolicy = .never
         layer?.addSublayer(cursorLayer)
         cellSize = fonts.cellSize
-        reducedMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        reducedMotion = Self.systemReduceMotion
         let workspaceNotifications = NSWorkspace.shared.notificationCenter
         accessibilityObserver = WorkspaceNotificationToken(
             center: workspaceNotifications,
@@ -186,8 +186,7 @@ public final class GridSurfaceView: NSView {
             ) { [weak self] _ in
                 MainActor.assumeIsolated {
                     guard let self else { return }
-                    self.reducedMotion =
-                        NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+                    self.reducedMotion = Self.systemReduceMotion
                     if self.reducedMotion { self.settleSmoothMotion() }
                 }
             })
@@ -195,6 +194,17 @@ public final class GridSurfaceView: NSView {
 
     @available(*, unavailable)
     public required init?(coder: NSCoder) { fatalError("not supported") }
+
+    /// The system Reduce Motion accessibility setting, with an environment
+    /// override so the animation-behavior tests are deterministic regardless
+    /// of the host's setting (CI runners enable it):
+    /// SUPERLEMON_REDUCE_MOTION=0 forces animations on, =1 forces them off.
+    private static var systemReduceMotion: Bool {
+        if let forced = ProcessInfo.processInfo.environment["SUPERLEMON_REDUCE_MOTION"] {
+            return forced != "0"
+        }
+        return NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    }
 
     public override var isFlipped: Bool { true }
 
