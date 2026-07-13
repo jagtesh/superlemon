@@ -16,10 +16,23 @@ public enum FileOperation: Equatable, Sendable {
     case revealInFinder(path: String)
 }
 
-public enum FileOperationError: Error, Equatable {
+public enum FileOperationError: Error, Equatable, LocalizedError {
     case alreadyExists(String)
     case notFound(String)
     case invalidName(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .alreadyExists(let path):
+            return "An item already exists at \(path)."
+        case .notFound(let path):
+            return "No item exists at \(path)."
+        case .invalidName(let name):
+            return name.isEmpty
+                ? "The item name cannot be empty."
+                : "\u{201C}\(name)\u{201D} is not a valid item name."
+        }
+    }
 }
 
 public enum FileOperations {
@@ -27,7 +40,7 @@ public enum FileOperations {
     /// Creates an empty file `name` inside `directory`. Fails if it exists.
     @discardableResult
     public static func createFile(in directory: URL, name: String) throws -> URL {
-        let url = directory.appendingPathComponent(try validated(name))
+        let url = directory.appendingPathComponent(try validateName(name))
         let fm = FileManager.default
         guard !fm.fileExists(atPath: url.path) else {
             throw FileOperationError.alreadyExists(url.path)
@@ -41,7 +54,7 @@ public enum FileOperations {
     /// Creates a folder `name` inside `directory`. Fails if it exists.
     @discardableResult
     public static func createFolder(in directory: URL, name: String) throws -> URL {
-        let url = directory.appendingPathComponent(try validated(name))
+        let url = directory.appendingPathComponent(try validateName(name))
         let fm = FileManager.default
         guard !fm.fileExists(atPath: url.path) else {
             throw FileOperationError.alreadyExists(url.path)
@@ -54,7 +67,7 @@ public enum FileOperations {
     @discardableResult
     public static func rename(at url: URL, to newName: String) throws -> URL {
         let destination = url.deletingLastPathComponent()
-            .appendingPathComponent(try validated(newName))
+            .appendingPathComponent(try validateName(newName))
         let fm = FileManager.default
         guard fm.fileExists(atPath: url.path) else {
             throw FileOperationError.notFound(url.path)
@@ -66,40 +79,51 @@ public enum FileOperations {
         return destination
     }
 
-    /// Moves the item to the Trash. Falls back to permanent removal when
-    /// the Trash is unavailable (e.g. sandboxed test runners, volumes
-    /// without a .Trashes folder) so "Delete" always deletes.
+    /// Moves the item to the Trash. A Trash failure is deliberately surfaced
+    /// to the caller: a recoverable UI operation must never silently turn into
+    /// permanent deletion.
     public static func trash(_ url: URL) throws {
+        try trash(url) { candidate in
+            try FileManager.default.trashItem(at: candidate, resultingItemURL: nil)
+        }
+    }
+
+    /// Injection seam used to prove that a failed Trash move leaves the
+    /// original item untouched. Deliberately internal; callers use `trash(_:)`.
+    static func trash(_ url: URL, moveToTrash: (URL) throws -> Void) throws {
         let fm = FileManager.default
         guard fm.fileExists(atPath: url.path) else {
             throw FileOperationError.notFound(url.path)
         }
-        do {
-            try fm.trashItem(at: url, resultingItemURL: nil)
-        } catch {
-            try fm.removeItem(at: url)
-        }
+        try moveToTrash(url)
     }
 
     /// Applies a mutating operation. `.revealInFinder` is a no-op here
     /// (pure UI concern — the embedder calls NSWorkspace).
-    public static func perform(_ operation: FileOperation) throws {
+    @discardableResult
+    public static func perform(_ operation: FileOperation) throws -> URL? {
         switch operation {
         case let .newFile(directory, name):
-            try createFile(in: URL(fileURLWithPath: directory), name: name)
+            return try createFile(in: URL(fileURLWithPath: directory), name: name)
         case let .newFolder(directory, name):
-            try createFolder(in: URL(fileURLWithPath: directory), name: name)
+            return try createFolder(in: URL(fileURLWithPath: directory), name: name)
         case let .rename(path, newName):
-            try rename(at: URL(fileURLWithPath: path), to: newName)
+            return try rename(at: URL(fileURLWithPath: path), to: newName)
         case let .trash(path):
             try trash(URL(fileURLWithPath: path))
+            return nil
         case .revealInFinder:
-            break
+            return nil
         }
     }
 
-    private static func validated(_ name: String) throws -> String {
-        guard !name.isEmpty, !name.contains("/"), name != ".", name != ".." else {
+    /// Validates a single path component while preserving the user's exact
+    /// spelling. Whitespace-only names and NUL/path separators are rejected
+    /// before any filesystem mutation is attempted.
+    public static func validateName(_ name: String) throws -> String {
+        guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            !name.contains("/"), !name.contains("\0"), name != ".", name != ".."
+        else {
             throw FileOperationError.invalidName(name)
         }
         return name

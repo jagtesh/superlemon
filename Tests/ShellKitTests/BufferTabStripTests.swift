@@ -76,6 +76,23 @@ struct BufferTabStripTests {
         #expect(active.accessibilityIdentifier() == "tab.3")
     }
 
+    @Test func tabsExposeSelectionLabelsAndActionsToAccessibility() throws {
+        let strip = makeStrip()
+        let active = strip.tabItems[1]
+
+        #expect(strip.accessibilityRole() == .tabGroup)
+        #expect(strip.accessibilityLabel() == "Open buffers")
+        #expect(active.accessibilityRole() == .radioButton)
+        #expect(active.isAccessibilitySelected())
+        #expect(active.accessibilityLabel() == "README.md, modified")
+        #expect(active.closeButton.accessibilityLabel() == "Close README.md")
+
+        var selected: [Int] = []
+        active.onSelect = { selected.append($0) }
+        #expect(active.accessibilityPerformPress())
+        #expect(selected == [3])
+    }
+
     @Test func selectAndCloseCallbacksCarryBufnr() {
         let strip = makeStrip()
         var selected: [Int] = []
@@ -123,6 +140,11 @@ struct BufferTabStripTests {
         let documentWidth = scrollView?.documentView?.frame.width ?? 0
         #expect(documentWidth > 300)
         #expect((scrollView?.documentView?.frame.height ?? 0) <= 28)
+
+        strip.ensureCurrentTabVisible()
+        let active = strip.tabItems.first { $0.isActive }!
+        let activeRect = active.convert(active.bounds, to: scrollView?.documentView)
+        #expect(scrollView?.contentView.bounds.intersects(activeRect) == true)
     }
 
     @Test func appearanceFlipChangesStripAndLabelColors() {
@@ -154,6 +176,21 @@ struct BufferTabStripTests {
 
         strip.render(tabs: [], current: -1, dark: false)
         #expect(strip.tabItems.isEmpty)
+    }
+
+    @Test func sameBufferOrderUpdatesViewsInPlace() {
+        let strip = makeStrip()
+        let before = strip.tabItems
+        var updated = tabs
+        updated[0].modified = true
+
+        strip.render(tabs: updated, current: 1, dark: false)
+        let after = strip.tabItems
+
+        #expect(before.count == after.count)
+        #expect(zip(before, after).allSatisfy { pair in pair.0 === pair.1 })
+        #expect(after[0].isActive)
+        #expect(after[0].label.stringValue.hasPrefix("●"))
     }
 }
 

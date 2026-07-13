@@ -71,8 +71,10 @@ Map the payload into `StatusModel`:
 | Payload | Model | Behavior |
 |---|---|---|
 | `mode` | `StatusMode(rawNvimMode:)` | `i` insert, `v`/`V`/CTRL-V/`s`/`S` visual, `c` command, `R` replace, otherwise normal |
-| `file` | `file` | cwd-relative; basename is shown; empty becomes `[No Name]` |
+| `file` | `file` | cwd-relative; basename is shown; empty becomes `[No Name]` and disables direct Save |
 | `modified` | `modified` | adds the modified dot |
+| `modifiable`, `readonly`, `buftype` | native command state | enables Save/Cut only when the named active buffer permits them |
+| `can_undo`, `can_redo` | native command state | enables Undo/Redo from Neovim's current undo tree |
 | `branch` | `branch` | empty hides the branch chip |
 | `line`, `col` | `line`, `col` | one-based line/column chip |
 | `total_lines` | `totalLines` | retained in the model |
@@ -190,36 +192,31 @@ decoration wins over the built-in git badge for the same row.
 
 `FileIndex.refresh()` walks from scratch. Hidden files are included unless
 excluded by the root `.gitignore`; `.git` is always skipped. Empty queries
-return the most recently modified files, not learned usage recency.
+return the most recently modified files, not learned usage recency. The index
+is capped at 50,000 entries and reports when it is truncated; fuzzy search
+keeps only a bounded top-result heap while still counting all indexed matches.
 
 The current workspace owns a replaceable index rather than capturing one index
 forever:
 
 ```swift
-quickOpen.onQueryChange = { [weak self] query in
-    guard let self else { return }
-    let index = self.fileIndex
-    let generation = self.fileIndexGeneration
-    Task {
-        let results = await index.query(query)
-        let total = await index.count()
-        guard generation == self.fileIndexGeneration else { return }
-        self.quickOpen.display(
-            results: results.map { QuickOpenResult(path: $0.path, positions: $0.positions) },
-            totalCount: total
-        )
-    }
-}
+quickOpen.onQueryChange = { [weak self] query in self?.queryQuickOpen(query) }
 
 quickOpen.onOpen = { [weak self] relativePath in
-    guard let self else { return }
-    self.controller.openFile(self.projectRoot.appendingPathComponent(relativePath).path)
+    self?.openQuickOpenSelection(relativePath)
 }
 ```
 
 `present(over:)` installs a 30-percent scrim, places the panel near the upper
-center, focuses the query field, and fires the empty query. Escape, Return,
-arrow keys, double-click, and scrim click are handled by the controller.
+center, focuses the query field, and fires the empty query. Text changes use a
+50 ms trailing-edge debounce. The app cancels superseded queries and validates
+both index and panel generations before displaying a reply, so late results
+cannot reopen or overwrite a newer palette. Escape, Return, arrow keys,
+double-click, and scrim click are handled by the controller.
+Selection revalidates the file off the main actor against the current workspace
+generation before opening it. A result deleted after display is rejected with
+a native warning and index refresh instead of becoming a new empty Neovim
+buffer at the stale path.
 
 The same panel hosts `superlemon.ui` plugin palette sessions. Opening a plugin
 palette saves the built-in callbacks; selection/close restores them. Choosing
@@ -229,12 +226,23 @@ The index currently refreshes:
 
 - when the workspace attaches;
 - after native sidebar mutations;
-- after File > Open Folder replaces the project root.
+- after File > Open Folder replaces the project root;
+- after a 250 ms coalesced burst from the recursive FSEvents watcher.
 
-There is no filesystem watcher. A raw `:cd` inside Neovim updates runtime
-status/git data but does not currently carry an absolute cwd back to the app,
-so it cannot re-root the native sidebar/index. File > Open Folder is the
-coordinated workspace-change path.
+Re-rooting stops the old FSEvents stream before starting one for the new root.
+An external save maps each changed path to its nearest represented, expanded
+parent and coalesces duplicate targets. Refresh listings run off the main
+actor and reconcile only that parent's immediate children, retaining unchanged
+node identity plus expansion, selection, and scroll anchor. Collapsed loaded
+branches are marked stale and wait until expansion; unloaded branches are not
+touched. If FSEvents reports dropped events or invalid history, every visible
+loaded directory refreshes and hidden loaded directories become stale until
+their next expansion, with the same layout preservation. The index still
+refreshes independently, and `.git`-only bursts are ignored. A raw `:cd` inside
+Neovim updates runtime status/git data but does not
+currently carry an absolute cwd back to the app, so it cannot re-root the
+native sidebar/index. File > Open Folder is the coordinated workspace-change
+path.
 
 ## Workspace re-rooting
 
@@ -269,8 +277,11 @@ sidebar.onOpenFilePermanently = { controller.openFilePermanently($0) }
 - Clicking an already-open permanent file switches to it without disturbing a
   different preview.
 
-Directories list children only on first expansion. `.git` remains hidden even
-when hidden files are enabled.
+Directories list children off the main actor only on first expansion. Their
+state is explicit (`unloaded`, `loading`, `loaded`, or `failed`): a visible
+Loading row prevents an in-flight read from looking like an empty directory,
+and a failed row exposes Retry. `.git` remains hidden even when hidden files
+are enabled.
 
 Sidebar context actions emit absolute-path `FileOperation` values. The app
 owns the mutation and subsequent refresh:
@@ -281,23 +292,25 @@ sidebar.onFileOperation = { operation in
     case .revealInFinder(let path):
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
     case .rename(let path, _), .trash(let path):
-        try? FileOperations.perform(operation)
-        sidebar.reload(path: (path as NSString).deletingLastPathComponent)
-        Task { await fileIndex.refresh() }
+        enqueueSerialMutation(operation,
+            reloadPath: (path as NSString).deletingLastPathComponent)
     case .newFile(let directory, _), .newFolder(let directory, _):
-        try? FileOperations.perform(operation)
-        sidebar.reload(path: directory)
-        Task { await fileIndex.refresh() }
+        enqueueSerialMutation(operation, reloadPath: directory)
     }
 }
 ```
 
-`FileOperations.trash` uses the Trash and falls back to permanent removal when
-the Trash is unavailable. The current implementation does not rename or wipe a
-matching open Neovim buffer after native rename/trash; documentation and callers
-must not assume that synchronization exists. New File and New Folder currently
-use the default names `untitled` and `untitled folder`; mutation failures are
-discarded by the app's current `try?` call rather than shown to the user.
+`WorkspaceChrome` serializes mutations through its actor-backed queue, reloads
+the affected subtree and refreshes the index only after success, and presents a
+native error sheet after failure. `FileOperations.trash` moves to Trash and
+leaves the original untouched if that move fails; it never falls back to
+permanent deletion. The current implementation does not rename or wipe a
+matching open Neovim buffer after native rename/trash. New File and New Folder
+show a naming sheet, preserve the proposed name when validation or creation
+fails, and select the created item after refresh; a collapsed or previously
+unloaded parent is loaded and expanded explicitly without resetting unrelated
+branches. A new file is also opened as a permanent editor buffer. The
+destructive action is labelled Move to Trash.
 
 ## Native File menu workflows
 
@@ -308,7 +321,7 @@ Neovim:
 |---|---|---|
 | Open File... | Command-O | single-file `NSOpenPanel` then `:drop` through `nvim_exec_lua` |
 | Open Folder... | Shift-Command-O | directory panel, `nvim_set_current_dir`, then coordinated workspace re-root |
-| Save | Command-S | re-inject `<D-s>` so a user's mapping wins; bundled mapping writes named buffers or requests Save As for unnamed ones |
+| Save | Command-S | direct Neovim `:write` RPC; native alert on failure |
 | Save As... | Shift-Command-S | `NSSavePanel` seeded from `nvim_buf_get_name`, then `nvim_cmd` `saveas!`; AppKit has already confirmed replacement |
 
 Open File and Quick Open use `:drop` so an existing buffer is selected rather
@@ -317,20 +330,19 @@ and buffer naming stay coherent.
 
 ## Configuration hierarchy
 
-Neovim launch configuration is selected in this order:
-
-1. an explicit custom init path from Settings;
-2. Superlemon's managed `runtime/config/init.lua` (the default);
-3. the user's normal Neovim init when managed configuration is disabled.
+Neovim launch configuration is one explicit mode: managed
+`runtime/config/init.lua` (the default), normal user configuration with no
+`-u`, or a diagnostic-only custom loader that sources one exact validated
+custom file. The loader applies no bundled defaults or later overlay.
 
 The managed init sources the annotated bundled baseline
 `runtime/config/superlemon.vim`, then the personal override at
 `$XDG_CONFIG_HOME/superlemon/init.vim` (normally
-`~/.config/superlemon/init.vim`). Custom/user-Neovim-init launches still source
-the personal Superlemon file once during bridge bootstrap.
+`~/.config/superlemon/init.vim`). Custom/user-Neovim-init launches do not source
+that managed personal file during bridge bootstrap.
 
 Settings chooses the init source and creates/opens the personal Superlemon file
-from the bundled template. Font, scrolling, native chrome, per-split
+from a minimal override template. Font, scrolling, native chrome, per-split
 minimap/scrollbar toggles and minimap geometry, native UI, keymap, statusline,
 and renderer preferences live in that file and apply on relaunch; they are not
 mirrored into native controls. Live View-menu accessory toggles still round-trip

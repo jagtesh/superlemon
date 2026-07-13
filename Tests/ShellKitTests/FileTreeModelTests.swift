@@ -5,16 +5,20 @@ import Testing
 /// Wraps a lister and counts list() calls per directory — the laziness probe.
 final class CountingLister: DirectoryLister, @unchecked Sendable {
     private let wrapped: DirectoryLister
-    private(set) var listedPaths: [String] = []
+    private let lock = NSLock()
+    private var recordedPaths: [String] = []
+    var listedPaths: [String] {
+        lock.withLock { recordedPaths }
+    }
     var totalCalls: Int { listedPaths.count }
 
     init(wrapping wrapped: DirectoryLister = FileSystemLister()) {
         self.wrapped = wrapped
     }
 
-    func list(_ url: URL) -> [DirectoryEntry] {
-        listedPaths.append(url.path)
-        return wrapped.list(url)
+    func list(_ url: URL) throws -> [DirectoryEntry] {
+        lock.withLock { recordedPaths.append(url.path) }
+        return try wrapped.list(url)
     }
 }
 
@@ -46,10 +50,12 @@ struct FileTreeModelTests {
         let node = FileTreeNode(url: root, isDirectory: true)
         #expect(lister.totalCalls == 0)
         #expect(!node.childrenLoaded)
+        #expect(node.loadState == .unloaded)
 
         let children = node.children(using: lister, showHidden: false)
         #expect(lister.totalCalls == 1)
         #expect(node.childrenLoaded)
+        #expect(node.loadState == .loaded)
 
         // Child directories exist as nodes but were NOT listed.
         let src = try #require(children.first { $0.name == "src" })
@@ -109,8 +115,36 @@ struct FileTreeModelTests {
         // Cached until invalidated.
         #expect(!node.children(using: lister, showHidden: false).map(\.name).contains("added.txt"))
         node.invalidateChildren()
+        #expect(node.loadState == .unloaded)
         #expect(node.children(using: lister, showHidden: false).map(\.name).contains("added.txt"))
         #expect(lister.totalCalls == 2)
+    }
+
+    @Test func reconciliationPreservesUnchangedLoadedSubtreeIdentity() throws {
+        let rootURL = URL(fileURLWithPath: "/project")
+        let root = FileTreeNode(url: rootURL, isDirectory: true)
+        root.installChildren([
+            DirectoryEntry(name: "src", isDirectory: true),
+            DirectoryEntry(name: "README.md", isDirectory: false),
+        ])
+        let src = try #require(root.findLoadedNode(path: "/project/src"))
+        src.installChildren([
+            DirectoryEntry(name: "deep", isDirectory: true),
+            DirectoryEntry(name: "main.swift", isDirectory: false),
+        ])
+        let deep = try #require(root.findLoadedNode(path: "/project/src/deep"))
+        deep.installChildren([DirectoryEntry(name: "leaf.swift", isDirectory: false)])
+
+        root.reconcileChildren([
+            DirectoryEntry(name: "src", isDirectory: true),
+            DirectoryEntry(name: "LICENSE", isDirectory: false),
+            DirectoryEntry(name: "README.md", isDirectory: false),
+        ])
+
+        #expect(root.findLoadedNode(path: "/project/src") === src)
+        #expect(root.findLoadedNode(path: "/project/src/deep") === deep)
+        #expect(deep.loadState == .loaded)
+        #expect(root.findLoadedNode(path: "/project/LICENSE") != nil)
     }
 
     @Test func findLoadedNodeNeverTriggersIO() throws {

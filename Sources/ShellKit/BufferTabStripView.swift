@@ -76,6 +76,9 @@ public final class BufferTabStripView: NSView {
     private func setUp() {
         wantsLayer = true
         setAccessibilityIdentifier("tabstrip")
+        setAccessibilityElement(true)
+        setAccessibilityRole(.tabGroup)
+        setAccessibilityLabel("Open buffers")
 
         bottomBorder.wantsLayer = true
         bottomBorder.translatesAutoresizingMaskIntoConstraints = false
@@ -120,6 +123,8 @@ public final class BufferTabStripView: NSView {
     /// Re-renders the whole strip from the model. Idempotent; call on every
     /// `superlemon.buffers` notification and on appearance changes.
     public func render(tabs: [BufferTab], current: Int, dark: Bool) {
+        let previousCurrent = self.current
+        let previousIDs = self.tabs.map(\.bufnr)
         self.tabs = tabs
         self.current = current
         self.isDark = dark
@@ -127,18 +132,44 @@ public final class BufferTabStripView: NSView {
         layer?.backgroundColor = ShellPalette.titlebarBackground(dark: dark).cgColor
         bottomBorder.layer?.backgroundColor = ShellPalette.hairline(dark: dark).cgColor
 
-        for view in stack.arrangedSubviews {
-            stack.removeArrangedSubview(view)
-            view.removeFromSuperview()
+        let existing = tabItems
+        if existing.map(\.bufnr) == tabs.map(\.bufnr) {
+            // Buffer notifications are frequent. Preserve the view hierarchy
+            // and scroll position when only active/modified/preview state
+            // changed instead of rebuilding every tab.
+            for (item, tab) in zip(existing, tabs) {
+                item.configure(tab: tab, active: tab.bufnr == current, dark: dark)
+            }
+        } else {
+            for view in stack.arrangedSubviews {
+                stack.removeArrangedSubview(view)
+                view.removeFromSuperview()
+            }
+            for tab in tabs {
+                let item = BufferTabItemView(tab: tab, active: tab.bufnr == current, dark: dark)
+                item.onSelect = { [weak self] bufnr in self?.onSelect?(bufnr) }
+                item.onClose = { [weak self] bufnr in self?.onClose?(bufnr) }
+                item.onPromote = { [weak self] bufnr in self?.onPromote?(bufnr) }
+                stack.addArrangedSubview(item)
+                item.heightAnchor.constraint(equalTo: stack.heightAnchor).isActive = true
+            }
         }
-        for tab in tabs {
-            let item = BufferTabItemView(tab: tab, active: tab.bufnr == current, dark: dark)
-            item.onSelect = { [weak self] bufnr in self?.onSelect?(bufnr) }
-            item.onClose = { [weak self] bufnr in self?.onClose?(bufnr) }
-            item.onPromote = { [weak self] bufnr in self?.onPromote?(bufnr) }
-            stack.addArrangedSubview(item)
-            item.heightAnchor.constraint(equalTo: stack.heightAnchor).isActive = true
+
+        if previousCurrent != current || previousIDs != tabs.map(\.bufnr) {
+            layoutSubtreeIfNeeded()
+            ensureCurrentTabVisible()
+            // Auto Layout may not settle the stack's final width until the
+            // enclosing window's layout pass; repeat once without animation.
+            DispatchQueue.main.async { [weak self] in
+                self?.ensureCurrentTabVisible()
+            }
         }
+    }
+
+    /// Scrolls the active buffer into the hidden-scroller viewport.
+    func ensureCurrentTabVisible() {
+        guard let active = tabItems.first(where: \.isActive) else { return }
+        _ = active.scrollToVisible(active.bounds)
     }
 
     /// Recolors for the given appearance (same signature family as the
@@ -174,20 +205,8 @@ final class BufferTabItemView: NSView {
         wantsLayer = true
         translatesAutoresizingMaskIntoConstraints = false
         setAccessibilityIdentifier("tab.\(tab.bufnr)")
-        toolTip = tab.name.isEmpty ? nil : tab.name
-
-        let basename = tab.name.isEmpty
-            ? "[No Name]" : (tab.name as NSString).lastPathComponent
-        label.stringValue = tab.modified ? "● \(basename)" : basename
-        // Preview tabs render italic (VS Code/Sublime); double-click pins.
-        let base = NSFont.systemFont(ofSize: 13)
-        label.font =
-            tab.preview
-            ? NSFontManager.shared.convert(base, toHaveTrait: .italicFontMask)
-            : base
-        label.textColor = active
-            ? ShellPalette.tabActiveText(dark: dark)
-            : ShellPalette.tabInactiveText(dark: dark)
+        setAccessibilityElement(true)
+        setAccessibilityRole(.radioButton)
         label.lineBreakMode = .byTruncatingMiddle
         label.usesSingleLineMode = true
         label.translatesAutoresizingMaskIntoConstraints = false
@@ -196,13 +215,6 @@ final class BufferTabItemView: NSView {
 
         closeButton.isBordered = false
         closeButton.setButtonType(.momentaryChange)
-        closeButton.attributedTitle = NSAttributedString(
-            string: "✕",
-            attributes: [
-                .font: NSFont.systemFont(ofSize: 11),
-                .foregroundColor: ShellPalette.secondaryText(dark: dark),
-            ]
-        )
         closeButton.target = self
         closeButton.action = #selector(closeClicked)
         closeButton.translatesAutoresizingMaskIntoConstraints = false
@@ -210,10 +222,6 @@ final class BufferTabItemView: NSView {
         closeButton.setContentCompressionResistancePriority(.required, for: .horizontal)
         closeButton.setAccessibilityIdentifier("tab.close.\(tab.bufnr)")
         addSubview(closeButton)
-
-        layer?.backgroundColor = active
-            ? ShellPalette.tabActiveBackground(dark: dark).cgColor
-            : NSColor.clear.cgColor
 
         NSLayoutConstraint.activate([
             widthAnchor.constraint(lessThanOrEqualToConstant: 220),
@@ -223,9 +231,48 @@ final class BufferTabItemView: NSView {
             closeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
             closeButton.centerYAnchor.constraint(equalTo: centerYAnchor),
         ])
+        configure(tab: tab, active: active, dark: dark)
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    func configure(tab: BufferTab, active: Bool, dark: Bool) {
+        precondition(tab.bufnr == bufnr)
+        isActive = active
+        toolTip = tab.name.isEmpty ? nil : tab.name
+
+        let basename = tab.name.isEmpty
+            ? "[No Name]" : (tab.name as NSString).lastPathComponent
+        label.stringValue = tab.modified ? "● \(basename)" : basename
+        let accessibilityName = tab.modified ? "\(basename), modified" : basename
+        setAccessibilityLabel(accessibilityName)
+        setAccessibilitySelected(active)
+        setAccessibilityHelp(active ? "Current buffer" : "Switches to this buffer")
+        closeButton.setAccessibilityLabel("Close \(basename)")
+        setAccessibilityCustomActions(tab.preview ? [
+            NSAccessibilityCustomAction(name: "Keep Open") { [weak self] in
+                guard let self else { return false }
+                self.performPromote()
+                return true
+            }
+        ] : [])
+        let base = NSFont.systemFont(ofSize: 13)
+        label.font = tab.preview
+            ? NSFontManager.shared.convert(base, toHaveTrait: .italicFontMask)
+            : base
+        label.textColor = active
+            ? ShellPalette.tabActiveText(dark: dark)
+            : ShellPalette.tabInactiveText(dark: dark)
+        closeButton.attributedTitle = NSAttributedString(
+            string: "✕",
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 11),
+                .foregroundColor: ShellPalette.secondaryText(dark: dark),
+            ])
+        layer?.backgroundColor = active
+            ? ShellPalette.tabActiveBackground(dark: dark).cgColor
+            : NSColor.clear.cgColor
+    }
 
     override func mouseDown(with event: NSEvent) {
         if event.clickCount >= 2 {
@@ -233,6 +280,11 @@ final class BufferTabItemView: NSView {
         } else {
             performSelect()
         }
+    }
+
+    override func accessibilityPerformPress() -> Bool {
+        performSelect()
+        return true
     }
 
     /// Programmatic stand-in for a double-click (also the test hook).

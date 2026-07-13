@@ -115,6 +115,38 @@ struct FileIndexTests {
         #expect(top.positions == [10, 11, 12, 13, 14])
     }
 
+    @Test func searchReportsAllMatchesWhileRetainingOnlyTopN() async throws {
+        let root = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        for i in 0..<80 { try write("Sources/Feature/Match\(i).swift", in: root) }
+        try write("README.md", in: root)
+
+        let index = FileIndex(root: root)
+        await index.refresh()
+        let response = await index.search("match", limit: 7)
+        let fullyRanked = await index.query("match", limit: 1_000)
+
+        #expect(response.matches.count == 7)
+        #expect(response.matches.map(\.path) == fullyRanked.prefix(7).map(\.path))
+        #expect(response.matchingCount == 80)
+        #expect(response.totalCount == 81)
+        #expect(!response.isTruncated)
+    }
+
+    @Test func zeroResultLimitStillReportsFullMatchCount() async throws {
+        let root = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try write("MatchOne.swift", in: root)
+        try write("MatchTwo.swift", in: root)
+
+        let index = FileIndex(root: root)
+        await index.refresh()
+        let response = await index.search("match", limit: 0)
+
+        #expect(response.matches.isEmpty)
+        #expect(response.matchingCount == 2)
+    }
+
     @Test func countMatchesIndexedFiles() async throws {
         let root = try makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -150,10 +182,12 @@ struct FileIndexTests {
         let capped = FileIndex(root: root, maxFiles: 25)
         await capped.refresh()
         #expect(await capped.count() == 25)
+        #expect(await capped.isTruncated)
 
         let uncapped = FileIndex(root: root)
         await uncapped.refresh()
         #expect(await uncapped.count() == 60)
+        #expect(!(await uncapped.isTruncated))
         #expect(FileIndex.defaultMaxFiles == 50_000)
     }
 }

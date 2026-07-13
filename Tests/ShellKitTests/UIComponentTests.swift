@@ -126,11 +126,12 @@ struct SidebarUIDecorationTests {
         return allStrings(in: cell)
     }
 
-    @Test func uiDecorationWinsOverGitBadgeOnSamePath() throws {
+    @Test func uiDecorationWinsOverGitBadgeOnSamePath() async throws {
         let root = try makeRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         let sidebar = FileTreeSidebarView(frame: NSRect(x: 0, y: 0, width: 370, height: 400))
         sidebar.setRoot(root)
+        await sidebar.waitForPendingLoads()
 
         let aPath = root.standardizedFileURL.appendingPathComponent("a.swift").path
         let bPath = root.standardizedFileURL.appendingPathComponent("b.swift").path
@@ -146,22 +147,24 @@ struct SidebarUIDecorationTests {
         #expect(try cellStrings(sidebar, name: "b.swift").contains("M"))
     }
 
-    @Test func dotDecorationRendersOnDirectories() throws {
+    @Test func dotDecorationRendersOnDirectories() async throws {
         let root = try makeRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         let sidebar = FileTreeSidebarView(frame: .zero)
         sidebar.setRoot(root)
+        await sidebar.waitForPendingLoads()
 
         let srcPath = root.standardizedFileURL.appendingPathComponent("src").path
         sidebar.setUIDecorations([srcPath: SidebarDecoration(kind: .dot, color: .systemGreen)])
         #expect(try cellStrings(sidebar, name: "src").contains("●"))
     }
 
-    @Test func clearingDecorationsRestoresGitBadges() throws {
+    @Test func clearingDecorationsRestoresGitBadges() async throws {
         let root = try makeRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         let sidebar = FileTreeSidebarView(frame: .zero)
         sidebar.setRoot(root)
+        await sidebar.waitForPendingLoads()
 
         let aPath = root.standardizedFileURL.appendingPathComponent("a.swift").path
         sidebar.setGitStatus([aPath: "M"])
@@ -246,8 +249,14 @@ struct StatusBarPluginSegmentTests {
 @MainActor
 struct QuickOpenSubtitleTests {
 
-    @Test func subtitleRowRendersTitleWholeWithSubtitleBelow() throws {
+    private func activeController() -> QuickOpenPanelController {
         let controller = QuickOpenPanelController()
+        controller.present(over: nil)
+        return controller
+    }
+
+    @Test func subtitleRowRendersTitleWholeWithSubtitleBelow() throws {
+        let controller = activeController()
         controller.display(
             results: [
                 QuickOpenResult(path: "a.swift", subtitle: "Sources", positions: [0, 2])
@@ -262,7 +271,7 @@ struct QuickOpenSubtitleTests {
     }
 
     @Test func positionsBoldTheTitleLineWhenSubtitlePresent() throws {
-        let controller = QuickOpenPanelController()
+        let controller = activeController()
         // A title containing "/" must still render whole (not path-split)
         // with positions indexing the full title.
         controller.display(
@@ -297,7 +306,7 @@ struct QuickOpenSubtitleTests {
     }
 
     @Test func emptySubtitleHidesSecondaryLine() throws {
-        let controller = QuickOpenPanelController()
+        let controller = activeController()
         controller.display(
             results: [QuickOpenResult(path: "row", subtitle: "", positions: [])],
             totalCount: 1)
@@ -308,7 +317,7 @@ struct QuickOpenSubtitleTests {
     }
 
     @Test func openIndexFiresWithSelectedRowBeforeClose() {
-        let controller = QuickOpenPanelController()
+        let controller = activeController()
         var events: [String] = []
         controller.onOpenIndex = { events.append("index:\($0)") }
         controller.onClose = { events.append("close") }
@@ -323,7 +332,7 @@ struct QuickOpenSubtitleTests {
         controller.moveSelection(by: 1)
         controller.openSelection()
 
-        #expect(events == ["index:1", "close", "open:second"])
+        #expect(events == ["index:1", "open:second", "close"])
     }
 
     @Test func placeholderIsSettable() {
