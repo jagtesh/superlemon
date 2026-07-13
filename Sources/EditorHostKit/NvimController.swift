@@ -11,7 +11,7 @@ import SurfaceKit
 /// NvimKit actor straight onto main — GridStore application and surface
 /// presentation need no further synchronization.
 @MainActor
-final class NvimController {
+public final class NvimController {
     private struct SessionContext {
         let session: NvimSession
         let generation: Int
@@ -119,13 +119,13 @@ final class NvimController {
     var headlessGridSize: (rows: Int, cols: Int) = (40, 120)
 
     /// Called once, on the first flushed frame (smoke-mode hook).
-    var onFirstFlush: ((FlushResult) -> Void)?
+    public var onFirstFlush: ((FlushResult) -> Void)?
     /// Overrides default exit handling (close window / alert / terminate).
-    var exitHandler: ((Int32, String) -> Void)?
+    public var exitHandler: ((Int32, String) -> Void)?
     /// Overrides default startup-failure handling (alert + terminate).
-    var startupFailureHandler: ((String) -> Void)?
+    public var startupFailureHandler: ((String) -> Void)?
 
-    private(set) var sessionExited = false
+    public private(set) var sessionExited = false
     private var lifecycle = LifecycleState()
     private var phase: Phase {
         get { lifecycle.phase }
@@ -255,6 +255,12 @@ final class NvimController {
     private var inputDrainTask: Task<Void, Never>?
     private var inputReady = false
 
+    /// Standard controller for the app and embedding hosts: bundled/managed
+    /// binary resolution and the saved configuration selection.
+    public convenience init() {
+        self.init(nvimBinaryResolver: { try await NvimController.resolveNvimBinary() })
+    }
+
     init(
         nvimBinaryResolver: @escaping @Sendable () async throws -> URL = {
             try await NvimController.resolveNvimBinary()
@@ -284,11 +290,11 @@ final class NvimController {
             && !sessionExited
     }
 
-    var editorCommandsAvailable: Bool {
+    public var editorCommandsAvailable: Bool {
         session != nil && !sessionExited && phase == .running
     }
 
-    var canSaveCurrentBuffer: Bool {
+    public var canSaveCurrentBuffer: Bool {
         editorCommandsAvailable && editorCommandState.canWrite
     }
 
@@ -308,7 +314,7 @@ final class NvimController {
     // MARK: - Startup
 
     /// Spawn nvim, handshake, attach the UI, and start the consumption loops.
-    func start() async {
+    public func start() async {
         await launchSession()
     }
 
@@ -581,7 +587,7 @@ final class NvimController {
 
     /// The runtime/ directory: env override → repo-relative to the executable
     /// (dev builds run from .build/<config>/) → cwd.
-    nonisolated static func runtimeDirectory() -> URL? {
+    public nonisolated static func runtimeDirectory() -> URL? {
         var candidates: [URL] = []
         if let env = ProcessInfo.processInfo.environment["SUPERLEMON_RUNTIME"], !env.isEmpty {
             candidates.append(URL(fileURLWithPath: env, isDirectory: true))
@@ -658,7 +664,7 @@ final class NvimController {
         }.value
     }
 
-    nonisolated static func workingDirectory() -> URL {
+    public nonisolated static func workingDirectory() -> URL {
         let cwd = FileManager.default.currentDirectoryPath
         // Apps launched from Finder start at "/"; use the home directory then.
         if cwd == "/" || cwd.isEmpty {
@@ -996,7 +1002,7 @@ final class NvimController {
     /// Final process-ownership backstop. The normal app quit path first asks
     /// Neovim to exit cleanly; this prevents a restart and terminates any
     /// remaining child when AppKit is already shutting down.
-    func stop() {
+    public func stop() {
         stopRequested = true
         phase = .stopping
         resetInputQueue()
@@ -1007,7 +1013,7 @@ final class NvimController {
 
     /// Backs `applicationShouldTerminate`: the app owns the native modified-
     /// buffer choice, while actual termination waits for nvim's lifecycle exit.
-    func handleTerminationRequest() -> NSApplication.TerminateReply {
+    public func handleTerminationRequest() -> NSApplication.TerminateReply {
         if phase == .starting, session == nil {
             // Binary/config resolution is still suspended. Invalidate that
             // generation now so it cannot spawn a child after AppKit proceeds.
@@ -1036,7 +1042,7 @@ final class NvimController {
 
     /// Settings relaunch goes through the same dirty-buffer decision as Quit.
     /// The replacement is created only after Neovim has actually exited.
-    func requestRelaunch(_ launchReplacement: @escaping () throws -> Void) {
+    public func requestRelaunch(_ launchReplacement: @escaping () throws -> Void) {
         terminationIntent.requestRelaunch(launchReplacement)
         requestApplicationTermination()
     }
@@ -1047,7 +1053,7 @@ final class NvimController {
     /// grayed the Quit item). Instead: query modified buffers with a hang
     /// timeout, then drive a NATIVE save/discard/cancel dialog; every path
     /// resolves the pending termination reply.
-    func requestQuit() {
+    public func requestQuit() {
         guard let context = currentSessionContext(), !quitRequestInFlight else { return }
         if phase == .starting {
             quitRequestInFlight = true
@@ -1519,6 +1525,19 @@ final class NvimController {
         applyFontSpec(spec)
     }
 
+    /// Embedding hosts (EditorHostNSView/EditorSurface) push a native
+    /// font-size override; nil returns to the guifont/linespace values from
+    /// the active Neovim configuration.
+    func overrideFontSize(_ size: CGFloat?) {
+        guard surface != nil else { return }
+        var spec = configuredFontSpec
+        renderingSettings.apply(to: &spec)
+        if let size {
+            spec.size = max(6, min(72, size))
+        }
+        applyFontSpec(spec)
+    }
+
     /// Native tab strip: switch to a buffer (CONTRACT.md superlemon.buffers).
     func switchToBuffer(_ bufnr: Int) {
         performSessionOperation(failureTitle: "Couldn’t switch buffers") { session in
@@ -1538,7 +1557,7 @@ final class NvimController {
     }
 
     /// View menu → plugin truth: toggle native chrome (CONTRACT.md).
-    func toggleNativeChrome(_ part: String) {
+    public func toggleNativeChrome(_ part: String) {
         guard currentSessionContext() != nil else {
             NSLog("superlemon: toggleNativeChrome(\(part)) — no session")
             return
@@ -1556,7 +1575,7 @@ final class NvimController {
 
     /// Open a file through nvim (`:drop` keeps buffer state coherent,
     /// DESIGN §14.1); fnameescape guards spaces/specials.
-    func openFile(_ absolutePath: String) {
+    public func openFile(_ absolutePath: String) {
         performSessionOperation(failureTitle: "Couldn’t open file") { session in
             _ = try await session.request(
                 "nvim_exec_lua",
@@ -1571,7 +1590,7 @@ final class NvimController {
     /// Change Neovim's global working directory, then re-root the native
     /// sidebar and quick-open index to the same folder. Neovim performs the
     /// change so `DirChanged` autocmds and user configuration still run.
-    func openFolder(_ absolutePath: String) {
+    public func openFolder(_ absolutePath: String) {
         guard let context = currentSessionContext() else { return }
         let root = URL(fileURLWithPath: absolutePath, isDirectory: true).standardizedFileURL
         Task { [weak self] in
@@ -1605,7 +1624,7 @@ final class NvimController {
     /// Absolute name of the current buffer, or nil for an unnamed/special
     /// buffer. Used only to seed the native Save As panel; Neovim remains
     /// responsible for writing and renaming the buffer.
-    func currentBufferPath() async -> String? {
+    public func currentBufferPath() async -> String? {
         guard let context = currentSessionContext() else { return nil }
         guard
             let name = try? await context.session.request(
@@ -1621,7 +1640,7 @@ final class NvimController {
     /// Save the current buffer under a new name. NSSavePanel has already
     /// confirmed replacement, hence `bang = true`; routing the operation
     /// through `nvim_cmd` preserves encoding, autocmds, undo, and buffer state.
-    func saveFile(as absolutePath: String) {
+    public func saveFile(as absolutePath: String) {
         performSessionOperation(failureTitle: "Couldn’t save file") { session in
             _ = try await session.request(
                 "nvim_exec_lua",
@@ -1637,7 +1656,7 @@ final class NvimController {
 
     /// Semantic File ▸ Save. Unlike forwarding <D-s>, this cannot be changed
     /// into an unrelated action by a user mapping.
-    func saveCurrentBuffer() {
+    public func saveCurrentBuffer() {
         performEditorCommand(
             "write", failureTitle: "Couldn’t save file", timeout: .seconds(30))
     }
@@ -1699,7 +1718,7 @@ final class NvimController {
     /// Create a durable user-owned settings file from the bundled annotated
     /// template on first use, then open it in Neovim. The managed init sources
     /// `$XDG_CONFIG_HOME/superlemon/init.vim` after the bundled baseline.
-    func openConfiguration(
+    public func openConfiguration(
         _ selection: NvimConfigSelection,
         managedTemplatePath: String
     ) {

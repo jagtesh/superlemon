@@ -3,9 +3,8 @@
 // NvimController.
 
 import AppKit
+import EditorHostKit
 import GridKit
-import ShellKit
-import SurfaceKit
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
@@ -13,13 +12,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 {
     private let smokeMode: Bool
     private var controller: NvimController?
-    private var chrome: WorkspaceChrome?
+    private var editorHost: EditorHostNSView?
     private var window: NSWindow?
-    private var sidebarPane: NSView?
-    private var appearanceObservation: NSKeyValueObservation?
     private var settings: SettingsWindowController?
     private var savePanelIsOpen = false
     private var smokeDeadlineTask: Task<Void, Never>?
+
+    private var chrome: WorkspaceChrome? { editorHost?.chrome }
 
     @objc private func showSettings(_ sender: Any?) {
         guard let controller else { return }
@@ -101,96 +100,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         window.tabbingMode = .disallowed
         window.delegate = self
 
-        let projectRoot = NvimController.workingDirectory()
-        let chrome = WorkspaceChrome(controller: controller, projectRoot: projectRoot)
-        self.chrome = chrome
-        controller.chrome = chrome
-        chrome.onSaveAsRequested = { [weak self] in self?.presentSaveAs() }
-
-        // FontSpec default (nil name → system mono 13pt) until guifont arrives.
-        let surface = GridSurfaceView(frame: contentRect, font: FontSpec())
-        let host = InputHostView(frame: contentRect, surface: surface, controller: controller)
-
-        // Layout: [ sidebar | editor ] over a full-width 24pt status bar.
-        let splitView = NSSplitView()
-        splitView.isVertical = true
-        splitView.dividerStyle = .thin
-        splitView.addArrangedSubview(chrome.sidebar)
-        splitView.addArrangedSubview(host)
-        splitView.setHoldingPriority(.init(300), forSubviewAt: 0)
-        splitView.setHoldingPriority(.init(250), forSubviewAt: 1)
-        chrome.sidebar.widthAnchor.constraint(greaterThanOrEqualToConstant: 180).isActive = true
-        sidebarPane = chrome.sidebar
-
-        // Native chrome bands (tab strip above, status bar below) start
-        // collapsed; nvim's `superlemon.chrome` state opens them (§14).
-        let root = NSView()
-        let statusBar = chrome.statusBar
-        let tabStrip = chrome.tabStrip
-        for view in [tabStrip, splitView, statusBar] {
-            view.translatesAutoresizingMaskIntoConstraints = false
-            root.addSubview(view)
-        }
-        let tabStripHeight = tabStrip.heightAnchor.constraint(equalToConstant: 0)
-        let statusBarHeight = statusBar.heightAnchor.constraint(equalToConstant: 0)
-        NSLayoutConstraint.activate([
-            tabStrip.topAnchor.constraint(equalTo: root.topAnchor),
-            tabStrip.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            tabStrip.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            tabStripHeight,
-            splitView.topAnchor.constraint(equalTo: tabStrip.bottomAnchor),
-            splitView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            splitView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            statusBar.topAnchor.constraint(equalTo: splitView.bottomAnchor),
-            statusBar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            statusBar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            statusBar.bottomAnchor.constraint(equalTo: root.bottomAnchor),
-            statusBarHeight,
-        ])
-        chrome.onChromeModeChange = {
-            [weak root, weak controller]
-            nativeTabs, nativeStatusbar, nativeMinimap, nativeScrollbars in
-            tabStripHeight.constant = nativeTabs ? BufferTabStripView.stripHeight : 0
-            statusBarHeight.constant = nativeStatusbar ? StatusBarView.barHeight : 0
-            // isHidden alongside the collapse: a 0-height NSView still draws
-            // its (unclipped) subviews and hit-tests otherwise.
-            tabStrip.isHidden = !nativeTabs
-            statusBar.isHidden = !nativeStatusbar
-            root?.layoutSubtreeIfNeeded()
-            controller?.setEditorAccessories(
-                minimap: nativeMinimap, scrollbars: nativeScrollbars)
-            // The grid gains/loses rows with the bands; don't wait for the
-            // next natural layout pass to tell nvim.
-            controller?.surfaceLayoutChanged()
-        }
-        window.contentView = root
-
-        controller.window = window
-        controller.surface = surface
-        controller.inputHost = host
-        chrome.attach(window: window, surface: surface)
-        chrome.restoreFocus = { [weak window, weak host] in
-            window?.makeFirstResponder(host)
-        }
-
-        // Sidebar starts at a fraction of the NORTHSTAR 370pt design width,
-        // proportional to our default window.
-        window.layoutIfNeeded()
-        splitView.setPosition(260, ofDividerAt: 0)
-
-        appearanceObservation = window.observe(\.effectiveAppearance) {
-            [weak chrome, weak window] _, _ in
-            Task { @MainActor in
-                guard let window, let chrome else { return }
-                let dark =
-                    window.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-                chrome.applyAppearance(dark: dark)
-            }
-        }
+        // The embeddable editor (EditorHostKit) owns the surface/input stack,
+        // the native chrome, and the controller wiring; placing it as the
+        // content view attaches it to this window.
+        let editorHost = EditorHostNSView(
+            controller: controller,
+            projectRoot: NvimController.workingDirectory(),
+            frame: contentRect)
+        self.editorHost = editorHost
+        editorHost.chrome.onSaveAsRequested = { [weak self] in self?.presentSaveAs() }
+        window.contentView = editorHost
 
         window.center()
         window.makeKeyAndOrderFront(nil)
-        window.makeFirstResponder(host)
+        editorHost.focusEditor()
         NSApp.activate(ignoringOtherApps: true)
 
         self.window = window
@@ -314,8 +237,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
 
     @objc private func toggleSidebar(_ sender: Any?) {
-        guard let sidebarPane else { return }
-        sidebarPane.isHidden.toggle()
+        editorHost?.toggleSidebar()
     }
 
     /// View ▸ Native Tabs / Native Status Bar — affordances only; the runtime

@@ -1,7 +1,7 @@
 import Foundation
 import Testing
 
-@testable import SuperlemonApp
+@testable import EditorHostKit
 
 @Suite("Workspace chrome safety")
 struct WorkspaceChromeTests {

@@ -2,12 +2,12 @@ import Foundation
 
 /// Neovim initialization sources are mutually exclusive. In particular,
 /// user/custom modes never receive Superlemon's managed override afterward.
-enum NvimConfigMode: String, CaseIterable, Sendable {
+public enum NvimConfigMode: String, CaseIterable, Sendable {
     case managed
     case user
     case custom
 
-    var displayName: String {
+    public var displayName: String {
         switch self {
         case .managed: "Managed by Superlemon"
         case .user: "My Neovim configuration"
@@ -16,17 +16,22 @@ enum NvimConfigMode: String, CaseIterable, Sendable {
     }
 }
 
-struct NvimConfigSelection: Equatable, Sendable {
-    var mode: NvimConfigMode
+public struct NvimConfigSelection: Equatable, Sendable {
+    public init(mode: NvimConfigMode, customInitPath: String?) {
+        self.mode = mode
+        self.customInitPath = customInitPath
+    }
+
+    public var mode: NvimConfigMode
     /// Retained while another mode is selected so switching modes does not
     /// discard a deliberate custom path.
-    var customInitPath: String?
+    public var customInitPath: String?
 }
 
 /// UserDefaults adapter plus a pure legacy-migration function. The legacy keys
 /// remain synchronized temporarily so older app code continues to honor a
 /// Settings change while launch selection moves to `NvimLaunchPlan`.
-enum NvimConfigPreferences {
+public enum NvimConfigPreferences {
     static let modeKey = "NvimConfigMode"
     static let customInitPathKey = "NvimCustomInitPath"
     static let legacyManagedKey = "UseSuperlemonManagedConfig"
@@ -52,7 +57,7 @@ enum NvimConfigPreferences {
     }
 
     @discardableResult
-    static func loadAndMigrate(from defaults: UserDefaults = .standard) -> NvimConfigSelection {
+    public static func loadAndMigrate(from defaults: UserDefaults = .standard) -> NvimConfigSelection {
         let selection = migratedSelection(
             modeRawValue: defaults.string(forKey: modeKey),
             legacyManaged: defaults.object(forKey: legacyManagedKey) as? Bool,
@@ -62,7 +67,7 @@ enum NvimConfigPreferences {
         return selection
     }
 
-    static func save(
+    public static func save(
         _ selection: NvimConfigSelection,
         to defaults: UserDefaults = .standard
     ) {
@@ -92,7 +97,7 @@ enum NvimConfigPreferences {
     }
 }
 
-struct NvimLaunchPlan: Equatable, Sendable {
+public struct NvimLaunchPlan: Equatable, Sendable {
     enum PlanError: LocalizedError, Equatable {
         case executableUnavailable(String)
         case runtimeUnavailable(String)
@@ -226,7 +231,7 @@ struct NvimLaunchPlan: Equatable, Sendable {
             safeStart: safeStart)
     }
 
-    static func liveFileValidator(_ url: URL) -> Bool {
+    public static func liveFileValidator(_ url: URL) -> Bool {
         let fileManager = FileManager.default
         var isDirectory = ObjCBool(false)
         guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory),

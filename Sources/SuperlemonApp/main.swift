@@ -2,6 +2,7 @@
 // `--smoke` runs headless: session → attach → first flush → "SMOKE OK" → quit.
 
 import AppKit
+import EditorHostKit
 
 let smokeMode = CommandLine.arguments.contains("--smoke")
 

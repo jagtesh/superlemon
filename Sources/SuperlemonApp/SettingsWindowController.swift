@@ -3,6 +3,7 @@
 // remain in Vim configuration rather than a second native settings store.
 
 import AppKit
+import EditorHostKit
 
 @MainActor
 final class SettingsWindowController: NSObject, NSTextFieldDelegate {

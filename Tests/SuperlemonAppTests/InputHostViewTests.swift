@@ -2,7 +2,7 @@ import AppKit
 import SurfaceKit
 import Testing
 
-@testable import SuperlemonApp
+@testable import EditorHostKit
 
 @MainActor
 @Suite("InputHostView text input", .serialized)

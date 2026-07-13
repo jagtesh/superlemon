@@ -3,7 +3,7 @@ import NvimKit
 import SurfaceKit
 import Testing
 
-@testable import SuperlemonApp
+@testable import EditorHostKit
 
 private struct SentNotification: Equatable {
     var method: String

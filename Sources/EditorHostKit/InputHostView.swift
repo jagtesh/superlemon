@@ -12,7 +12,7 @@ import QuartzCore
 import SurfaceKit
 
 @MainActor
-final class InputHostView: NSView, @preconcurrency NSTextInputClient, NSMenuItemValidation {
+public final class InputHostView: NSView, @preconcurrency NSTextInputClient, NSMenuItemValidation {
     weak var controller: NvimController?
     let surface: GridSurfaceView
 
@@ -52,13 +52,13 @@ final class InputHostView: NSView, @preconcurrency NSTextInputClient, NSMenuItem
     }
 
     @available(*, unavailable)
-    required init?(coder: NSCoder) { fatalError("not supported") }
+    public required init?(coder: NSCoder) { fatalError("not supported") }
 
-    override var isFlipped: Bool { true }
-    override var acceptsFirstResponder: Bool { true }
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    public override var isFlipped: Bool { true }
+    public override var acceptsFirstResponder: Bool { true }
+    public override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
-    override func resignFirstResponder() -> Bool {
+    public override func resignFirstResponder() -> Bool {
         // A focus change should not silently throw away an in-progress word.
         // Session teardown uses discardMarkedTextForSessionChange() instead.
         if hasMarkedText() { unmarkText() }
@@ -70,13 +70,13 @@ final class InputHostView: NSView, @preconcurrency NSTextInputClient, NSMenuItem
     /// AppKit passes `point` in the superview's coordinate system; this view
     /// sits at a sidebar-width x offset inside the split view, so converting
     /// from the correct space is load-bearing.
-    override func hitTest(_ point: NSPoint) -> NSView? {
+    public override func hitTest(_ point: NSPoint) -> NSView? {
         guard super.hitTest(point) != nil else { return nil }
         let pointInSurface = surface.convert(point, from: superview)
         return surface.accessoryInteractionView(at: pointInSurface) ?? self
     }
 
-    override func layout() {
+    public override func layout() {
         super.layout()
         surface.frame = bounds
         controller?.surfaceLayoutChanged()
@@ -84,7 +84,7 @@ final class InputHostView: NSView, @preconcurrency NSTextInputClient, NSMenuItem
 
     // MARK: - Keyboard
 
-    override func keyDown(with event: NSEvent) {
+    public override func keyDown(with event: NSEvent) {
         if hasMarkedText() {
             interpretKeyEvents([event])  // the IME owns the event
             return
@@ -99,20 +99,20 @@ final class InputHostView: NSView, @preconcurrency NSTextInputClient, NSMenuItem
         }
     }
 
-    override func flagsChanged(with event: NSEvent) {
+    public override func flagsChanged(with event: NSEvent) {
         // Modifier-only events are deliberately ignored (DESIGN §7.1).
     }
 
     // MARK: - NSTextInputClient
 
-    func insertText(_ string: Any, replacementRange: NSRange) {
+    public func insertText(_ string: Any, replacementRange: NSRange) {
         let text = Self.plainString(from: string)
         clearMarkedText()
         guard !text.isEmpty else { return }
         controller?.sendInput(KeyTranslator.escapeForInput(text))
     }
 
-    func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
+    public func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
         let attributed = Self.attributedString(from: string)
         if attributed.length == 0 {
             clearMarkedText()
@@ -154,7 +154,7 @@ final class InputHostView: NSView, @preconcurrency NSTextInputClient, NSMenuItem
         updatePreeditLayer()
     }
 
-    func unmarkText() {
+    public func unmarkText() {
         let committed = markedText.string
         clearMarkedText()
         if !suppressUnmarkCommit, !committed.isEmpty {
@@ -162,19 +162,19 @@ final class InputHostView: NSView, @preconcurrency NSTextInputClient, NSMenuItem
         }
     }
 
-    func hasMarkedText() -> Bool {
+    public func hasMarkedText() -> Bool {
         markedText.length > 0
     }
 
-    func markedRange() -> NSRange {
+    public func markedRange() -> NSRange {
         hasMarkedText() ? markedDocumentRange : NSRange(location: NSNotFound, length: 0)
     }
 
-    func selectedRange() -> NSRange {
+    public func selectedRange() -> NSRange {
         hasMarkedText() ? markedSelectedRange : NSRange(location: NSNotFound, length: 0)
     }
 
-    func attributedSubstring(forProposedRange range: NSRange, actualRange: NSRangePointer?)
+    public func attributedSubstring(forProposedRange range: NSRange, actualRange: NSRangePointer?)
         -> NSAttributedString?
     {
         guard hasMarkedText(), range.location != NSNotFound else { return nil }
@@ -187,13 +187,13 @@ final class InputHostView: NSView, @preconcurrency NSTextInputClient, NSMenuItem
         return markedText.attributedSubstring(from: local)
     }
 
-    func validAttributesForMarkedText() -> [NSAttributedString.Key] {
+    public func validAttributesForMarkedText() -> [NSAttributedString.Key] {
         [.underlineStyle, .underlineColor, .markedClauseSegment, .textAlternatives]
     }
 
     /// Anchors the IME candidate window at the cursor cell (view → window →
     /// screen).
-    func firstRect(forCharacterRange range: NSRange, actualRange: NSRangePointer?) -> NSRect {
+    public func firstRect(forCharacterRange range: NSRange, actualRange: NSRangePointer?) -> NSRect {
         let cellRect =
             surface.cursorRect
             ?? NSRect(x: 0, y: 0, width: surface.cellSize.width, height: surface.cellSize.height)
@@ -225,7 +225,7 @@ final class InputHostView: NSView, @preconcurrency NSTextInputClient, NSMenuItem
         return window?.convertToScreen(rectInWindow) ?? rectInWindow
     }
 
-    func characterIndex(for point: NSPoint) -> Int {
+    public func characterIndex(for point: NSPoint) -> Int {
         guard hasMarkedText(), let window, let preeditLayer else { return NSNotFound }
         let pointInWindow = window.convertPoint(fromScreen: point)
         let pointInSelf = convert(pointInWindow, from: nil)
@@ -239,7 +239,7 @@ final class InputHostView: NSView, @preconcurrency NSTextInputClient, NSMenuItem
         return markedDocumentRange.location + bounded
     }
 
-    override func doCommand(by selector: Selector) {
+    public override func doCommand(by selector: Selector) {
         if hasMarkedText() {
             // Commands emitted by an input manager while it owns marked text
             // must not leak to Neovim and move/delete unrelated buffer text.
@@ -383,40 +383,40 @@ final class InputHostView: NSView, @preconcurrency NSTextInputClient, NSMenuItem
         }
     }
 
-    override func isAccessibilityElement() -> Bool { true }
-    override func accessibilityRole() -> NSAccessibility.Role? { .textArea }
-    override func accessibilityLabel() -> String? { "Neovim editor" }
-    override func accessibilityValue() -> Any? { accessibleText }
-    override func accessibilitySelectedTextRange() -> NSRange { accessibleSelection }
-    override func accessibilityVisibleCharacterRange() -> NSRange {
+    public override func isAccessibilityElement() -> Bool { true }
+    public override func accessibilityRole() -> NSAccessibility.Role? { .textArea }
+    public override func accessibilityLabel() -> String? { "Neovim editor" }
+    public override func accessibilityValue() -> Any? { accessibleText }
+    public override func accessibilitySelectedTextRange() -> NSRange { accessibleSelection }
+    public override func accessibilityVisibleCharacterRange() -> NSRange {
         NSRange(location: 0, length: (accessibleText as NSString).length)
     }
-    override func accessibilityNumberOfCharacters() -> Int {
+    public override func accessibilityNumberOfCharacters() -> Int {
         (accessibleText as NSString).length
     }
 
     // MARK: - Mouse (DESIGN §7.4)
 
-    override func mouseDown(with event: NSEvent) {
+    public override func mouseDown(with event: NSEvent) {
         acquireEditorFocus()
         sendMouse(event, button: .left, action: .press)
     }
-    override func mouseDragged(with event: NSEvent) { sendMouse(event, button: .left, action: .drag) }
-    override func mouseUp(with event: NSEvent) { sendMouse(event, button: .left, action: .release) }
+    public override func mouseDragged(with event: NSEvent) { sendMouse(event, button: .left, action: .drag) }
+    public override func mouseUp(with event: NSEvent) { sendMouse(event, button: .left, action: .release) }
 
-    override func rightMouseDown(with event: NSEvent) {
+    public override func rightMouseDown(with event: NSEvent) {
         acquireEditorFocus()
         sendMouse(event, button: .right, action: .press)
     }
-    override func rightMouseDragged(with event: NSEvent) { sendMouse(event, button: .right, action: .drag) }
-    override func rightMouseUp(with event: NSEvent) { sendMouse(event, button: .right, action: .release) }
+    public override func rightMouseDragged(with event: NSEvent) { sendMouse(event, button: .right, action: .drag) }
+    public override func rightMouseUp(with event: NSEvent) { sendMouse(event, button: .right, action: .release) }
 
-    override func otherMouseDown(with event: NSEvent) {
+    public override func otherMouseDown(with event: NSEvent) {
         acquireEditorFocus()
         sendMouse(event, button: .middle, action: .press)
     }
-    override func otherMouseDragged(with event: NSEvent) { sendMouse(event, button: .middle, action: .drag) }
-    override func otherMouseUp(with event: NSEvent) { sendMouse(event, button: .middle, action: .release) }
+    public override func otherMouseDragged(with event: NSEvent) { sendMouse(event, button: .middle, action: .drag) }
+    public override func otherMouseUp(with event: NSEvent) { sendMouse(event, button: .middle, action: .release) }
 
     /// The grid latched at mouse-press: per the nvim UI contract, DRAG and
     /// RELEASE events must stay on the press grid. Re-hit-testing per event
@@ -455,7 +455,7 @@ final class InputHostView: NSView, @preconcurrency NSTextInputClient, NSMenuItem
             grid: arguments.grid, row: arguments.row, col: arguments.col)
     }
 
-    override func scrollWheel(with event: NSEvent) {
+    public override func scrollWheel(with event: NSEvent) {
         guard let controller, controller.isMouseEnabled else { return }
         let steps = scrollAccumulator.accumulate(
             deltaX: event.scrollingDeltaX,
@@ -516,23 +516,23 @@ final class InputHostView: NSView, @preconcurrency NSTextInputClient, NSMenuItem
 
     // MARK: - Menu actions
 
-    @objc func undo(_ sender: Any?) { controller?.performUndo() }
+    @objc public func undo(_ sender: Any?) { controller?.performUndo() }
 
-    @objc func redo(_ sender: Any?) { controller?.performRedo() }
+    @objc public func redo(_ sender: Any?) { controller?.performRedo() }
 
-    @objc func cut(_ sender: Any?) { controller?.copySelection(cut: true) }
+    @objc public func cut(_ sender: Any?) { controller?.copySelection(cut: true) }
 
-    @objc func copy(_ sender: Any?) { controller?.copySelection(cut: false) }
+    @objc public func copy(_ sender: Any?) { controller?.copySelection(cut: false) }
 
-    @objc func paste(_ sender: Any?) {
+    @objc public func paste(_ sender: Any?) {
         controller?.pasteFromPasteboard()
     }
 
-    override func selectAll(_ sender: Any?) { controller?.selectAllText() }
+    public override func selectAll(_ sender: Any?) { controller?.selectAllText() }
 
-    @objc func performFindPanelAction(_ sender: Any?) { controller?.beginFind() }
+    @objc public func performFindPanelAction(_ sender: Any?) { controller?.beginFind() }
 
-    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+    public func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         switch menuItem.action {
         case #selector(undo(_:)):
             return controller?.canUndo ?? false

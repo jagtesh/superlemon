@@ -3,7 +3,7 @@ import Foundation
 import NvimKit
 import Testing
 
-@testable import SuperlemonApp
+@testable import EditorHostKit
 
 private let startupSafetyNvimPath =
     ProcessInfo.processInfo.environment["SUPERLEMON_NVIM"] ?? "/opt/homebrew/bin/nvim"

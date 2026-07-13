@@ -47,11 +47,11 @@ private actor WorkspaceFileMutationQueue {
 }
 
 @MainActor
-final class WorkspaceChrome {
+public final class WorkspaceChrome {
     let chromeState = ChromeState()
     let cmdlinePanel: CmdlinePanelController
     let popupMenu: PopupMenuPanelController
-    let toasts = MessageToastController()
+    public let toasts = MessageToastController()
 
     let statusBar = StatusBarView()
     let sidebar = FileTreeSidebarView()
@@ -67,16 +67,16 @@ final class WorkspaceChrome {
     ) -> Void)?
     /// The default Neovim save mapping requests the native sheet for an
     /// unnamed buffer. AppDelegate supplies the document-panel presentation.
-    var onSaveAsRequested: (() -> Void)?
-    private(set) var nativeTabs = false
-    private(set) var nativeStatusbar = false
-    private(set) var nativeMinimap = true
+    public var onSaveAsRequested: (() -> Void)?
+    public private(set) var nativeTabs = false
+    public private(set) var nativeStatusbar = false
+    public private(set) var nativeMinimap = true
     private(set) var nativeScrollbars = false
 
     private unowned let controller: NvimController
     private weak var window: NSWindow?
     private weak var surface: GridSurfaceView?
-    private(set) var projectRoot: URL
+    public private(set) var projectRoot: URL
     /// Invalidates quick-open work started against an earlier project root.
     private var fileIndexGeneration = 0
     private var quickOpenQueryGeneration: UInt64 = 0
@@ -749,7 +749,7 @@ final class WorkspaceChrome {
         }
     }
 
-    func presentQuickOpen() {
+    public func presentQuickOpen() {
         // ⌘P during a plugin palette session: end the session first so the
         // built-in file-picker wiring (restored on session close) is live.
         uiRouter.closePaletteSession()
