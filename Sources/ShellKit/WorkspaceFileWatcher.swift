@@ -153,7 +153,11 @@ private func workspaceFileWatcherCallback(
     guard let clientInfo else { return }
     let watcher = Unmanaged<WorkspaceFileWatcher>
         .fromOpaque(clientInfo).takeUnretainedValue()
-    let paths = unsafeBitCast(eventPaths, to: NSArray.self) as? [String] ?? []
+    // kFSEventStreamCreateFlagUseCFTypes: eventPaths is a CFArray of
+    // CFString; bridge it rather than reinterpreting the raw pointer.
+    let paths =
+        Unmanaged<CFArray>.fromOpaque(eventPaths).takeUnretainedValue()
+        as? [String] ?? []
     let flags = Array(UnsafeBufferPointer(start: eventFlags, count: eventCount))
     Task { @MainActor in watcher.recordChanges(paths, flags: flags) }
 }
