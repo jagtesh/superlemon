@@ -13,6 +13,10 @@ let package = Package(
         .library(name: "ChromeKit", targets: ["ChromeKit"]),
         .library(name: "ShellKit", targets: ["ShellKit"]),
         .library(name: "EditorHostKit", targets: ["EditorHostKit"]),
+        .library(name: "EditorEmbed", targets: ["EditorEmbed"]),
+    ],
+    dependencies: [
+        .package(url: "https://github.com/stackotter/swift-cross-ui", exact: "0.8.0")
     ],
     targets: [
         // msgpack-RPC session, nvim process lifecycle, redraw-event decoding
@@ -32,6 +36,17 @@ let package = Package(
         .target(
             name: "EditorHostKit",
             dependencies: ["NvimKit", "GridKit", "InputKit", "SurfaceKit", "ChromeKit", "ShellKit"]
+        ),
+        // swift-cross-ui embedding (macOS/AppKitBackend only): EditorSurface,
+        // an NSViewRepresentable wrapping EditorHostNSView for host apps
+        // (lemon-tmux) that render the editor as a swift-cross-ui view
+        .target(
+            name: "EditorEmbed",
+            dependencies: [
+                "EditorHostKit",
+                .product(name: "SwiftCrossUI", package: "swift-cross-ui"),
+                .product(name: "AppKitBackend", package: "swift-cross-ui"),
+            ]
         ),
         // app shell: windows, menus, session
         .executableTarget(
