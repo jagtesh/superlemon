@@ -920,12 +920,16 @@ public actor NvimSession {
         // Process termination closes both pipe writers, but their private read
         // queues may still hold the final chunk. Give them a bounded window to
         // reach EOF so the last redraw and stderr diagnostics are not lost.
+        // The window only elapses in full when something (e.g. a grandchild)
+        // holds the pipe open — EOF completes the wait immediately — so it is
+        // sized for loaded CI machines, where 250ms of scheduling delay was
+        // enough to lose the exit diagnostics.
         if let stdoutPump {
-            let drained = await stdoutPump.waitForCompletion(timeout: .milliseconds(250))
+            let drained = await stdoutPump.waitForCompletion(timeout: .seconds(2))
             if !drained { logger.warning("timed out draining nvim stdout after exit") }
         }
         if let stderrPump {
-            let drained = await stderrPump.waitForCompletion(timeout: .milliseconds(250))
+            let drained = await stderrPump.waitForCompletion(timeout: .seconds(2))
             if !drained { logger.warning("timed out draining nvim stderr after exit") }
         }
         finish(exitCode: exitCode)
