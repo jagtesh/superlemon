@@ -55,10 +55,13 @@ under Core Animation.
   current projection.
 - Vertical viewport scrolling is the optimized interpolated path. Horizontal
   scrolling and conflicting partial-region scrolls present atomically.
-- The current IME bridge supports marked text, commit/cancel, and candidate
-  placement, but not rich per-clause styling or reconversion fidelity.
-- Session restoration, Finder/Dock open-file routing, drag-and-drop, Services, a
-  command-line helper, signed distribution, and notarization are open work.
+- The current IME bridge retains attributed marked-text clauses, selection,
+  local composition replacement, commit/cancel, and candidate placement.
+  Arbitrary-buffer reconversion is not implemented.
+- Session restoration, Finder/Dock open-file routing, drag-and-drop, Services,
+  and a command-line helper are open work. Tagged distribution is gated on
+  protected Developer ID credentials, hardened signing, notarization, and
+  stapling.
 
 ---
 
@@ -202,38 +205,47 @@ work instead of allowing stale pixels to arrive late.
 
 ### Process startup
 
-`NvimController.start()` resolves Neovim in this order:
-
-1. executable path in `SUPERLEMON_NVIM`;
-2. an app-bundled `Contents/Helpers/nvim` or development sibling binary;
-3. `command -v nvim` from a login zsh;
-4. `/opt/homebrew/bin/nvim` as the final fallback.
+`NvimController.start()` first honors the explicit development/test override in
+`SUPERLEMON_NVIM`. A packaged `.app` otherwise requires its bundled
+`Contents/Helpers/nvim`; it never silently borrows a host binary. A bare
+development executable may use a sibling binary, inherited `PATH`, or the
+standard Homebrew locations, without starting a login shell.
 
 The controller launches `nvim --embed`. `SUPERLEMON_LISTEN=<path>` adds
 `--listen <path>` for diagnostics and external driving.
 
-Neovim configuration is selected before launch:
+Neovim configuration is selected before launch as exactly one mode:
 
-1. an existing explicit custom init path from Settings;
-2. the managed `runtime/config/init.lua` when managed configuration is enabled;
-3. otherwise no `-u` flag, allowing Neovim to load the user's normal init.
+1. managed: `-u runtime/config/init.lua` (the default);
+2. user: no `-u`, allowing Neovim to load its normal init; or
+3. custom: a diagnostic-only bundled `-u` loader that sources exactly the
+   validated regular file selected in Settings once, without bundled defaults
+   or any post-attach configuration.
+
+A missing managed or custom file fails startup; there is no silent mode
+fallback. Managed mode uses `NVIM_APPNAME=superlemon` to isolate its state.
 
 After the process starts, Superlemon:
 
-1. calls `nvim_get_api_info` and records channel/API/version metadata;
-2. identifies itself with `nvim_set_client_info`;
-3. attaches the UI with `ext_linegrid`, `ext_multigrid`, `ext_cmdline`,
+1. prepends the bundled runtime through a pre-init `--cmd`;
+2. calls `nvim_get_api_info`, records channel/API/version metadata, and rejects
+   Neovim older than 0.12;
+3. identifies itself with `nvim_set_client_info`;
+4. attaches the UI with `ext_linegrid`, `ext_multigrid`, `ext_cmdline`,
    `ext_popupmenu`, `ext_messages`, and RGB color enabled;
-4. prepends the bundled runtime to `runtimepath`;
-5. sources the personal Superlemon configuration once; and
-6. calls `require('superlemon').setup(channel)`.
+5. calls `require('superlemon').setup(channel)` without sourcing configuration;
+   and
+6. requires structured bridge readiness before startup or smoke testing passes.
+
+User-triggered safe recovery relaunches managed mode with an isolated
+`NVIM_APPNAME=superlemon-safe` and `SUPERLEMON_SAFE_START=1`. The managed
+baseline loads, but executable personal configuration is skipped.
 
 `ext_tabline` is decoded by NvimKit but is not enabled by the application. The
 visible native strip is a runtime-driven buffer list, not Neovim tabpages.
 
-The handshake currently records API compatibility data but does not reject an
-older Neovim version. Version claims should therefore be treated as tested
-compatibility, not an enforced runtime gate.
+The application enforces Neovim 0.12 or newer before UI attachment. Packaged
+artifacts additionally verify the exact manifest-pinned bundled version.
 
 ### RPC implementation
 
@@ -256,16 +268,30 @@ not a raw-byte zero-copy parser.
 ### Exit and quit behavior
 
 Normal Neovim exit closes the window and terminates the current app instance.
-Unexpected exit presents the exit code and captured stderr tail, then closes.
-There is no current session autosave or automatic relaunch.
+An unexpected exit presents captured failure context and offers user-triggered
+Restart, Start Safely, or Quit; there is no automatic relaunch loop or session
+autosave.
 
 Quit and window close use an app-owned native flow:
 
-1. query listed modified buffers, guarded by a two-second timeout;
-2. if none are modified, issue `qa!`;
+1. query every valid, loaded modified buffer (listed or unlisted), guarded by a
+   two-second timeout;
+2. if none are modified, issue clean `qa` so a late edit or refusing autocommand
+   can still keep the app open;
 3. otherwise present Save All & Quit, Discard All & Quit, and Cancel;
-4. Save All runs `wall` and then `qa!`;
-5. if Neovim does not answer, offer Cancel or Force Quit.
+4. Save All writes each modified buffer in its own `nvim_buf_call`, reports
+   per-buffer failures, re-probes all loaded buffers, and uses clean `qa` only
+   when the second probe is empty;
+5. `qa!` is used only after the explicit Discard All choice; and
+6. if Neovim does not answer, offer Cancel or user-triggered Force Quit.
+
+Settings relaunch goes through this same flow and starts the replacement only
+after Neovim actually exits.
+
+Quit or relaunch requested during startup transitions that launch generation
+to stopping and reaps any created child before resolving AppKit. If binary
+resolution has not created a child yet, the generation is invalidated so its
+suspended task cannot spawn Neovim after application termination begins.
 
 Neovim still owns the actual write operations and buffer state. The native sheet
 does not maintain a duplicate modified-buffer model.
@@ -606,9 +632,11 @@ writes the bounded ring off-main after motion settles, keeping file I/O out of
 the input, raster, and display-commit paths.
 
 Low input latency, hitch-free 60/120 Hz scrolling, bounded memory growth, and
-fast launch remain product targets. End-to-end key/RPC/raster/commit signposts,
-cold-launch budgets, and automated performance gates are open work rather than
-current test guarantees.
+fast launch remain product targets. Points-of-interest signposts now cover RPC
+requests, inbound/decode work, model apply, rasterization, display commit,
+writer-queue depth, and scroll frames. A single correlated key-to-present
+interval, cold-launch budgets, and automated performance thresholds remain open
+work rather than current test guarantees.
 
 ---
 
@@ -644,14 +672,22 @@ through `NSTextInputClient`.
 ### 7.2 IME and marked text
 
 `InputHostView` implements `NSTextInputClient` and keeps uncommitted marked text
-out of Neovim. A `CATextLayer` at the cursor displays the marked string with a
-single underline. `firstRect(forCharacterRange:)` maps the cursor cell into
-screen coordinates so macOS can place its candidate window.
+out of Neovim. It retains the input manager's attributed clauses, marked and
+selected ranges, answers attributed-substring and character-index queries, and
+supports replacements contained within the active composition. A `CATextLayer`
+at the cursor renders those attributes; a default underline is added only when
+the input manager supplied none. `firstRect(forCharacterRange:)` anchors the
+candidate window at the requested position within the marked string.
 
 Commit clears the overlay and sends escaped text through `nvim_input`; cancel
-removes it without changing the buffer. Current limitations are deliberate to
-document: replacement ranges, attributed substring retrieval, rich active-clause
-styling, and reconversion-specific behavior are not implemented.
+removes it without changing the buffer. Arbitrary-buffer reconversion is the
+deliberate limit: without a changedtick-validated document snapshot, the app
+does not claim that Neovim's full buffer lives in the local composition range.
+
+The editor host is a viewport-scoped accessibility text area. Each authoritative
+flush updates its visible text value and cursor selection, with coalesced value
+and selection notifications. This is not advertised as a synthetic full-buffer
+accessibility document. Native message toasts also post announcement requests.
 
 ### 7.3 Command shortcuts and File menu
 
@@ -665,15 +701,17 @@ Native menu key equivalents run before `keyDown`. Current File workflows are:
 |---|---:|---|
 | Open File… | ⌘O | Native `NSOpenPanel`, then Neovim `:drop` |
 | Open Folder… | ⇧⌘O | Native folder panel, `nvim_set_current_dir`, then re-root native project state |
-| Save | ⌘S | Send remappable `<D-s>`; default writes a named buffer or asks the GUI for Save As |
+| Save | ⌘S | Direct Neovim `:write` RPC; failure is shown natively |
 | Save As… | ⇧⌘S | Native `NSSavePanel`, then Neovim `nvim_cmd({cmd='saveas', bang=true})` |
 | Close | ⌘W | Begin the app's native modified-buffer quit flow |
 
 Other native equivalents include Settings (`⌘,`), Paste (`⌘V`), sidebar toggle
 (`⌘B`), Quick Open (`⌘P`), and Quit (`⌘Q`). Quick Open and native file panels
 are app actions, not Neovim mappings. Native Tabs and Native Status Bar menu
-validation reflects runtime state; general enabled/modified menu validation is
-not currently pushed from Neovim.
+validation reflects runtime state. `superlemon.status` also carries the active
+buffer's modifiable/read-only/type flags, visual-selection mode, and undo-tree
+availability so Save, Undo, Redo, Cut, Copy, Paste, Select All, and Find are
+disabled when their semantic action is unavailable.
 
 The clipboard provider supports plain strings for the `+` and `*` registers.
 It does not currently publish HTML or rich-text pasteboard flavors.
@@ -736,7 +774,7 @@ Swift.
 | Module | Current responsibility |
 |---|---|
 | `init.lua` | Idempotent bridge setup and active-channel state |
-| `settings.lua` | Source the personal config once and push renderer/accessory settings |
+| `settings.lua` | Expose startup config diagnostics and push renderer/accessory settings |
 | `keymaps.lua` | Unmapped-only macOS defaults, native Save As request, font zoom |
 | `clipboard.lua` | Plain-text `+`/`*` clipboard provider |
 | `chrome.lua` | Neovim-owned buffer-strip, status-bar, minimap, and scrollbar toggles plus buffer notifications |
@@ -754,21 +792,20 @@ Finder reveal, notifications, or URL opening, and there is no session autosave.
 ### Configuration hierarchy
 
 The default experience uses `runtime/config/init.lua`. It establishes ordinary
-editor defaults, optionally loads its example plugin with Neovim's package
-manager, then sources:
+editor defaults without network access, then sources:
 
 1. bundled `runtime/config/superlemon.vim`; and
 2. `$XDG_CONFIG_HOME/superlemon/init.vim` if present, normally
    `~/.config/superlemon/init.vim`.
 
 The second file is the user's primary Superlemon override and wins setting by
-setting. Settings ▸ Edit Superlemon Configuration creates it from the annotated
-bundled template only when absent, then opens it in Neovim.
+setting. Settings ▸ Edit Superlemon Configuration creates it from a minimal,
+commented user template only when absent, then opens it in Neovim.
 
-When Settings selects the user's normal Neovim config or an explicit custom init,
-the managed init is bypassed. Runtime bootstrap still sources the personal
-Superlemon init once before bridge setup. A marker prevents duplicate sourcing
-when the managed init already loaded it.
+When Settings selects the user's normal Neovim config or an explicit custom
+init, the managed init is bypassed completely. Runtime bootstrap installs only
+the GUI bridge and never sources executable configuration after UI attach. A
+missing custom init is an actionable startup error, not a managed/user fallback.
 
 Superlemon-specific values currently include native chrome/accessory toggles,
 native `vim.ui`, default keymaps, renderer ligatures/Powerline/symbol options,
@@ -865,14 +902,22 @@ swift build -c release
 swift run superlemon --smoke
 ```
 
-The smoke path attaches a headless grid, waits for the first flush, prints its
-size/title, and exits through the normal controller lifecycle.
+The smoke path attaches a headless grid and succeeds only after both structured
+runtime bootstrap readiness and the first authoritative flush. It has a bounded
+deadline, prints the grid size/title, and exits through the normal controller
+lifecycle.
 
 Current tests are programmatic; the repository does not contain recorded golden
 RPC transcripts, reference-PNG baselines, a structured redraw fuzzer, a scripted
 IME matrix, or automated latency/memory performance gates. Native File-menu and
 About-panel workflows are presently verified through live/manual app testing
-rather than a SuperlemonApp test target.
+rather than a SuperlemonApp test target. `packaging/RELEASE_ACCEPTANCE.md` is the
+runbook for the required dead-key, emoji, Japanese Romaji, Chinese Pinyin,
+Korean 2-Set, VoiceOver, five-minute memory, main-thread filesystem stress, and
+sidebar-layout runs. The companion `packaging/RELEASE_ACCEPTANCE.json` starts at
+`NOT RUN`. Trusted main builds stage that unfinished template; a protected tag
+job requires a completed record and validates its checks, evidence, performance
+budgets, sign-off, tag, commit, artifact filename, and SHA-256 before release.
 
 ---
 
@@ -888,21 +933,22 @@ rather than a SuperlemonApp test target.
 - Per-split native minimap gutters with acknowledged Neovim resizing, bounded
   highlighted content, Core Text miniatures, coupled viewport/cursor markers,
   semantic interactions, and independent opt-in native scrollbars.
-- Keyboard, basic IME, mouse, trackpad, clipboard, and ordered input queue.
+- Native key handling, attributed marked-text IME composition, viewport-scoped
+  editor accessibility, mouse, trackpad, clipboard, and ordered input queue.
 - Native cmdline, popupmenu, messages, prompts, sidebar, Quick Open, preview
   buffers, buffer strip, statusline/status bar, file panels, Settings, and About.
 - Annotated managed/personal configuration and generic `superlemon.ui` bridge.
 
 ### Open work
 
-- Rich IME clause/reconversion behavior and a multi-IME validation matrix.
+- Arbitrary-buffer IME reconversion and a broader multi-IME validation matrix.
 - Float materials/shadows and separator affordance paint.
 - Workspace overview, multiple windows, restored sessions, Finder/Dock opening,
   drag-and-drop, Services, and CLI/XPC integration.
 - Buffer-aware reconciliation for sidebar rename/trash operations.
-- Rich clipboard flavors and broader menu validation.
-- End-to-end latency/hitch/memory instrumentation and CI performance gates.
-- Signed/notarized application packaging and distribution.
+- Rich clipboard flavors.
+- Correlated input-to-present metrics, fixed latency/hitch/memory budgets, and
+  automated CI performance gates.
 
 ---
 
@@ -914,11 +960,11 @@ rather than a SuperlemonApp test target.
 | Fast scrolling | Retained history cannot represent every true far jump or delayed compositor frame | Exact authoritative rows stay visible; one-line far cue, bounded debt, diagnostics, Reduce Motion bypass |
 | IOSurface lifetime | Reusing a surface still referenced by history/compositor corrupts rows | Revision leases, IOSurface use counts, compositor-use checks, bounded CGImage fallback |
 | Minimap fidelity and staleness | A full-document/highlight mirror would block Neovim or install obsolete content; ephemeral decoration state is intentionally incomplete | Sliding 384-line requests, cooperative 16-line chunks, 256-character line cap, syntax budgets/fallbacks, identity and generation checks, detached raster cancellation |
-| IME | Clause editing and reconversion are incomplete | Keep marked text out of Neovim; use AppKit candidate placement; document current scope |
+| IME | Arbitrary-buffer reconversion lacks a changedtick-validated document snapshot | Retain attributed clauses and local composition replacement; keep uncommitted text out of Neovim and document the boundary |
 | Externalized messages | Plugins may depend on TUI-specific hit-enter/message behavior | Typed model, native history, atomic editor grid; no claim of complete TUI-message emulation |
 | Sidebar mutations | Rename/trash may leave an already-open Neovim buffer referring to the old path | File open/preview goes through Neovim; buffer-aware mutation integration remains open |
 | Config combinations | Managed, normal-user, and custom init paths can expose different plugin/chrome behavior | Explicit Settings choice, one documented personal override, idempotent runtime setup, Lua config tests |
-| Version compatibility | API metadata is observed but no minimum is enforced | Unknown events are skipped; decoder tests cover supported vocabulary; an explicit version gate remains open |
+| Version compatibility | Future Neovim protocol changes may add unknown events | Enforce Neovim 0.12+, pin and verify the packaged version, skip well-formed unknown events, and test the supported decoder vocabulary |
 
 ---
 
@@ -1001,8 +1047,11 @@ Quick Open panels.
 
 ### 14.7 Settings
 
-The native Settings window chooses the Neovim init source and opens the personal
-Superlemon configuration. Font, spacing, scroll steps, ligatures, symbols, native
+The native Settings window exposes mutually exclusive managed, normal-user, and
+exact-custom init modes. It validates custom files without silently falling
+back and opens the configuration associated with the selected mode. Managed
+mode creates a minimal personal override template rather than copying all
+bundled defaults. Font, spacing, scroll steps, ligatures, symbols, native
 chrome/accessories, minimap width/scale/pitch, statusline, and default-keymap
 customization remain file-backed rather than duplicated in UserDefaults
 controls. The View menu exposes live minimap and native-scrollbar toggles, but
