@@ -154,7 +154,10 @@ public final class NvimController {
 
     private let nvimBinaryResolver: @Sendable () async throws -> URL
     private let configSelectionProvider: @MainActor () -> NvimConfigSelection
-    var requestApplicationTermination: @MainActor () -> Void = { NSApp.terminate(nil) }
+    /// How "quit" leaves the editor. Standalone superlemon terminates the
+    /// app; embedding hosts (lemon-tmux) override this to close their editor
+    /// surface instead — an embedded editor must never quit its host.
+    public var requestApplicationTermination: @MainActor () -> Void = { NSApp.terminate(nil) }
     var replyToApplicationTermination: @MainActor (Bool) -> Void = {
         NSApp.reply(toApplicationShouldTerminate: $0)
     }
@@ -767,7 +770,7 @@ public final class NvimController {
             return
         }
         guard let window else {
-            NSApp.terminate(nil)
+            requestApplicationTermination()
             return
         }
         let alert = NSAlert()
@@ -788,7 +791,7 @@ public final class NvimController {
             case .alertSecondButtonReturn:
                 Task { await self.launchSession(safeStart: true) }
             default:
-                NSApp.terminate(nil)
+                requestApplicationTermination()
             }
         }
     }
@@ -1011,7 +1014,7 @@ public final class NvimController {
         } else if outcome.cause == .processExit, outcome.exitCode == 0 {
             phase = .terminated
             window?.close()
-            NSApp.terminate(nil)
+            requestApplicationTermination()
         } else {
             phase = .recovering
             presentRecoveryAlert(outcome)
@@ -1041,7 +1044,7 @@ public final class NvimController {
 
     private func presentRecoveryChoices(title: String, detail: String) {
         guard let window else {
-            NSApp.terminate(nil)
+            requestApplicationTermination()
             return
         }
         let generation = sessionGeneration
@@ -1062,7 +1065,7 @@ public final class NvimController {
             case .alertSecondButtonReturn:
                 Task { await self.launchSession(safeStart: true) }
             default:
-                NSApp.terminate(nil)
+                requestApplicationTermination()
             }
         }
     }
