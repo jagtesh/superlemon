@@ -154,6 +154,13 @@ public final class NvimController {
 
     private let nvimBinaryResolver: @Sendable () async throws -> URL
     private let configSelectionProvider: @MainActor () -> NvimConfigSelection
+    /// Whether the controller drives its window's NSAppearance from the
+    /// active colorscheme's background luminance. Standalone superlemon does;
+    /// embedding hosts (lemon-tmux) own the app-wide chrome appearance and
+    /// set this false so the editor's colorscheme can't flip the host's
+    /// light/dark chrome. The window's background color still follows nvim.
+    public var managesWindowAppearance = true
+
     /// How "quit" leaves the editor. Standalone superlemon terminates the
     /// app; embedding hosts (lemon-tmux) override this to close their editor
     /// surface instead — an embedded editor must never quit its host.
@@ -914,6 +921,7 @@ public final class NvimController {
         let green = CGFloat((background.rgb >> 8) & 0xFF) / 255
         let blue = CGFloat(background.rgb & 0xFF) / 255
         window.backgroundColor = NSColor(srgbRed: red, green: green, blue: blue, alpha: 1)
+        guard managesWindowAppearance else { return }
         let luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue
         window.appearance = NSAppearance(named: luminance < 0.5 ? .darkAqua : .aqua)
     }
