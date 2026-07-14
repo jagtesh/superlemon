@@ -29,6 +29,14 @@ H.eq(vim.g.superlemon_minimap_min_editor_columns, 40,
 H.ok(vim.g.syntax_on ~= nil, "managed editor enables syntax for grid and minimap")
 H.eq(vim.o.laststatus, 0, "in-grid statusline released")
 H.eq(vim.o.mousescroll, "ver:1,hor:1", "native scrolling advances one cell per wheel step")
+H.eq(vim.g.superlemon_user_config_state, "missing",
+  "an absent optional personal config is explicit but non-fatal")
+
+local managed_source = table.concat(vim.fn.readfile(H.root() .. "/config/init.lua"), "\n")
+H.ok(managed_source:find("vim.pack", 1, true) == nil,
+  "managed startup performs no package-manager bootstrap")
+H.ok(managed_source:find("https://", 1, true) == nil,
+  "managed startup performs no network fetch")
 
 local segments = require("superlemon.statusline").eval()
 H.ok(segments ~= nil and #segments >= 4, "statusline evaluates into segments")

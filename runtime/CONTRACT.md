@@ -7,33 +7,41 @@ sides together when changing a wire shape.
 
 ## Bootstrap and configuration
 
-After `nvim_ui_attach`, the GUI prepends the bundled runtime, sources the
-personal Superlemon configuration at most once, and starts the bridge:
+The GUI prepends the bundled runtime through a pre-init `--cmd`. After
+`nvim_ui_attach`, it starts the bridge. Configuration is startup input and is
+never sourced by this bootstrap:
 
 ```lua
-local path, channel = ...
-vim.opt.runtimepath:prepend(path)
-require("superlemon.settings").source_user_config()
-require("superlemon").setup(channel)
+local channel, mode = ...
+vim.g.superlemon_config_mode = vim.g.superlemon_config_mode or mode
+return require("superlemon").setup(channel)
 ```
 
-The GUI passes `[runtime_path, channel_id]` as the `nvim_exec_lua` argument
-array. `channel_id` comes from `nvim_get_api_info`.
+The GUI passes `[channel_id, config_mode]` as the `nvim_exec_lua` argument
+array. `channel_id` comes from `nvim_get_api_info`; `config_mode` is managed,
+user, or custom launch state used when the managed init did not set it.
 
 `require("superlemon")` has no side effects. `setup(channel)` rejects invalid
 channels, stores a valid one in `g:superlemon_channel`, stays inert when no UI
-is attached, and may be called again safely. Active setup installs status,
+is attached, and may be called again safely. It returns structured readiness
+with `ready`, `runtime_api`, and `config` fields. Active setup installs status,
 clipboard, keymap, chrome, minimap, git, and native-UI adapters, then pushes
 initial settings and status.
 
 ### Configuration source order
 
-The app launches Neovim with the first available source:
+Settings selects exactly one launch source:
 
-1. the explicit custom init selected in Settings;
-2. bundled `runtime/config/init.lua` when managed configuration is enabled
-   (the default);
-3. the user's normal Neovim init when managed configuration is disabled.
+1. managed: bundled `runtime/config/init.lua` (the default);
+2. user: no `-u`, allowing Neovim to load its normal init; or
+3. custom: a diagnostic-only bundled `-u` loader that sources exactly the
+   readable regular file selected in Settings once. The loader exists so an
+   init error can be returned over RPC instead of entering Neovim's startup
+   prompt; it applies no defaults or other executable configuration.
+
+The modes are mutually exclusive. User and custom launches do not receive the
+managed baseline or the Superlemon personal override after startup. A missing
+custom file is a startup error rather than a silent fallback.
 
 The managed init sources the annotated baseline
 `runtime/config/superlemon.vim`, then sources:
@@ -43,14 +51,20 @@ $XDG_CONFIG_HOME/superlemon/init.vim
 ```
 
 or `~/.config/superlemon/init.vim` when `XDG_CONFIG_HOME` is unset. The personal
-file wins setting by setting. For custom and normal-user-init launches, bridge
-bootstrap still sources that personal file once. The marker
-`g:superlemon_user_config_loaded` prevents duplicate sourcing.
+file wins setting by setting. The state marker is set to `loading` before
+`:source`, then becomes `loaded` or `error`, preventing recursive/repeated
+execution. A source error is retained as structured path/message diagnostics.
+Bridge setup returns that error to the GUI, which presents recovery including
+an explicit safe-start path rather than silently changing configuration modes.
 
-Settings creates the personal file from the bundled annotated template only
-when it does not already exist. Editor, scrolling, native chrome, minimap,
-native UI, keymap, statusline, and renderer preferences live in these Vim
-files rather than a parallel native preference store.
+Recovery can launch managed mode with `SUPERLEMON_SAFE_START=1` (and an isolated
+`NVIM_APPNAME`). It loads the bundled baseline, skips executable personal
+configuration, and reports config state `safe_start`.
+
+Settings creates the personal file from the minimal `config/user-init.vim`
+template only when it does not already exist. Editor, scrolling, native chrome,
+minimap, native UI, keymap, statusline, and renderer preferences live in these
+Vim files rather than a parallel native preference store.
 
 ## Neovim to GUI notifications
 
@@ -65,6 +79,8 @@ One map argument:
   mode = "n",                 -- raw nvim_get_mode().mode
   file = "Sources/a.swift",   -- cwd-relative; "" when unnamed
   modified = true,
+  modifiable = true, readonly = false, buftype = "",
+  can_undo = true, can_redo = false, -- native menu enablement snapshot
   line = 42, col = 7,         -- one-based
   total_lines = 310,
   branch = "main",            -- "" outside a repository
@@ -73,9 +89,11 @@ One map argument:
 ```
 
 Immediate pushes occur at setup and on `ModeChanged`, `BufEnter`,
-`BufModifiedSet`, `DirChanged`, and `FocusGained`. `CursorMoved` and
-`CursorMovedI` use one trailing-edge timer: a movement burst produces one push
-about 100 ms after its final event.
+`BufModifiedSet`, `BufFilePost`, relevant `OptionSet`, `DirChanged`, and
+`FocusGained`. `CursorMoved`, `CursorMovedI`, `TextChanged`, and `TextChangedI`
+use one trailing-edge timer: a movement/edit burst produces one push about
+100 ms after its final event. This keeps Save, Cut, Undo, and Redo enablement
+current even when a plugin edits or renames a buffer without moving the cursor.
 
 The branch reader walks upward for `.git`, supports worktree/submodule
 `gitdir:` indirection, reads `HEAD` with `vim.uv` filesystem calls, and caches
@@ -569,9 +587,12 @@ dropping or pacing protocol events. Paste remains an ordered `nvim_paste`
 request.
 
 Command chords not claimed by an AppKit menu item arrive through InputKit as
-`<D-x>` notation via `nvim_input`. Menu equivalents are handled first. File >
-Save deliberately sends `<D-s>` back through this path so user remapping still
-wins.
+`<D-x>` notation via `nvim_input`. Standard Edit selectors remain on AppKit's
+responder chain, so native text fields and panels retain native editing while
+the editor input host maps the same selectors to Neovim. Semantic editor/File
+commands call Neovim directly; for example File > Save issues `write` rather
+than changing meaning through a `<D-s>` mapping. Direct Save is disabled for an
+unnamed buffer; Save As remains available.
 
 ### Default Command-key mappings
 
@@ -599,7 +620,7 @@ installed afterward.
 |---|---|
 | Open File... | native single-file panel, then `vim.cmd.drop(fnameescape(path))` |
 | Open Folder... | native directory panel, `nvim_set_current_dir(path)`, return canonical `getcwd()`, then re-root native workspace chrome |
-| Save | send `<D-s>` through `nvim_input` |
+| Save | direct `nvim_command("write")`; surface failure in a native alert |
 | Save As... | seed native panel with `nvim_buf_get_name(0)`, then `nvim_cmd({cmd="saveas", args={path}, bang=true})` |
 
 The Save As panel has already confirmed replacement before `bang=true` is

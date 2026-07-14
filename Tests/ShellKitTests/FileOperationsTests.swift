@@ -74,7 +74,7 @@ struct FileOperationsTests {
         }
     }
 
-    @Test(arguments: ["", "a/b", ".", ".."])
+    @Test(arguments: ["", "   ", "a/b", "a\0b", ".", ".."])
     func invalidNamesAreRejected(name: String) throws {
         let dir = try makeTempDir()
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -82,6 +82,18 @@ struct FileOperationsTests {
         #expect(throws: FileOperationError.invalidName(name)) {
             try FileOperations.createFile(in: dir, name: name)
         }
+    }
+
+    @Test func performReturnsCreatedAndRenamedLocations() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let created = try FileOperations.perform(
+            .newFile(directory: dir.path, name: "created.txt"))
+        #expect(created == dir.appendingPathComponent("created.txt"))
+        let renamed = try FileOperations.perform(
+            .rename(path: created!.path, newName: "renamed.txt"))
+        #expect(renamed == dir.appendingPathComponent("renamed.txt"))
     }
 
     // MARK: trash
@@ -112,6 +124,20 @@ struct FileOperationsTests {
         #expect(throws: FileOperationError.self) {
             try FileOperations.trash(dir.appendingPathComponent("ghost.txt"))
         }
+    }
+
+    @Test func failedTrashMoveNeverFallsBackToPermanentDeletion() throws {
+        enum SimulatedTrashFailure: Error { case unavailable }
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = try FileOperations.createFile(in: dir, name: "keep-me.txt")
+
+        #expect(throws: SimulatedTrashFailure.self) {
+            try FileOperations.trash(url) { _ in
+                throw SimulatedTrashFailure.unavailable
+            }
+        }
+        #expect(FileManager.default.fileExists(atPath: url.path))
     }
 
     // MARK: perform (enum dispatch)

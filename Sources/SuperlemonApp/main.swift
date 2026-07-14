@@ -2,6 +2,7 @@
 // `--smoke` runs headless: session → attach → first flush → "SMOKE OK" → quit.
 
 import AppKit
+import EditorHostKit
 
 let smokeMode = CommandLine.arguments.contains("--smoke")
 
@@ -13,9 +14,9 @@ let smokeMode = CommandLine.arguments.contains("--smoke")
 // global domain's true).
 UserDefaults.standard.set(false, forKey: "ApplePressAndHoldEnabled")
 
-UserDefaults.standard.register(defaults: [
-    NvimController.managedConfigDefaultsKey: true
-])
+// NvimConfigPreferences treats an absent mode as managed. Do not register a
+// synthetic mode value here: a registered value is indistinguishable from an
+// explicit choice and would prevent migration of a legacy CustomInitPath.
 
 // Register bundled symbol fonts (runtime/fonts/, e.g. Fira Code under its
 // OFL license) for THIS PROCESS only — no system install. The renderer's

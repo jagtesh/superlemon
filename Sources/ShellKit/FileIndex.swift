@@ -9,6 +9,26 @@
 
 import Foundation
 
+public struct FileIndexQueryResult: Sendable {
+    public let matches: [(path: String, positions: [Int])]
+    /// Total matches before the display limit is applied.
+    public let matchingCount: Int
+    public let totalCount: Int
+    public let isTruncated: Bool
+
+    public init(
+        matches: [(path: String, positions: [Int])],
+        matchingCount: Int,
+        totalCount: Int,
+        isTruncated: Bool
+    ) {
+        self.matches = matches
+        self.matchingCount = matchingCount
+        self.totalCount = totalCount
+        self.isTruncated = isTruncated
+    }
+}
+
 public actor FileIndex {
 
     /// Default hard cap on indexed files.
@@ -20,10 +40,12 @@ public actor FileIndex {
 
     /// Relative paths ordered by modification date, newest first.
     private var files: [String] = []
+    /// True when the last completed walk found more files than `maxFiles`.
+    public private(set) var isTruncated = false
 
     public init(root: URL, maxFiles: Int = FileIndex.defaultMaxFiles) {
         self.root = root.standardizedFileURL
-        self.maxFiles = maxFiles
+        self.maxFiles = max(0, maxFiles)
     }
 
     /// All indexed relative paths, most recently modified first.
@@ -46,10 +68,15 @@ public actor FileIndex {
             options: [] // hidden files included; .gitignore decides, .git skipped below
         ) else {
             files = []
+            isTruncated = false
             return
         }
 
+        var truncated = false
         for case let url as URL in enumerator {
+            // A superseded root refresh should leave the last complete index
+            // intact instead of publishing a partial walk.
+            if Task.isCancelled { return }
             let values = try? url.resourceValues(forKeys: Set(keys))
             let isDirectory = values?.isDirectory ?? false
             let relative = relativePath(of: url.standardizedFileURL.path, under: rootPath)
@@ -64,34 +91,111 @@ public actor FileIndex {
             if ignore.matches(relative, isDirectory: false) { continue }
 
             collected.append((relative, values?.contentModificationDate ?? .distantPast))
-            if collected.count >= maxFiles { break }
+            // Read one item beyond the cap so the UI can distinguish exactly
+            // `maxFiles` files from a truncated index.
+            if collected.count > maxFiles {
+                collected.removeLast()
+                truncated = true
+                break
+            }
         }
 
+        if Task.isCancelled { return }
         collected.sort { lhs, rhs in
             lhs.mtime != rhs.mtime ? lhs.mtime > rhs.mtime : lhs.path < rhs.path
         }
         files = collected.map(\.path)
+        isTruncated = truncated
     }
 
     /// Fuzzy query over the index. Empty query returns the most recently
     /// modified files first; otherwise
     /// results are ranked by FuzzyScorer, best first.
     public func query(_ q: String, limit: Int = 50) -> [(path: String, positions: [Int])] {
+        rankedQuery(q, limit: limit).matches
+    }
+
+    private func rankedQuery(
+        _ q: String, limit: Int
+    ) -> (matches: [(path: String, positions: [Int])], matchingCount: Int) {
+        let retainedLimit = max(0, limit)
         if q.isEmpty {
-            return files.prefix(limit).map { ($0, []) }
+            return (files.prefix(retainedLimit).map { ($0, []) }, files.count)
         }
-        var scored: [(path: String, positions: [Int], score: Double)] = []
-        for path in files {
-            if let (score, positions) = FuzzyScorer.score(query: q, candidate: path) {
-                scored.append((path, positions, score))
-            }
-        }
-        scored.sort { lhs, rhs in
+        typealias Scored = (path: String, positions: [Int], score: Double)
+        // A worst-at-root bounded heap keeps memory at O(limit) and makes
+        // every retained insertion O(log limit), instead of sorting all
+        // project matches or shifting an O(limit) sorted array per match.
+        var heap: [Scored] = []
+        heap.reserveCapacity(min(retainedLimit, files.count))
+        var matchingCount = 0
+
+        @inline(__always)
+        func ranksBefore(_ lhs: Scored, _ rhs: Scored) -> Bool {
             if lhs.score != rhs.score { return lhs.score > rhs.score }
             if lhs.path.count != rhs.path.count { return lhs.path.count < rhs.path.count }
             return lhs.path < rhs.path
         }
-        return scored.prefix(limit).map { ($0.path, $0.positions) }
+
+        @inline(__always)
+        func isWorse(_ lhs: Scored, than rhs: Scored) -> Bool {
+            ranksBefore(rhs, lhs)
+        }
+
+        func siftUp(_ index: Int, in heap: inout [Scored]) {
+            var child = index
+            while child > 0 {
+                let parent = (child - 1) / 2
+                guard isWorse(heap[child], than: heap[parent]) else { return }
+                heap.swapAt(child, parent)
+                child = parent
+            }
+        }
+
+        func siftDown(_ index: Int, in heap: inout [Scored]) {
+            var parent = index
+            while true {
+                let left = parent * 2 + 1
+                guard left < heap.count else { return }
+                let right = left + 1
+                var worstChild = left
+                if right < heap.count, isWorse(heap[right], than: heap[left]) {
+                    worstChild = right
+                }
+                guard isWorse(heap[worstChild], than: heap[parent]) else { return }
+                heap.swapAt(parent, worstChild)
+                parent = worstChild
+            }
+        }
+
+        for (offset, path) in files.enumerated() {
+            if offset.isMultiple(of: 256), Task.isCancelled { return ([], 0) }
+            if let (score, positions) = FuzzyScorer.score(query: q, candidate: path) {
+                matchingCount += 1
+                guard retainedLimit > 0 else { continue }
+                let candidate: Scored = (path, positions, score)
+                if heap.count < retainedLimit {
+                    heap.append(candidate)
+                    siftUp(heap.count - 1, in: &heap)
+                } else if let worst = heap.first, ranksBefore(candidate, worst) {
+                    heap[0] = candidate
+                    siftDown(0, in: &heap)
+                }
+            }
+        }
+        heap.sort(by: ranksBefore)
+        return (heap.map { ($0.path, $0.positions) }, matchingCount)
+    }
+
+    /// One actor hop for Quick Open: results and count/truncation metadata are
+    /// guaranteed to describe the same completed index generation.
+    public func search(_ q: String, limit: Int = 50) -> FileIndexQueryResult {
+        let ranked = rankedQuery(q, limit: limit)
+        return FileIndexQueryResult(
+            matches: ranked.matches,
+            matchingCount: ranked.matchingCount,
+            totalCount: files.count,
+            isTruncated: isTruncated)
     }
 
     private func relativePath(of path: String, under rootPath: String) -> String {

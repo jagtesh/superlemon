@@ -10,12 +10,48 @@ import NvimKit
 import ShellKit
 import SurfaceKit
 
+private struct WorkspaceFileMutationResult: Sendable {
+    let errorDescription: String?
+    let resultingPath: String?
+    var succeeded: Bool { errorDescription == nil }
+}
+
+enum QuickOpenSelectionError: Error, Equatable, LocalizedError {
+    case outsideWorkspace(String)
+    case notAFile(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .outsideWorkspace(let path):
+            return "The selected result is outside the current workspace: \(path)"
+        case .notAFile(let path):
+            return "The selected file no longer exists: \(path)"
+        }
+    }
+}
+
+/// Serializes sidebar mutations away from the main actor. Besides keeping
+/// FileManager I/O off the UI thread, this prevents two rapid context-menu
+/// actions from racing each other against the same path.
+private actor WorkspaceFileMutationQueue {
+    func perform(_ operation: FileOperation) -> WorkspaceFileMutationResult {
+        do {
+            let result = try FileOperations.perform(operation)
+            return WorkspaceFileMutationResult(
+                errorDescription: nil, resultingPath: result?.path)
+        } catch {
+            return WorkspaceFileMutationResult(
+                errorDescription: error.localizedDescription, resultingPath: nil)
+        }
+    }
+}
+
 @MainActor
-final class WorkspaceChrome {
+public final class WorkspaceChrome {
     let chromeState = ChromeState()
     let cmdlinePanel: CmdlinePanelController
     let popupMenu: PopupMenuPanelController
-    let toasts = MessageToastController()
+    public let toasts = MessageToastController()
 
     let statusBar = StatusBarView()
     let sidebar = FileTreeSidebarView()
@@ -31,18 +67,23 @@ final class WorkspaceChrome {
     ) -> Void)?
     /// The default Neovim save mapping requests the native sheet for an
     /// unnamed buffer. AppDelegate supplies the document-panel presentation.
-    var onSaveAsRequested: (() -> Void)?
-    private(set) var nativeTabs = false
-    private(set) var nativeStatusbar = false
-    private(set) var nativeMinimap = true
+    public var onSaveAsRequested: (() -> Void)?
+    public private(set) var nativeTabs = false
+    public private(set) var nativeStatusbar = false
+    public private(set) var nativeMinimap = true
     private(set) var nativeScrollbars = false
 
     private unowned let controller: NvimController
     private weak var window: NSWindow?
     private weak var surface: GridSurfaceView?
-    private(set) var projectRoot: URL
+    public private(set) var projectRoot: URL
     /// Invalidates quick-open work started against an earlier project root.
     private var fileIndexGeneration = 0
+    private var quickOpenQueryGeneration: UInt64 = 0
+    private var quickOpenQueryTask: Task<Void, Never>?
+    private var workspaceRefreshTask: Task<Void, Never>?
+    private let fileMutationQueue = WorkspaceFileMutationQueue()
+    private let fileWatcher = WorkspaceFileWatcher()
     private var confirmAlertShowing = false
     /// Identity of the last-presented popup menu: selection changes preserve
     /// it; anything else forces a re-anchor (see syncChrome).
@@ -84,6 +125,7 @@ final class WorkspaceChrome {
         sidebar.setRoot(projectRoot)
         statusBar.render(StatusModel(project: projectRoot.lastPathComponent), dark: isDark)
         Task { await fileIndex.refresh() }
+        startWorkspaceWatcher()
     }
 
     /// Re-roots all native workspace chrome after Neovim changes directory.
@@ -97,6 +139,10 @@ final class WorkspaceChrome {
         // produced its rows. Plugin palettes get their normal close callback;
         // the built-in palette simply dismisses and restores editor focus.
         uiRouter.closePaletteSession()
+        cancelQuickOpenQuery()
+        workspaceRefreshTask?.cancel()
+        workspaceRefreshTask = nil
+        fileWatcher.stop()
         quickOpen.close()
 
         fileIndexGeneration &+= 1
@@ -113,6 +159,7 @@ final class WorkspaceChrome {
 
         let index = fileIndex
         Task { await index.refresh() }
+        startWorkspaceWatcher()
     }
 
     // MARK: - Redraw / notification entry points (called by NvimController)
@@ -126,6 +173,7 @@ final class WorkspaceChrome {
         case "superlemon.status":
             guard let payload = params.first, payload.mapValue != nil else { return }
             statusBar.render(statusModel(from: payload), dark: isDark)
+            controller.updateEditorCommandState(payload)
         case "superlemon.font":
             let delta = params.first?["delta"]?.intValue ?? 0
             controller.bumpFont(delta: delta)
@@ -379,34 +427,27 @@ final class WorkspaceChrome {
 
     private func wireShell() {
         quickOpen.onQueryChange = { [weak self] query in
-            guard let self else { return }
-            let index = self.fileIndex
-            let generation = self.fileIndexGeneration
-            Task {
-                let results = await index.query(query)
-                let total = await index.count()
-                guard generation == self.fileIndexGeneration else { return }
-                self.quickOpen.display(
-                    results: results.map { QuickOpenResult(path: $0.path, positions: $0.positions) },
-                    totalCount: total)
-            }
+            self?.queryQuickOpen(query)
         }
         quickOpen.onOpen = { [weak self] relativePath in
-            guard let self else { return }
-            self.controller.openFile(self.projectRoot.appendingPathComponent(relativePath).path)
+            self?.openQuickOpenSelection(relativePath)
         }
         quickOpen.onClose = { [weak self] in
+            self?.cancelQuickOpenQuery()
             self?.restoreFocus?()
         }
 
         tabStrip.onSelect = { [weak self] bufnr in
             self?.controller.switchToBuffer(bufnr)
+            self?.restoreFocus?()
         }
         tabStrip.onClose = { [weak self] bufnr in
             self?.controller.closeBuffer(bufnr)
+            self?.restoreFocus?()
         }
         tabStrip.onPromote = { [weak self] bufnr in
             self?.controller.promoteBuffer(bufnr)
+            self?.restoreFocus?()
         }
 
         // VS Code/Sublime semantics: single-click previews (italic tab,
@@ -417,24 +458,298 @@ final class WorkspaceChrome {
         sidebar.onOpenFilePermanently = { [weak self] absolutePath in
             self?.controller.openFilePermanently(absolutePath)
         }
+        sidebar.onRequestEditorFocus = { [weak self] in
+            self?.restoreFocus?()
+        }
+        sidebar.onRequestCreateItem = { [weak self] directory, kind in
+            self?.presentCreatePrompt(in: directory, kind: kind)
+        }
         sidebar.onFileOperation = { [weak self] op in
             guard let self else { return }
             switch op {
             case .revealInFinder(let path):
                 NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+                self.restoreFocus?()
             case .rename(let path, _), .trash(let path):
-                try? FileOperations.perform(op)
-                self.sidebar.reload(path: (path as NSString).deletingLastPathComponent)
-                Task { await self.fileIndex.refresh() }
+                self.performFileOperation(
+                    op, reloadPath: (path as NSString).deletingLastPathComponent)
             case .newFile(let dir, _), .newFolder(let dir, _):
-                try? FileOperations.perform(op)
-                self.sidebar.reload(path: dir)
-                Task { await self.fileIndex.refresh() }
+                self.performFileOperation(op, reloadPath: dir)
+            }
+        }
+        fileWatcher.onChange = { [weak self] batch in
+            self?.workspaceFilesChanged(batch)
+        }
+    }
+
+    private func queryQuickOpen(_ query: String) {
+        quickOpenQueryTask?.cancel()
+        quickOpenQueryGeneration &+= 1
+        let queryGeneration = quickOpenQueryGeneration
+        let indexGeneration = fileIndexGeneration
+        let presentationGeneration = quickOpen.presentationGeneration
+        let index = fileIndex
+
+        quickOpenQueryTask = Task { [weak self] in
+            let response = await index.search(query)
+            guard !Task.isCancelled, let self,
+                queryGeneration == self.quickOpenQueryGeneration,
+                indexGeneration == self.fileIndexGeneration,
+                presentationGeneration == self.quickOpen.presentationGeneration,
+                self.quickOpen.sessionActive,
+                self.quickOpen.query == query
+            else { return }
+            _ = self.quickOpen.display(
+                results: response.matches.map {
+                    QuickOpenResult(path: $0.path, positions: $0.positions)
+                },
+                totalCount: response.totalCount,
+                isTruncated: response.isTruncated,
+                matchingCount: query.isEmpty ? nil : response.matchingCount,
+                presentationGeneration: presentationGeneration)
+            self.quickOpenQueryTask = nil
+        }
+    }
+
+    private func cancelQuickOpenQuery() {
+        quickOpenQueryGeneration &+= 1
+        quickOpenQueryTask?.cancel()
+        quickOpenQueryTask = nil
+    }
+
+    /// A displayed result can become stale between an FSEvents batch and the
+    /// user's Return key. Revalidate it off the main actor, then reject both
+    /// an obsolete workspace generation and a deleted/directory result before
+    /// asking Neovim to open anything.
+    private func openQuickOpenSelection(_ relativePath: String) {
+        let generation = fileIndexGeneration
+        let root = projectRoot
+        let index = fileIndex
+        Task { [weak self] in
+            let result = await Task.detached(priority: .userInitiated) {
+                do {
+                    return Result<URL, QuickOpenSelectionError>.success(
+                        try Self.validatedQuickOpenURL(
+                            relativePath: relativePath, projectRoot: root))
+                } catch let error as QuickOpenSelectionError {
+                    return .failure(error)
+                } catch {
+                    return .failure(.notAFile(relativePath))
+                }
+            }.value
+            guard let self, generation == self.fileIndexGeneration,
+                root == self.projectRoot
+            else { return }
+
+            switch result {
+            case .success(let url):
+                self.controller.openFile(url.path)
+            case .failure(let error):
+                await index.refresh()
+                guard generation == self.fileIndexGeneration else { return }
+                self.presentQuickOpenSelectionError(error)
             }
         }
     }
 
-    func presentQuickOpen() {
+    nonisolated static func validatedQuickOpenURL(
+        relativePath: String, projectRoot: URL
+    ) throws -> URL {
+        let root = projectRoot.standardizedFileURL
+        let candidate = root.appendingPathComponent(relativePath).standardizedFileURL
+        let rootPath = root.path
+        guard candidate.path != rootPath,
+            candidate.path.hasPrefix(rootPath == "/" ? "/" : rootPath + "/")
+        else {
+            throw QuickOpenSelectionError.outsideWorkspace(candidate.path)
+        }
+        var isDirectory = ObjCBool(false)
+        guard FileManager.default.fileExists(
+            atPath: candidate.path, isDirectory: &isDirectory), !isDirectory.boolValue
+        else {
+            throw QuickOpenSelectionError.notAFile(candidate.path)
+        }
+        return candidate
+    }
+
+    private func presentQuickOpenSelectionError(_ error: QuickOpenSelectionError) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Couldn’t Open Quick Open Result"
+        alert.informativeText = error.localizedDescription
+        alert.addButton(withTitle: "OK")
+        if let window { alert.beginSheetModal(for: window) }
+    }
+
+    private func performFileOperation(
+        _ operation: FileOperation,
+        reloadPath: String,
+        restoreEditorFocus: Bool = true,
+        onSuccess: ((String?) async -> Void)? = nil,
+        onFailure: ((String) -> Void)? = nil
+    ) {
+        let generation = fileIndexGeneration
+        let index = fileIndex
+        Task { [weak self] in
+            guard let self else { return }
+            let result = await self.fileMutationQueue.perform(operation)
+            guard generation == self.fileIndexGeneration else {
+                if restoreEditorFocus { self.restoreFocus?() }
+                return
+            }
+            if result.succeeded {
+                self.sidebar.reload(path: reloadPath)
+                await index.refresh()
+                guard generation == self.fileIndexGeneration else {
+                    if restoreEditorFocus { self.restoreFocus?() }
+                    return
+                }
+                await self.sidebar.waitForPendingLoads()
+                await onSuccess?(result.resultingPath)
+            } else if let description = result.errorDescription {
+                if case .rename(let path, _) = operation {
+                    self.sidebar.rollbackInlineRename(path: path)
+                }
+                if let onFailure {
+                    onFailure(description)
+                } else {
+                    self.presentFileOperationError(operation, description: description)
+                }
+            }
+            if restoreEditorFocus { self.restoreFocus?() }
+        }
+    }
+
+    private func presentCreatePrompt(
+        in directory: String,
+        kind: FileTreeCreateKind,
+        proposedName: String = "",
+        errorDescription: String? = nil
+    ) {
+        let noun = kind == .file ? "File" : "Folder"
+        let alert = NSAlert()
+        alert.messageText = "New \(noun)"
+        alert.informativeText = errorDescription ?? "Enter a name for the new \(noun.lowercased())."
+        if errorDescription != nil { alert.alertStyle = .warning }
+        let nameField = NSTextField(string: proposedName)
+        nameField.placeholderString = kind == .file ? "example.swift" : "Folder name"
+        nameField.frame.size = NSSize(width: 320, height: 24)
+        nameField.setAccessibilityLabel("New \(noun) name")
+        alert.accessoryView = nameField
+        alert.addButton(withTitle: "Create")
+        alert.addButton(withTitle: "Cancel")
+
+        let submit: (NSApplication.ModalResponse) -> Void = { [weak self, weak nameField] response in
+            guard response == .alertFirstButtonReturn, let self, let nameField else {
+                self?.restoreFocus?()
+                return
+            }
+            let name = nameField.stringValue
+            do {
+                _ = try FileOperations.validateName(name)
+            } catch {
+                self.presentCreatePrompt(
+                    in: directory, kind: kind, proposedName: name,
+                    errorDescription: error.localizedDescription)
+                return
+            }
+
+            let operation: FileOperation = kind == .file
+                ? .newFile(directory: directory, name: name)
+                : .newFolder(directory: directory, name: name)
+            self.performFileOperation(
+                operation,
+                reloadPath: directory,
+                restoreEditorFocus: false,
+                onSuccess: { [weak self] resultingPath in
+                    guard let self, let resultingPath else { return }
+                    if !self.sidebar.selectItem(
+                        path: resultingPath, focus: kind == .folder)
+                    {
+                        _ = await self.sidebar.revealCreatedItem(
+                            path: resultingPath, focus: kind == .folder)
+                    }
+                    if kind == .file {
+                        self.controller.openFilePermanently(resultingPath)
+                        self.restoreFocus?()
+                    }
+                },
+                onFailure: { [weak self] description in
+                    self?.presentCreatePrompt(
+                        in: directory, kind: kind, proposedName: name,
+                        errorDescription: description)
+                })
+        }
+
+        if let window {
+            alert.beginSheetModal(for: window, completionHandler: submit)
+            DispatchQueue.main.async { [weak alert, weak nameField] in
+                guard let alert, let nameField else { return }
+                alert.window.makeFirstResponder(nameField)
+                nameField.currentEditor()?.selectAll(nil)
+            }
+        } else {
+            submit(alert.runModal())
+        }
+    }
+
+    private func startWorkspaceWatcher() {
+        do {
+            try fileWatcher.start(watching: projectRoot)
+        } catch {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "Workspace Monitoring Unavailable"
+            alert.informativeText = error.localizedDescription
+            alert.addButton(withTitle: "OK")
+            if let window { alert.beginSheetModal(for: window) }
+        }
+    }
+
+    private func workspaceFilesChanged(_ batch: WorkspaceFileChangeBatch) {
+        let gitPath = projectRoot.appendingPathComponent(".git").path
+        let relevantPaths = Set(batch.paths.filter {
+            $0 != gitPath && !$0.hasPrefix(gitPath + "/")
+        })
+        guard !relevantPaths.isEmpty || batch.requiresFullRescan else { return }
+
+        workspaceRefreshTask?.cancel()
+        let generation = fileIndexGeneration
+        let index = fileIndex
+        sidebar.reload(
+            changedPaths: relevantPaths,
+            requiresFullRescan: batch.requiresFullRescan)
+        workspaceRefreshTask = Task { [weak self] in
+            await index.refresh()
+            guard !Task.isCancelled, let self,
+                generation == self.fileIndexGeneration
+            else { return }
+            self.workspaceRefreshTask = nil
+        }
+    }
+
+    private func presentFileOperationError(_ operation: FileOperation, description: String) {
+        let action: String
+        switch operation {
+        case .newFile: action = "Create File"
+        case .newFolder: action = "Create Folder"
+        case .rename: action = "Rename Item"
+        case .trash: action = "Move Item to Trash"
+        case .revealInFinder: return
+        }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Couldn’t \(action)"
+        alert.informativeText = description
+        alert.addButton(withTitle: "OK")
+        if let window {
+            alert.beginSheetModal(for: window)
+        } else {
+            alert.runModal()
+        }
+    }
+
+    public func presentQuickOpen() {
         // ⌘P during a plugin palette session: end the session first so the
         // built-in file-picker wiring (restored on session close) is live.
         uiRouter.closePaletteSession()

@@ -1,0 +1,32 @@
+{
+  "neovim": {
+    "version": "0.12.4",
+    "minimumVersion": "0.12.0",
+    "license": "Apache-2.0 AND Vim",
+    "licenseSource": "https://raw.githubusercontent.com/neovim/neovim/v0.12.4/LICENSE.txt",
+    "licenseSha256": "de23202ef9a51f5e654034190539739a4abece5505f2ce75e780791106707011",
+    "source": "https://github.com/neovim/neovim/tree/v0.12.4",
+    "architectures": {
+      "arm64": {
+        "asset": "nvim-macos-arm64",
+        "url": "https://github.com/neovim/neovim/releases/download/v0.12.4/nvim-macos-arm64.tar.gz",
+        "sha256": "51ab83afa66d663627c2ab1be43209b0f4e81360d4598b53efaa4d8195f24c89"
+      },
+      "x86_64": {
+        "asset": "nvim-macos-x86_64",
+        "url": "https://github.com/neovim/neovim/releases/download/v0.12.4/nvim-macos-x86_64.tar.gz",
+        "sha256": "03fe16f8dd9f1e9eaf52d5e294913a39917b9e2faea30d7fb0fb385fbd36fe59"
+      }
+    }
+  },
+  "firaCodeNerdFont": {
+    "version": "Fira Code 6.002; Nerd Fonts 3.4.0",
+    "postScriptName": "FiraCodeNFM-Reg",
+    "license": "OFL-1.1",
+    "source": "https://github.com/ryanoasis/nerd-fonts/releases/tag/v3.4.0",
+    "fontPath": "runtime/fonts/FiraCodeNerdFontMono-Regular.ttf",
+    "fontSha256": "ad88c69cb6a497db9f2714e4b414817aabbee621484a1560bfdb3fd73abdd564",
+    "licensePath": "runtime/fonts/LICENSE-FiraCode-NerdFont.txt",
+    "licenseSha256": "1d41e10031ab125302780a05ec4c91d218e47db0c7e37cf315cce5e608cdc25c"
+  }
+}

@@ -18,6 +18,15 @@ private func allStrings(in view: NSView) -> [String] {
 }
 
 @MainActor
+private func button(in view: NSView, titled title: String) -> NSButton? {
+    if let button = view as? NSButton, button.title == title { return button }
+    for subview in view.subviews {
+        if let found = button(in: subview, titled: title) { return found }
+    }
+    return nil
+}
+
+@MainActor
 private func makeFixtureRoot() throws -> URL {
     let fm = FileManager.default
     let root = fm.temporaryDirectory
@@ -107,6 +116,14 @@ struct QuickOpenPanelTests {
         ]
     }
 
+    private func activeController(
+        queryDebounce: Duration = .milliseconds(50)
+    ) -> QuickOpenPanelController {
+        let controller = QuickOpenPanelController(queryDebounce: queryDebounce)
+        controller.present(over: nil)
+        return controller
+    }
+
     @Test func panelGeometryMatchesNorthstar() {
         let controller = QuickOpenPanelController()
         #expect(controller.panel.frame.size == NSSize(width: 498, height: 346))
@@ -115,7 +132,7 @@ struct QuickOpenPanelTests {
     }
 
     @Test func displayShowsLiveCountAndSelectsFirstRow() {
-        let controller = QuickOpenPanelController()
+        let controller = activeController()
         controller.display(results: makeResults(), totalCount: 32)
 
         #expect(controller.countLabel.stringValue == "32 files")
@@ -128,14 +145,14 @@ struct QuickOpenPanelTests {
     }
 
     @Test func cellsRenderTwoLinesWithFilenameAndDirectory() throws {
-        let controller = QuickOpenPanelController()
+        let controller = activeController()
         controller.display(results: makeResults(), totalCount: 3)
 
         let cell = try #require(controller.tableView(
             controller.tableView,
             viewFor: controller.tableView.tableColumns[0],
             row: 0
-        ) as? NSView)
+        ))
 
         let strings = allStrings(in: cell)
         #expect(strings.contains("index.astro"))   // primary line = basename
@@ -156,7 +173,7 @@ struct QuickOpenPanelTests {
     }
 
     @Test func arrowKeysMoveSelectionWithClamping() {
-        let controller = QuickOpenPanelController()
+        let controller = activeController()
         controller.display(results: makeResults(), totalCount: 3)
 
         controller.moveSelection(by: 1)
@@ -169,7 +186,7 @@ struct QuickOpenPanelTests {
     }
 
     @Test func openSelectionFiresOnOpenThenOnClose() {
-        let controller = QuickOpenPanelController()
+        let controller = activeController()
         var opened: [String] = []
         var closed = 0
         controller.onOpen = { opened.append($0) }
@@ -213,16 +230,65 @@ struct QuickOpenPanelTests {
         parent.orderOut(nil)
     }
 
-    @Test func queryChangeCallbackFires() {
-        let controller = QuickOpenPanelController()
+    @Test func queryChangeCallbackIsDebouncedToLatestText() async throws {
+        let controller = activeController(queryDebounce: .milliseconds(10))
         var queries: [String] = []
         controller.onQueryChange = { queries.append($0) }
 
+        controller.searchField.stringValue = "i"
+        controller.controlTextDidChange(
+            Notification(name: NSControl.textDidChangeNotification, object: controller.searchField)
+        )
         controller.searchField.stringValue = "idx"
         controller.controlTextDidChange(
             Notification(name: NSControl.textDidChangeNotification, object: controller.searchField)
         )
+        await controller.waitForPendingQueryChange()
         #expect(queries == ["idx"])
+    }
+
+    @Test func closedSessionRejectsLateResults() {
+        let controller = activeController()
+        let generation = controller.presentationGeneration
+        controller.close()
+
+        let accepted = controller.display(
+            results: makeResults(), totalCount: 3,
+            presentationGeneration: generation)
+        #expect(!accepted)
+        #expect(controller.results.isEmpty)
+        #expect(!controller.sessionActive)
+    }
+
+    @Test func countDistinguishesFilesMatchesAndTruncatedIndexes() {
+        let controller = activeController()
+        controller.display(results: makeResults(), totalCount: 50_000, isTruncated: true)
+        #expect(controller.countLabel.stringValue == "50,000+ indexed")
+
+        controller.display(
+            results: makeResults(), totalCount: 50_000, isTruncated: true,
+            matchingCount: 120)
+        #expect(controller.countLabel.stringValue == "120 matches (partial)")
+        #expect(controller.countLabel.toolTip?.contains("top 3") == true)
+
+        controller.display(results: [], totalCount: 50_000, matchingCount: 0)
+        #expect(controller.countLabel.stringValue == "0 matches")
+    }
+
+    @Test func panelClampsInsideSmallParentContent() {
+        let parent = NSWindow(
+            contentRect: NSRect(x: 100, y: 100, width: 320, height: 240),
+            styleMask: [.borderless], backing: .buffered, defer: false)
+        parent.contentView = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
+        let controller = QuickOpenPanelController()
+        controller.present(over: parent)
+
+        let available = parent.convertToScreen(
+            parent.contentView!.convert(parent.contentView!.bounds, to: nil))
+        #expect(controller.panel.frame.width <= available.width)
+        #expect(controller.panel.frame.height <= available.height)
+        #expect(available.contains(controller.panel.frame))
+        controller.close()
     }
 }
 
@@ -232,7 +298,29 @@ struct QuickOpenPanelTests {
 @MainActor
 struct FileTreeSidebarTests {
 
-    @Test func rendersRootRowsHeadless() throws {
+    private func makeRefreshFixture(rootFileCount: Int = 0) throws -> URL {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory
+            .appendingPathComponent("ShellKitRefresh-\(UUID().uuidString)")
+        for directory in ["src/deep", "docs"] {
+            try fm.createDirectory(
+                at: root.appendingPathComponent(directory),
+                withIntermediateDirectories: true)
+        }
+        for file in ["src/app.js", "src/deep/leaf.md", "docs/guide.md"] {
+            fm.createFile(
+                atPath: root.appendingPathComponent(file).path, contents: Data())
+        }
+        for index in 0..<rootFileCount {
+            fm.createFile(
+                atPath: root.appendingPathComponent(
+                    String(format: "file-%03d.txt", index)).path,
+                contents: Data())
+        }
+        return root
+    }
+
+    @Test func rendersRootRowsHeadless() async throws {
         let root = try makeFixtureRoot()
         defer { try? FileManager.default.removeItem(at: root) }
 
@@ -240,6 +328,7 @@ struct FileTreeSidebarTests {
             frame: NSRect(x: 0, y: 0, width: 370, height: 600)
         )
         sidebar.setRoot(root)
+        await sidebar.waitForPendingLoads()
         sidebar.outlineView.layoutSubtreeIfNeeded()
 
         #expect(sidebar.outlineView.numberOfRows == 3) // src, main.swift, notes.md
@@ -259,22 +348,107 @@ struct FileTreeSidebarTests {
         #expect(names.contains("notes.md"))
     }
 
-    @Test func expandingDirectoryRevealsChildren() throws {
+    @Test func expandingDirectoryRevealsChildren() async throws {
         let root = try makeFixtureRoot()
         defer { try? FileManager.default.removeItem(at: root) }
 
         let sidebar = FileTreeSidebarView(frame: NSRect(x: 0, y: 0, width: 370, height: 600))
         sidebar.setRoot(root)
+        await sidebar.waitForPendingLoads()
 
         let srcRow = (0..<sidebar.outlineView.numberOfRows).first {
             (sidebar.outlineView.item(atRow: $0) as? FileTreeNode)?.name == "src"
         }
         let srcNode = sidebar.outlineView.item(atRow: try #require(srcRow)) as? FileTreeNode
         sidebar.outlineView.expandItem(srcNode)
+        await sidebar.waitForPendingLoads()
+        sidebar.outlineView.expandItem(srcNode)
         #expect(sidebar.outlineView.numberOfRows == 4) // + app.js
     }
 
-    @Test func hiddenFilesToggleReloads() throws {
+    @Test func rowSelectionAndDisclosureActionsRequestEditorFocus() async throws {
+        let root = try makeFixtureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sidebar = FileTreeSidebarView(frame: .zero)
+        sidebar.setRoot(root)
+        await sidebar.waitForPendingLoads()
+
+        let srcRow = try #require((0..<sidebar.outlineView.numberOfRows).first {
+            (sidebar.outlineView.item(atRow: $0) as? FileTreeNode)?.name == "src"
+        })
+        let fileRow = try #require((0..<sidebar.outlineView.numberOfRows).first {
+            (sidebar.outlineView.item(atRow: $0) as? FileTreeNode)?.name == "main.swift"
+        })
+        let srcNode = try #require(
+            sidebar.outlineView.item(atRow: srcRow) as? FileTreeNode)
+        var focusRequests = 0
+        var opened: [String] = []
+        sidebar.onRequestEditorFocus = { focusRequests += 1 }
+        sidebar.onOpenFile = { opened.append($0) }
+
+        focusRequests = 0
+        sidebar.performRowAction(row: srcRow, isDoubleClick: false)
+        #expect(focusRequests == 1, "a directory row click must return focus")
+
+        focusRequests = 0
+        sidebar.performRowAction(row: fileRow, isDoubleClick: false)
+        #expect(focusRequests == 1)
+        #expect(opened.last == root.appendingPathComponent("main.swift").path)
+
+        focusRequests = 0
+        sidebar.outlineView.selectRowIndexes(
+            IndexSet(integer: srcRow), byExtendingSelection: false)
+        sidebar.outlineViewSelectionDidChange(Notification(
+            name: NSOutlineView.selectionDidChangeNotification,
+            object: sidebar.outlineView))
+        #expect(focusRequests >= 1, "selection changes must return focus")
+
+        focusRequests = 0
+        #expect(sidebar.outlineView(sidebar.outlineView, shouldExpandItem: srcNode))
+        #expect(focusRequests == 1, "disclosure expansion must return focus")
+
+        focusRequests = 0
+        #expect(sidebar.outlineView(sidebar.outlineView, shouldCollapseItem: srcNode))
+        #expect(focusRequests == 1, "disclosure collapse must return focus")
+        await sidebar.waitForPendingLoads()
+    }
+
+    @Test func failedInlineRenameRollsVisibleTextBackToModelName() async throws {
+        let root = try makeFixtureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sidebar = FileTreeSidebarView(frame: .zero)
+        sidebar.setRoot(root)
+        await sidebar.waitForPendingLoads()
+
+        let row = try #require((0..<sidebar.outlineView.numberOfRows).first {
+            (sidebar.outlineView.item(atRow: $0) as? FileTreeNode)?.name == "main.swift"
+        })
+        let node = try #require(sidebar.outlineView.item(atRow: row) as? FileTreeNode)
+        var operations: [FileOperation] = []
+        var focusRequests = 0
+        sidebar.onFileOperation = { operations.append($0) }
+        sidebar.onRequestEditorFocus = { focusRequests += 1 }
+
+        sidebar.beginRename(of: node)
+        let editingCell = try #require(sidebar.outlineView.view(
+            atColumn: 0, row: row, makeIfNecessary: true) as? FileTreeCellView)
+        editingCell.commitEditingName("invalid/name")
+
+        #expect(editingCell.displayedName == "invalid/name")
+        #expect(operations == [.rename(
+            path: root.appendingPathComponent("main.swift").path,
+            newName: "invalid/name")])
+        #expect(focusRequests == 1)
+
+        // Simulate the embedder's failure callback. No filesystem mutation
+        // occurred, so reloading the row must restore the node's original name.
+        #expect(sidebar.rollbackInlineRename(path: node.url.path))
+        let rolledBackCell = try #require(sidebar.outlineView.view(
+            atColumn: 0, row: row, makeIfNecessary: true) as? FileTreeCellView)
+        #expect(rolledBackCell.displayedName == "main.swift")
+    }
+
+    @Test func hiddenFilesToggleReloads() async throws {
         let root = try makeFixtureRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         FileManager.default.createFile(
@@ -283,6 +457,7 @@ struct FileTreeSidebarTests {
 
         let sidebar = FileTreeSidebarView(frame: .zero)
         sidebar.setRoot(root)
+        await sidebar.waitForPendingLoads()
         #expect(sidebar.outlineView.numberOfRows == 3)
         sidebar.showsHiddenFiles = true
         #expect(sidebar.outlineView.numberOfRows == 4)
@@ -298,28 +473,38 @@ struct FileTreeSidebarTests {
             == ShellPalette.fileTypeColor(forExtension: "json", dark: false))
     }
 
-    @Test func contextMenuListsExpectedItems() throws {
+    @Test func contextMenuListsExpectedItems() async throws {
         let root = try makeFixtureRoot()
         defer { try? FileManager.default.removeItem(at: root) }
 
         let sidebar = FileTreeSidebarView(frame: .zero)
         sidebar.setRoot(root)
+        await sidebar.waitForPendingLoads()
 
         let menu = try #require(sidebar.outlineView.menu)
         sidebar.menuNeedsUpdate(menu)
 
         let titles = menu.items.filter { !$0.isSeparatorItem }.map(\.title)
-        #expect(titles == ["New File", "New Folder", "Rename", "Delete", "Reveal in Finder"])
+        #expect(titles == [
+            "New File", "New Folder", "Rename", "Move to Trash", "Reveal in Finder"
+        ])
     }
 
-    @Test func contextMenuActionsEmitFileOperations() throws {
+    @Test func contextMenuActionsRequestNamesAndEmitOtherOperations() async throws {
         let root = try makeFixtureRoot()
         defer { try? FileManager.default.removeItem(at: root) }
 
         let sidebar = FileTreeSidebarView(frame: .zero)
         sidebar.setRoot(root)
+        await sidebar.waitForPendingLoads()
         var operations: [FileOperation] = []
+        var createDirectories: [String] = []
+        var createKinds: [FileTreeCreateKind] = []
         sidebar.onFileOperation = { operations.append($0) }
+        sidebar.onRequestCreateItem = { directory, kind in
+            createDirectories.append(directory)
+            createKinds.append(kind)
+        }
 
         let menu = try #require(sidebar.outlineView.menu)
         sidebar.menuNeedsUpdate(menu)  // clickedRow == -1 → root node
@@ -330,31 +515,373 @@ struct FileTreeSidebarTests {
         }
         fire("New File")
         fire("New Folder")
-        fire("Delete")
+        fire("Move to Trash")
         fire("Reveal in Finder")
 
+        #expect(createDirectories == [
+            root.standardizedFileURL.path, root.standardizedFileURL.path
+        ])
+        #expect(createKinds == [.file, .folder])
         #expect(operations == [
-            .newFile(directory: root.standardizedFileURL.path, name: "untitled"),
-            .newFolder(directory: root.standardizedFileURL.path, name: "untitled folder"),
             .trash(path: root.standardizedFileURL.path),
             .revealInFinder(path: root.standardizedFileURL.path),
         ])
     }
 
-    @Test func openFileCallbackAndReloadAfterOperation() throws {
+    @Test func loadingAndFailureRowsAreVisibleAndRetryable() async throws {
+        enum ListingFailure: Error { case unavailable }
+        final class RecoveringLister: DirectoryLister, @unchecked Sendable {
+            private let lock = NSLock()
+            private var calls = 0
+
+            func list(_ url: URL) throws -> [DirectoryEntry] {
+                let attempt = lock.withLock {
+                    calls += 1
+                    return calls
+                }
+                if attempt == 1 {
+                    Thread.sleep(forTimeInterval: 0.03)
+                    throw ListingFailure.unavailable
+                }
+                return [DirectoryEntry(name: "recovered.swift", isDirectory: false)]
+            }
+        }
+
+        let root = try makeFixtureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sidebar = FileTreeSidebarView(frame: .zero, lister: RecoveringLister())
+        sidebar.setRoot(root)
+
+        // An unloaded directory is represented immediately instead of
+        // looking like an empty folder while its detached read is running.
+        #expect(sidebar.outlineView.numberOfRows == 1)
+        let loadingItem = try #require(sidebar.outlineView.item(atRow: 0))
+        let loadingCell = try #require(sidebar.outlineView(
+            sidebar.outlineView,
+            viewFor: sidebar.outlineView.tableColumns[0],
+            item: loadingItem))
+        #expect(allStrings(in: loadingCell).contains("Loading…"))
+        await sidebar.waitForPendingLoads()
+        guard case .failed = sidebar.rootNode?.loadState else {
+            Issue.record("Expected a failed directory state")
+            return
+        }
+
+        let failureItem = try #require(sidebar.outlineView.item(atRow: 0))
+        let failureCell = try #require(sidebar.outlineView(
+            sidebar.outlineView,
+            viewFor: sidebar.outlineView.tableColumns[0],
+            item: failureItem))
+        #expect(allStrings(in: failureCell).contains("Couldn’t load folder"))
+        let retry = try #require(button(in: failureCell, titled: "Retry"))
+        retry.performClick(nil)
+        await sidebar.waitForPendingLoads()
+
+        #expect(sidebar.rootNode?.loadState == .loaded)
+        let recovered = sidebar.outlineView.item(atRow: 0) as? FileTreeNode
+        #expect(recovered?.name == "recovered.swift")
+    }
+
+    @Test func changedPathsRefreshOnlyTheirExpandedLoadedParentOnce() async throws {
+        let root = try makeRefreshFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let lister = CountingLister()
+        let sidebar = FileTreeSidebarView(
+            frame: NSRect(x: 0, y: 0, width: 370, height: 240), lister: lister)
+        sidebar.setRoot(root)
+        await sidebar.waitForPendingLoads()
+
+        let src = try #require(sidebar.rootNode?.findLoadedNode(
+            path: root.appendingPathComponent("src").path))
+        sidebar.outlineView.expandItem(src)
+        await sidebar.waitForPendingLoads()
+        sidebar.outlineView.expandItem(src)
+        let deep = try #require(sidebar.rootNode?.findLoadedNode(
+            path: root.appendingPathComponent("src/deep").path))
+        sidebar.outlineView.expandItem(deep)
+        await sidebar.waitForPendingLoads()
+        sidebar.outlineView.expandItem(deep)
+
+        let selectedPath = root.appendingPathComponent("src/app.js").path
+        #expect(sidebar.selectItem(path: selectedPath))
+        var focusRequests = 0
+        sidebar.onRequestEditorFocus = { focusRequests += 1 }
+        let callsBeforeRefresh = lister.listedPaths
+
+        for name in ["new-a.swift", "new-b.swift"] {
+            FileManager.default.createFile(
+                atPath: root.appendingPathComponent("src/\(name)").path,
+                contents: Data())
+        }
+        sidebar.reload(changedPaths: Set([
+            root.appendingPathComponent("src/new-a.swift").path,
+            root.appendingPathComponent("src/new-b.swift").path,
+        ]))
+        await sidebar.waitForPendingLoads()
+
+        let refreshCalls = Array(lister.listedPaths.dropFirst(callsBeforeRefresh.count))
+        #expect(refreshCalls == [root.appendingPathComponent("src").path])
+        #expect(sidebar.rootNode?.findLoadedNode(path: src.url.path) === src)
+        #expect(sidebar.rootNode?.findLoadedNode(path: deep.url.path) === deep)
+        #expect(sidebar.outlineView.isItemExpanded(src))
+        #expect(sidebar.outlineView.isItemExpanded(deep))
+        #expect((sidebar.outlineView.item(atRow: sidebar.outlineView.selectedRow)
+            as? FileTreeNode)?.url.path == selectedPath)
+        #expect(focusRequests == 0, "layout restoration must not steal editor focus")
+    }
+
+    @Test func collapsedAndUnloadedBranchesAreNotEnumeratedByEvents() async throws {
+        let root = try makeRefreshFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let lister = CountingLister()
+        let sidebar = FileTreeSidebarView(frame: .zero, lister: lister)
+        sidebar.setRoot(root)
+        await sidebar.waitForPendingLoads()
+
+        let docs = try #require(sidebar.rootNode?.findLoadedNode(
+            path: root.appendingPathComponent("docs").path))
+        let callsAfterRoot = lister.totalCalls
+        FileManager.default.createFile(
+            atPath: root.appendingPathComponent("docs/new.md").path, contents: Data())
+        sidebar.reload(changedPaths: [root.appendingPathComponent("docs/new.md").path])
+        await sidebar.waitForPendingLoads()
+        #expect(docs.loadState == .unloaded)
+        #expect(lister.totalCalls == callsAfterRoot)
+
+        let src = try #require(sidebar.rootNode?.findLoadedNode(
+            path: root.appendingPathComponent("src").path))
+        sidebar.outlineView.expandItem(src)
+        await sidebar.waitForPendingLoads()
+        sidebar.outlineView.expandItem(src)
+        let deep = try #require(sidebar.rootNode?.findLoadedNode(
+            path: root.appendingPathComponent("src/deep").path))
+        sidebar.outlineView.expandItem(deep)
+        await sidebar.waitForPendingLoads()
+        sidebar.outlineView.expandItem(deep)
+        sidebar.outlineView.collapseItem(src)
+        let callsAfterCollapse = lister.totalCalls
+        let added = root.appendingPathComponent("src/deep/while-collapsed.swift")
+        FileManager.default.createFile(atPath: added.path, contents: Data())
+        sidebar.reload(changedPaths: [added.path])
+        await sidebar.waitForPendingLoads()
+        #expect(lister.totalCalls == callsAfterCollapse)
+
+        // Expanding a previously loaded but stale branch refreshes it then,
+        // and still does not enumerate any descendant directory.
+        sidebar.outlineView.expandItem(src)
+        await sidebar.waitForPendingLoads()
+        sidebar.outlineView.expandItem(src)
+        sidebar.outlineView.expandItem(deep)
+        await sidebar.waitForPendingLoads()
+        sidebar.outlineView.expandItem(deep)
+        #expect(Array(lister.listedPaths.dropFirst(callsAfterCollapse)) == [deep.url.path])
+        #expect(sidebar.rootNode?.findLoadedNode(path: added.path) != nil)
+    }
+
+    @Test func revealingCreatedFolderLoadsAndExpandsUnloadedParent() async throws {
+        let root = try makeRefreshFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let lister = CountingLister()
+        let sidebar = FileTreeSidebarView(
+            frame: NSRect(x: 0, y: 0, width: 370, height: 240), lister: lister)
+        let window = NSWindow(
+            contentRect: sidebar.frame, styleMask: [.titled],
+            backing: .buffered, defer: false)
+        window.contentView = sidebar
+        sidebar.setRoot(root)
+        await sidebar.waitForPendingLoads()
+
+        let src = try #require(sidebar.rootNode?.findLoadedNode(
+            path: root.appendingPathComponent("src").path))
+        #expect(src.loadState == .unloaded)
+        let callsBeforeReveal = lister.listedPaths.count
+        let created = root.appendingPathComponent("src/New Folder")
+        try FileManager.default.createDirectory(
+            at: created, withIntermediateDirectories: false)
+
+        #expect(await sidebar.revealCreatedItem(path: created.path, focus: true))
+
+        #expect(Array(lister.listedPaths.dropFirst(callsBeforeReveal)) == [src.url.path])
+        #expect(src.loadState == .loaded)
+        #expect(sidebar.outlineView.isItemExpanded(src))
+        let selected = sidebar.outlineView.item(atRow: sidebar.outlineView.selectedRow)
+            as? FileTreeNode
+        #expect(selected?.url.path == created.path)
+        let selectedRow = try #require(
+            (0..<sidebar.outlineView.numberOfRows).first {
+                (sidebar.outlineView.item(atRow: $0) as? FileTreeNode)?.url.path
+                    == created.path
+            })
+        #expect(sidebar.outlineView.visibleRect.intersects(
+            sidebar.outlineView.rect(ofRow: selectedRow)))
+        #expect(window.firstResponder === sidebar.outlineView)
+        _ = window
+    }
+
+    @Test func revealingCreatedFolderPreservesUnrelatedExpandedBranches() async throws {
+        let root = try makeRefreshFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let lister = CountingLister()
+        let sidebar = FileTreeSidebarView(
+            frame: NSRect(x: 0, y: 0, width: 370, height: 240), lister: lister)
+        let window = NSWindow(
+            contentRect: sidebar.frame, styleMask: [.titled],
+            backing: .buffered, defer: false)
+        window.contentView = sidebar
+        sidebar.setRoot(root)
+        await sidebar.waitForPendingLoads()
+
+        let src = try #require(sidebar.rootNode?.findLoadedNode(
+            path: root.appendingPathComponent("src").path))
+        sidebar.outlineView.expandItem(src)
+        await sidebar.waitForPendingLoads()
+        sidebar.outlineView.expandItem(src)
+        let deep = try #require(sidebar.rootNode?.findLoadedNode(
+            path: root.appendingPathComponent("src/deep").path))
+        sidebar.outlineView.expandItem(deep)
+        await sidebar.waitForPendingLoads()
+        sidebar.outlineView.expandItem(deep)
+
+        let docs = try #require(sidebar.rootNode?.findLoadedNode(
+            path: root.appendingPathComponent("docs").path))
+        sidebar.outlineView.expandItem(docs)
+        await sidebar.waitForPendingLoads()
+        sidebar.outlineView.expandItem(docs)
+        sidebar.outlineView.collapseItem(src)
+        #expect(!sidebar.outlineView.isItemExpanded(src))
+        #expect(sidebar.outlineView.isItemExpanded(docs))
+
+        let callsBeforeReveal = lister.listedPaths.count
+        let created = root.appendingPathComponent("src/New Folder")
+        try FileManager.default.createDirectory(
+            at: created, withIntermediateDirectories: false)
+
+        #expect(await sidebar.revealCreatedItem(path: created.path, focus: true))
+
+        #expect(Array(lister.listedPaths.dropFirst(callsBeforeReveal)) == [src.url.path])
+        #expect(sidebar.rootNode?.findLoadedNode(path: src.url.path) === src)
+        #expect(sidebar.rootNode?.findLoadedNode(path: deep.url.path) === deep)
+        #expect(sidebar.rootNode?.findLoadedNode(path: docs.url.path) === docs)
+        #expect(sidebar.outlineView.isItemExpanded(src))
+        #expect(sidebar.outlineView.isItemExpanded(deep))
+        #expect(sidebar.outlineView.isItemExpanded(docs))
+        #expect((sidebar.outlineView.item(atRow: sidebar.outlineView.selectedRow)
+            as? FileTreeNode)?.url.path == created.path)
+        #expect(window.firstResponder === sidebar.outlineView)
+        _ = window
+    }
+
+    @Test func droppedEventRescanRefreshesEveryVisibleLoadedDirectory() async throws {
+        let root = try makeRefreshFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let lister = CountingLister()
+        let sidebar = FileTreeSidebarView(
+            frame: NSRect(x: 0, y: 0, width: 370, height: 240), lister: lister)
+        sidebar.setRoot(root)
+        await sidebar.waitForPendingLoads()
+
+        let src = try #require(sidebar.rootNode?.findLoadedNode(
+            path: root.appendingPathComponent("src").path))
+        sidebar.outlineView.expandItem(src)
+        await sidebar.waitForPendingLoads()
+        sidebar.outlineView.expandItem(src)
+        let deep = try #require(sidebar.rootNode?.findLoadedNode(
+            path: root.appendingPathComponent("src/deep").path))
+        sidebar.outlineView.expandItem(deep)
+        await sidebar.waitForPendingLoads()
+        sidebar.outlineView.expandItem(deep)
+        let callsBeforeRescan = lister.listedPaths.count
+
+        sidebar.reload(changedPaths: [], requiresFullRescan: true)
+        await sidebar.waitForPendingLoads()
+
+        let rescanned = Array(lister.listedPaths.dropFirst(callsBeforeRescan))
+        #expect(rescanned.count == 3)
+        #expect(Set(rescanned) == Set([root.path, src.url.path, deep.url.path]))
+        #expect(sidebar.outlineView.isItemExpanded(src))
+        #expect(sidebar.outlineView.isItemExpanded(deep))
+    }
+
+    @Test func rootRefreshPreservesNestedExpansionSelectionAndScrollAnchor() async throws {
+        let root = try makeRefreshFixture(rootFileCount: 80)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let lister = CountingLister()
+        let sidebar = FileTreeSidebarView(
+            frame: NSRect(x: 0, y: 0, width: 370, height: 144), lister: lister)
+        let window = NSWindow(
+            contentRect: sidebar.frame, styleMask: [.titled],
+            backing: .buffered, defer: false)
+        window.contentView = sidebar
+        sidebar.setRoot(root)
+        await sidebar.waitForPendingLoads()
+
+        let src = try #require(sidebar.rootNode?.findLoadedNode(
+            path: root.appendingPathComponent("src").path))
+        sidebar.outlineView.expandItem(src)
+        await sidebar.waitForPendingLoads()
+        sidebar.outlineView.expandItem(src)
+        let deep = try #require(sidebar.rootNode?.findLoadedNode(
+            path: root.appendingPathComponent("src/deep").path))
+        sidebar.outlineView.expandItem(deep)
+        await sidebar.waitForPendingLoads()
+        sidebar.outlineView.expandItem(deep)
+        let selectedPath = root.appendingPathComponent("src/deep/leaf.md").path
+        #expect(sidebar.selectItem(path: selectedPath))
+
+        sidebar.layoutSubtreeIfNeeded()
+        sidebar.outlineView.layoutSubtreeIfNeeded()
+        sidebar.outlineView.scrollRowToVisible(45)
+        let clip = try #require(sidebar.outlineView.enclosingScrollView?.contentView)
+        let topRowBefore = sidebar.outlineView.row(at: NSPoint(
+            x: sidebar.outlineView.bounds.midX, y: clip.bounds.minY + 1))
+        let topPathBefore = (sidebar.outlineView.item(atRow: topRowBefore)
+            as? FileTreeNode)?.url.path
+        let topOffsetBefore = clip.bounds.minY
+            - sidebar.outlineView.rect(ofRow: topRowBefore).minY
+        let callsBeforeRefresh = lister.totalCalls
+
+        FileManager.default.createFile(
+            atPath: root.appendingPathComponent("aaa-new-root-file.txt").path,
+            contents: Data())
+        sidebar.reload(path: nil)
+        await sidebar.waitForPendingLoads()
+
+        let topRowAfter = sidebar.outlineView.row(at: NSPoint(
+            x: sidebar.outlineView.bounds.midX, y: clip.bounds.minY + 1))
+        let topPathAfter = (sidebar.outlineView.item(atRow: topRowAfter)
+            as? FileTreeNode)?.url.path
+        let topOffsetAfter = clip.bounds.minY
+            - sidebar.outlineView.rect(ofRow: topRowAfter).minY
+        #expect(lister.totalCalls == callsBeforeRefresh + 1)
+        #expect(lister.listedPaths.last == root.path)
+        #expect(sidebar.rootNode?.findLoadedNode(path: src.url.path) === src)
+        #expect(sidebar.rootNode?.findLoadedNode(path: deep.url.path) === deep)
+        #expect(sidebar.outlineView.isItemExpanded(src))
+        #expect(sidebar.outlineView.isItemExpanded(deep))
+        #expect((sidebar.outlineView.item(atRow: sidebar.outlineView.selectedRow)
+            as? FileTreeNode)?.url.path == selectedPath)
+        #expect(topPathAfter == topPathBefore)
+        #expect(abs(topOffsetAfter - topOffsetBefore) < 0.5)
+        _ = window
+    }
+
+    @Test func openFileCallbackAndReloadAfterOperation() async throws {
         let root = try makeFixtureRoot()
         defer { try? FileManager.default.removeItem(at: root) }
 
         let sidebar = FileTreeSidebarView(frame: .zero)
         sidebar.setRoot(root)
+        await sidebar.waitForPendingLoads()
         #expect(sidebar.outlineView.numberOfRows == 3)
 
         // Simulate the embedder applying an operation, then reloading.
         try FileOperations.perform(.newFile(directory: root.path, name: "extra.txt"))
         sidebar.reload(path: root.path)
+        await sidebar.waitForPendingLoads()
         #expect(sidebar.outlineView.numberOfRows == 4)
 
         sidebar.reload(path: nil)
+        await sidebar.waitForPendingLoads()
         #expect(sidebar.outlineView.numberOfRows == 4)
     }
 }

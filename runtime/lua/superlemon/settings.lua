@@ -13,39 +13,58 @@ function M.user_config_path()
   return vim.fs.joinpath(config_home, "superlemon", "init.vim")
 end
 
---- Source the personal configuration once. The managed internal init loads it
---- before runtimepath is available and records the same marker; custom/user
---- init launches arrive here without the marker and are covered as well.
----@return boolean sourced
-function M.source_user_config()
-  local path = M.user_config_path()
-  if vim.g.superlemon_user_config_loaded == path then
-    return false
-  end
-  if vim.fn.filereadable(path) ~= 1 then
-    return false
-  end
-  vim.cmd("source " .. vim.fn.fnameescape(path))
-  vim.g.superlemon_user_config_loaded = path
-  return true
-end
-
 --- Copy the bundled annotated template on first use. An existing personal
 --- file is never modified or replaced.
 ---@param template string
 ---@return string target
 function M.ensure_user_config(template)
   local target = M.user_config_path()
-  if vim.fn.filereadable(target) == 1 then
+  if vim.uv.fs_stat(target) ~= nil then
     return target
   end
-  assert(vim.fn.filereadable(template) == 1, "missing bundled superlemon.vim")
+
+  -- Older GUI builds pass config/superlemon.vim. Prefer the sibling minimal
+  -- user template when available so first use never freezes a complete copy
+  -- of the managed defaults into the user's override file.
+  if vim.fs.basename(template) == "superlemon.vim" then
+    local user_template = vim.fs.joinpath(vim.fs.dirname(template), "user-init.vim")
+    if vim.fn.filereadable(user_template) == 1 then
+      template = user_template
+    end
+  end
+
+  assert(vim.fn.filereadable(template) == 1, "missing bundled user-init.vim")
   vim.fn.mkdir(vim.fs.dirname(target), "p")
   assert(
     vim.fn.writefile(vim.fn.readfile(template), target) == 0,
     "could not create " .. target
   )
+  vim.uv.fs_chmod(target, 384) -- 0600
   return target
+end
+
+--- Structured startup diagnostics returned by bridge setup. User and custom
+--- modes intentionally have no managed personal-file state unless the GUI
+--- supplies their mode before setup.
+---@return table
+function M.config_status()
+  local mode = vim.g.superlemon_config_mode or "external"
+  local state = vim.g.superlemon_user_config_state
+  if state == nil then
+    state = mode == "managed" and "unknown" or "not_applicable"
+  end
+
+  local status = {
+    mode = mode,
+    state = state,
+  }
+  if vim.g.superlemon_config_path ~= nil then
+    status.path = vim.g.superlemon_config_path
+  end
+  if vim.g.superlemon_config_error ~= nil then
+    status.error = vim.g.superlemon_config_error
+  end
+  return status
 end
 
 --- Interpret the public 1/0-or-boolean convention used by Superlemon globals.

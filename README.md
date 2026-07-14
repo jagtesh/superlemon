@@ -15,7 +15,9 @@ Neovim state into AppKit windows, pixels, motion, menus, panels, and gestures—
 about as far as a native Mac integration can go without forking Neovim itself.
 The result includes smooth display-linked scrolling, a native file browser,
 Quick Open, a minimap, a buffer tab bar, and a command/status bar integrated
-into the main window, plus proper Mac keyboard and IME support.
+into the main window, plus native key handling and marked-text IME composition.
+Active composition retains attributed clauses and local replacement ranges;
+arbitrary-buffer reconversion remains outside the current text snapshot model.
 
 This is still Neovim, not merely an editor with a Vim mode. Your mappings and
 Neovim plugins continue to work through your configuration, while Superlemon
@@ -25,13 +27,14 @@ adds native Mac surfaces where they improve the experience.
 
 ## Requirements
 
-- macOS 14+
-- Swift 6
+- macOS 14+ for the packaged application
+- Xcode 16 / Swift 6 only when building from source, including the current
+  Homebrew formula
 
 Packaged builds include Neovim, so users do not need to install it separately.
-Running the bare executable during development uses Neovim 0.12+ from the
-login-shell `PATH`; set `SUPERLEMON_NVIM` to an explicit executable path when
-needed.
+Running the bare executable during development may use
+`SUPERLEMON_NVIM` to select an explicit Neovim 0.12+ executable. Packaged
+releases use their checksum-verified bundled copy.
 
 ## Run
 
@@ -67,9 +70,10 @@ open dist/Superlemon.app
 
 The managed configuration lives in `runtime/config/`. Personal overrides belong
 in `~/.config/superlemon/init.vim`; because Neovim remains the editor, this file
-can also load ordinary Neovim plugins and define mappings just like any other
-Neovim configuration. You can instead choose your existing Neovim init from
-**Superlemon → Settings…**.
+can define ordinary options, mappings, autocmds, and plugin configuration. It is
+sourced exactly once after the bundled baseline. You can instead choose your
+normal Neovim init or one exact custom init from **Superlemon → Settings…**;
+those modes do not receive the managed configuration afterward.
 
 Common development overrides are:
 
@@ -86,18 +90,41 @@ swift test
 bash runtime/tests/run.sh
 ```
 
-Every push and pull request also produces a packaged macOS application in
-GitHub Actions. To create a versioned GitHub Release from a clean, up-to-date
-`main` branch:
+Every push and pull request tests and produces an arm64, ad-hoc-signed validation
+artifact in GitHub Actions. Tagged releases additionally require the protected
+Developer ID/notarization environment before publishing a distributable app.
+Before approving a tagged build, follow the
+[release acceptance runbook](packaging/RELEASE_ACCEPTANCE.md), copy its
+[machine-readable record](packaging/RELEASE_ACCEPTANCE.json), run the manual
+IME, VoiceOver, memory, filesystem-stress, and sidebar-layout matrix against the
+exact validation archive, and retain the completed results and referenced
+evidence. The template deliberately starts at `NOT RUN`; a green build or GUI
+smoke is not a substitute for those results.
+
+Trusted main/tag builds require an interactive ARM64 self-hosted Mac labeled
+`superlemon-gui`. Main uses the `gui-acceptance` environment; tags use the
+separate, protected `release-acceptance` environment. A tag cannot
+advance to the release job unless that runner gate validates a completed record
+against the exact tag, commit, archive filename, and SHA-256, with every required
+check and overall decision at `PASS`. Configure the environment variable
+`SUPERLEMON_ACCEPTANCE_RECORD_PATH` as the absolute runner-local path to that
+record in `release-acceptance` and protect tag deployments with required review.
+Main builds only stage
+unfinished templates. The GUI job has read-only repository access and receives
+no Developer ID or notarization credentials. Keep every Apple credential as an
+environment secret scoped only to `release`; do not configure those values as
+repository-level, `gui-acceptance`, or `release-acceptance` secrets.
+
+To create a versioned GitHub Release from a clean, up-to-date `main` branch:
 
 ```sh
 scripts/release.sh 0.2.0
 ```
 
-The command updates the application version, creates and pushes the release
-commit and `v0.2.0` tag, and starts the release workflow. GitHub Actions tests
-the tagged source, uploads its packaged application as a workflow artifact,
-and attaches that exact archive to the corresponding GitHub Release.
+The command updates the application version, creates the release commit and
+`v0.2.0` tag, and pushes them atomically. GitHub Actions tests the tagged source,
+signs the exact tested app with Developer ID, notarizes and staples it, and
+attaches the arm64 archive plus SHA-256 to the corresponding GitHub Release.
 Once the release workflow completes, publish its checksum-pinned source formula:
 
 ```sh

@@ -17,14 +17,24 @@ end
 ---@param channel integer RPC channel id of the GUI
 function M.setup(channel)
   if type(channel) ~= "number" or channel <= 0 then
-    return
+    return {
+      ready = false,
+      reason = "invalid_channel",
+      runtime_api = 1,
+      config = require("superlemon.settings").config_status(),
+    }
   end
 
   vim.g.superlemon_channel = channel
 
   -- No UI attached (e.g. plain `nvim --headless` without the GUI): stay inert.
   if #vim.api.nvim_list_uis() == 0 then
-    return
+    return {
+      ready = false,
+      reason = "no_ui",
+      runtime_api = 1,
+      config = require("superlemon.settings").config_status(),
+    }
   end
 
   -- All autocmds live in this augroup; clearing it makes setup() idempotent.
@@ -44,6 +54,12 @@ function M.setup(channel)
   -- Seed the GUI with the current configuration and editor state right away.
   require("superlemon.settings").push()
   require("superlemon.status").push()
+
+  return {
+    ready = true,
+    runtime_api = 1,
+    config = require("superlemon.settings").config_status(),
+  }
 end
 
 --- GUI menu entry point (View ▸ Native Tabs / Native Status Bar): the menu

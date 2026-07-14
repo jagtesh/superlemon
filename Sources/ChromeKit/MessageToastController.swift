@@ -122,6 +122,12 @@ public final class MessageToastController {
         removeCurrentToast()
     }
 
+    /// Test/diagnostic hook that observes the real auto-dismiss task without
+    /// making callers guess at main-actor scheduling latency.
+    func waitForPendingDismissal() async {
+        await dismissTask?.value
+    }
+
     // MARK: History
 
     /// Opens (or refreshes) the timestamped message-history panel.
@@ -148,6 +154,15 @@ public final class MessageToastController {
         currentIsAdHoc = adHoc
         container?.addSubview(toast)
         layoutToast()
+        NSAccessibility.post(
+            element: NSApplication.shared,
+            notification: .announcementRequested,
+            userInfo: [
+                .announcement: message.text,
+                .priority: message.isError
+                    ? NSAccessibilityPriorityLevel.high.rawValue
+                    : NSAccessibilityPriorityLevel.medium.rawValue,
+            ])
         let id = message.id
         dismissTask = Task { [weak self] in
             let interval = self?.autoDismissInterval ?? 3.0
@@ -283,6 +298,11 @@ final class ToastView: NSView {
         wantsLayer = true
         layer?.cornerRadius = 8
         layer?.borderWidth = 1
+        setAccessibilityElement(true)
+        setAccessibilityRole(.button)
+        setAccessibilityLabel(message.isError ? "Error message" : "Message")
+        setAccessibilityValue(message.text)
+        setAccessibilityHelp("Opens Message History")
         needsDisplay = true
     }
 

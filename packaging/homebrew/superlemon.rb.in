@@ -10,12 +10,12 @@ class Superlemon < Formula
 
   resource "neovim" do
     on_arm do
-      url "https://github.com/neovim/neovim/releases/download/v0.12.4/nvim-macos-arm64.tar.gz"
-      sha256 "51ab83afa66d663627c2ab1be43209b0f4e81360d4598b53efaa4d8195f24c89"
+      url "@NEOVIM_ARM64_URL@"
+      sha256 "@NEOVIM_ARM64_SHA256@"
     end
     on_intel do
-      url "https://github.com/neovim/neovim/releases/download/v0.12.4/nvim-macos-x86_64.tar.gz"
-      sha256 "03fe16f8dd9f1e9eaf52d5e294913a39917b9e2faea30d7fb0fb385fbd36fe59"
+      url "@NEOVIM_X86_64_URL@"
+      sha256 "@NEOVIM_X86_64_SHA256@"
     end
   end
 

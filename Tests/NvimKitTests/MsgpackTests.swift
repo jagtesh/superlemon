@@ -194,4 +194,59 @@ private let boundaryValues: [Value] = [
         decoder.append([0xc3])
         #expect(try decoder.decodeNext() == .array([.nil, .bool(true)]))
     }
+
+    @Test func rejectsBufferedMessageBeyondWireLimitWithoutGrowingPastLimit() {
+        let limits = MsgpackDecodingLimits(
+            maximumMessageBytes: 8,
+            maximumContainerElements: 100,
+            maximumNestingDepth: 10)
+        var decoder = MsgpackDecoder(limits: limits)
+        decoder.append([0xd9, 20] + Array(repeating: 0x61, count: 20))
+
+        #expect(decoder.bytesPending == 8)
+        #expect(throws: MsgpackError.messageTooLarge(limit: 8)) {
+            try decoder.decodeNext()
+        }
+    }
+
+    @Test func rejectsOversizedDeclaredStringBeforePayloadArrives() {
+        let limits = MsgpackDecodingLimits(
+            maximumMessageBytes: 32,
+            maximumContainerElements: 100,
+            maximumNestingDepth: 10)
+        var decoder = MsgpackDecoder(limits: limits)
+        // str32 declaring 256 bytes, with no body. This is a limit violation,
+        // not an indefinitely incomplete message.
+        decoder.append([0xdb, 0, 0, 1, 0])
+
+        #expect(throws: MsgpackError.messageTooLarge(limit: 32)) {
+            try decoder.decodeNext()
+        }
+    }
+
+    @Test func rejectsOversizedDeclaredContainerBeforeAllocation() {
+        let limits = MsgpackDecodingLimits(
+            maximumMessageBytes: 1024,
+            maximumContainerElements: 4,
+            maximumNestingDepth: 10)
+        // array32 declaring one million entries and no body.
+        let bytes: [UInt8] = [0xdd, 0, 0x0f, 0x42, 0x40]
+
+        #expect(throws: MsgpackError.containerTooLarge(count: 1_000_000, limit: 4)) {
+            try MsgpackDecoder.decode(bytes, limits: limits)
+        }
+    }
+
+    @Test func rejectsNestingBeyondConfiguredDepth() {
+        let limits = MsgpackDecodingLimits(
+            maximumMessageBytes: 1024,
+            maximumContainerElements: 100,
+            maximumNestingDepth: 4)
+        // Five single-element arrays around nil; four are allowed.
+        let bytes = Array(repeating: UInt8(0x91), count: 5) + [0xc0]
+
+        #expect(throws: MsgpackError.nestingTooDeep(limit: 4)) {
+            try MsgpackDecoder.decode(bytes, limits: limits)
+        }
+    }
 }

@@ -125,11 +125,17 @@ function M.payload()
   end
 
   local pos = vim.api.nvim_win_get_cursor(0)
+  local undo = vim.fn.undotree()
 
   return {
     mode = vim.api.nvim_get_mode().mode,
     file = file,
     modified = vim.bo[buf].modified,
+    modifiable = vim.bo[buf].modifiable,
+    readonly = vim.bo[buf].readonly,
+    buftype = vim.bo[buf].buftype,
+    can_undo = (undo.seq_cur or 0) > 0,
+    can_redo = (undo.seq_cur or 0) < (undo.seq_last or 0),
     line = pos[1],
     col = pos[2] + 1, -- API col is 0-based; contract wants 1-based
     total_lines = vim.api.nvim_buf_line_count(buf),
@@ -172,12 +178,24 @@ function M.setup(group)
     timer:stop()
   end
 
-  vim.api.nvim_create_autocmd({ "ModeChanged", "BufEnter", "BufModifiedSet" }, {
+  vim.api.nvim_create_autocmd(
+    { "ModeChanged", "BufEnter", "BufModifiedSet", "BufFilePost" },
+    {
     group = group,
     callback = function()
       M.push()
     end,
     desc = "superlemon: push status",
+    }
+  )
+
+  vim.api.nvim_create_autocmd("OptionSet", {
+    group = group,
+    pattern = { "modifiable", "readonly" },
+    callback = function()
+      M.push()
+    end,
+    desc = "superlemon: push editor capability status",
   })
 
   vim.api.nvim_create_autocmd("DirChanged", {
@@ -201,11 +219,14 @@ function M.setup(group)
     desc = "superlemon: refresh branch on focus",
   })
 
-  vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI" }, {
+  vim.api.nvim_create_autocmd(
+    { "CursorMoved", "CursorMovedI", "TextChanged", "TextChangedI" },
+    {
     group = group,
     callback = push_debounced,
     desc = "superlemon: push status (debounced)",
-  })
+    }
+  )
 end
 
 return M

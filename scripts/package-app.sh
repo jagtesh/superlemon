@@ -3,8 +3,13 @@ set -euo pipefail
 
 root=${0:A:h:h}
 configuration=${1:-release}
-app="$root/dist/Superlemon.app"
+dist_dir=${SUPERLEMON_DIST_DIR:-"$root/dist"}
+app="$dist_dir/Superlemon.app"
 contents="$app/Contents"
+manifest="$root/packaging/dependencies.json"
+
+asset_info=$(mktemp "${TMPDIR:-/tmp}/superlemon-assets.XXXXXX.plist")
+trap 'rm -f "$asset_info"' EXIT INT TERM
 
 cd "$root"
 swift_arguments=(-c "$configuration")
@@ -17,17 +22,32 @@ swift build "${swift_arguments[@]}"
 build_dir=$(swift build "${swift_arguments[@]}" --show-bin-path)
 
 rm -rf "$app"
-mkdir -p "$contents/MacOS" "$contents/Resources" "$contents/Helpers"
+mkdir -p "$contents/MacOS" "$contents/Resources/Licenses" "$contents/Helpers"
 cp "$root/packaging/Info.plist" "$contents/Info.plist"
 cp "$build_dir/superlemon" "$contents/MacOS/superlemon"
 cp -R "$root/runtime" "$contents/Resources/runtime"
+cp "$root/LICENSE" "$contents/Resources/Licenses/Superlemon.txt"
+cp "$root/packaging/licenses/Neovim.txt" "$contents/Resources/Licenses/Neovim.txt"
+cp "$root/packaging/THIRD_PARTY_NOTICES.md" "$contents/Resources/THIRD_PARTY_NOTICES.md"
+cp "$manifest" "$contents/Resources/dependencies.json"
 
 nvim_distribution=${SUPERLEMON_NVIM_DIST:-$("$root/scripts/fetch-neovim.sh")}
 if [[ ! -x "$nvim_distribution/bin/nvim" ]]; then
   echo "invalid Neovim distribution: $nvim_distribution" >&2
   exit 1
 fi
+expected_nvim_version=$(/usr/bin/plutil -extract neovim.version raw -o - "$manifest")
+reported_nvim_version=$("$nvim_distribution/bin/nvim" --version | head -n 1)
+if [[ "$reported_nvim_version" != "NVIM v$expected_nvim_version"* ]]; then
+  echo "Neovim version mismatch: expected $expected_nvim_version, got $reported_nvim_version" >&2
+  exit 1
+fi
+
 cp -R "$nvim_distribution" "$contents/Helpers/nvim"
+# Cache metadata authenticates the source before packaging; the bundled
+# dependency manifest carries the same digest without confusing code-signing's
+# nested-code discovery.
+rm -f "$contents/Helpers/nvim/.superlemon-source-sha256"
 mv "$contents/Helpers/nvim/share" "$contents/Resources/nvim-share"
 ln -s ../../Resources/nvim-share "$contents/Helpers/nvim/share"
 
@@ -41,17 +61,9 @@ xcrun actool "$root/packaging/Assets.xcassets" \
   --platform macosx \
   --minimum-deployment-target 14.0 \
   --app-icon AppIcon \
-  --output-partial-info-plist /tmp/superlemon-asset-info.plist
+  --output-partial-info-plist "$asset_info"
 
-/usr/libexec/PlistBuddy -c \
-  "Merge /tmp/superlemon-asset-info.plist" "$contents/Info.plist"
-
-find "$contents/Helpers/nvim" -type f -print0 |
-while IFS= read -r -d '' component; do
-  if file "$component" | grep -q 'Mach-O'; then
-    codesign --force --sign - "$component"
-  fi
-done
-codesign --force --sign - "$contents/MacOS/superlemon"
-codesign --force --sign - "$app"
+/usr/libexec/PlistBuddy -c "Merge $asset_info" "$contents/Info.plist"
+"$root/scripts/sign-app.sh" "$app"
+"$root/scripts/verify-package.sh" "$app"
 echo "$app"
