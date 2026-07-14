@@ -192,4 +192,11 @@ public final class EditorHostNSView: NSView {
     public func setFontSizeOverride(_ size: CGFloat?) {
         controller.overrideFontSize(size)
     }
+
+    /// Persistent host font override (an embedding host's Settings): face
+    /// and/or size applied over Neovim's guifont at every font recompute.
+    /// nil fields defer to Neovim.
+    public func setHostFontOverride(name: String?, size: CGFloat?) {
+        controller.setHostFontOverride(name: name, size: size)
+    }
 }

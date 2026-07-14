@@ -959,9 +959,29 @@ public final class NvimController {
         applyFontSpec(spec)
     }
 
+    /// Host-supplied persistent font override (an embedding host's Settings).
+    /// Unlike `overrideFontSize` (the transient ⌘= zoom), this is applied at
+    /// the applyFontSpec choke point so it survives guifont/linespace pushes
+    /// and runtime-settings recomputes. nil fields defer to Neovim.
+    private var hostFontOverrideName: String?
+    private var hostFontOverrideSize: CGFloat?
+
+    public func setHostFontOverride(name: String?, size: CGFloat?) {
+        hostFontOverrideName = name
+        hostFontOverrideSize = size
+        guard surface != nil else { return }
+        var spec = configuredFontSpec
+        renderingSettings.apply(to: &spec)
+        applyFontSpec(spec)
+    }
+
     /// Install one fully resolved font spec and keep the native statusline's
     /// Powerline synthesis policy in lockstep with the grid renderer.
+    /// The host font override (when set) has the last word.
     private func applyFontSpec(_ spec: FontSpec) {
+        var spec = spec
+        if let name = hostFontOverrideName { spec.name = name }
+        if let size = hostFontOverrideSize { spec.size = max(6, min(72, size)) }
         guard let surface else { return }
         chrome?.statusBar.synthesizePowerline =
             spec.powerlineGlyphs && (spec.useSymbolFont || spec.forceSynthesis)
