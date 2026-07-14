@@ -178,6 +178,51 @@ struct BufferTabStripTests {
         #expect(strip.tabItems.isEmpty)
     }
 
+    @Test func accessoryButtonsExistAndFireToggleCallbacks() {
+        let strip = makeStrip()
+        #expect(strip.sidebarButton.accessibilityIdentifier() == "tabstrip.toggleSidebar")
+        #expect(strip.minimapButton.accessibilityIdentifier() == "tabstrip.toggleMinimap")
+        #expect(strip.sidebarButton.accessibilityLabel() == "Toggle Sidebar")
+        #expect(strip.minimapButton.accessibilityLabel() == "Toggle Minimap")
+
+        var sidebarToggles = 0
+        var minimapToggles = 0
+        strip.onToggleSidebar = { sidebarToggles += 1 }
+        strip.onToggleMinimap = { minimapToggles += 1 }
+        strip.sidebarButton.performClick(nil)
+        strip.minimapButton.performClick(nil)
+        strip.minimapButton.performClick(nil)
+        #expect(sidebarToggles == 1)
+        #expect(minimapToggles == 2)
+    }
+
+    @Test func accessoryButtonsReflectChromeState() {
+        let strip = makeStrip()
+
+        strip.updateAccessoryState(sidebarVisible: true, minimapOn: true)
+        let onTint = strip.sidebarButton.contentTintColor
+        #expect(strip.sidebarButton.accessibilityValue() as? String == "visible")
+        #expect(strip.minimapButton.accessibilityValue() as? String == "visible")
+
+        strip.updateAccessoryState(sidebarVisible: false, minimapOn: true)
+        #expect(strip.sidebarButton.accessibilityValue() as? String == "hidden")
+        #expect(strip.minimapButton.accessibilityValue() as? String == "visible")
+        #expect(strip.sidebarButton.contentTintColor != onTint)
+        #expect(strip.minimapButton.contentTintColor == onTint)
+
+        // State survives a re-render (which recomputes tints for appearance).
+        strip.render(tabs: tabs, current: 1, dark: false)
+        #expect(strip.sidebarButton.accessibilityValue() as? String == "hidden")
+    }
+
+    @Test func accessoryButtonsBracketTheTabScroller() {
+        let strip = makeStrip(width: 400)
+        let scrollView = strip.subviews.compactMap { $0 as? NSScrollView }.first!
+        #expect(strip.sidebarButton.frame.maxX <= scrollView.frame.minX)
+        #expect(scrollView.frame.maxX <= strip.minimapButton.frame.minX)
+        #expect(strip.sidebarButton.frame.minX < strip.minimapButton.frame.minX)
+    }
+
     @Test func sameBufferOrderUpdatesViewsInPlace() {
         let strip = makeStrip()
         let before = strip.tabItems

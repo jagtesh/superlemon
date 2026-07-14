@@ -48,6 +48,20 @@ end
 H.ok(status_call ~= nil, "setup pushes an initial superlemon.status")
 H.eq(status_call and status_call.chan, 3, "initial push targets the stored channel")
 
+-- DirChanged inside nvim notifies the GUI so the workspace re-roots
+-- (CONTRACT.md `superlemon.cwd`).
+local cwd_dir = H.tmpdir()
+local cwd_before = #vim.tbl_filter(function(c)
+  return c.method == "superlemon.cwd"
+end, calls.notify)
+vim.cmd("cd " .. cwd_dir)
+local cwd_calls = vim.tbl_filter(function(c)
+  return c.method == "superlemon.cwd"
+end, calls.notify)
+H.eq(#cwd_calls, cwd_before + 1, ":cd emits one superlemon.cwd notification")
+H.eq(cwd_calls[#cwd_calls].args[1], { cwd = vim.fn.getcwd() },
+  "superlemon.cwd carries the new working directory")
+
 -- health module loads and runs.
 local health_ok, health_err = pcall(function()
   vim.cmd("checkhealth superlemon")

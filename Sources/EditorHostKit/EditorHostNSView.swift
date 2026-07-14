@@ -13,6 +13,11 @@ import SurfaceKit
 
 @MainActor
 public final class EditorHostNSView: NSView {
+    /// Below this host width at bridge bootstrap, the runtime defaults the
+    /// sidebar and minimap to hidden (startup-time only; explicit
+    /// g:superlemon_native_* settings and later toggles are unaffected).
+    public static let compactStartupWidthThreshold: CGFloat = 800
+
     public let controller: NvimController
     public let chrome: WorkspaceChrome
 
@@ -21,6 +26,11 @@ public final class EditorHostNSView: NSView {
     private let splitView = NSSplitView()
     private var appearanceObservation: NSKeyValueObservation?
     private weak var attachedWindow: NSWindow?
+    /// Last sidebar visibility applied from a `superlemon.chrome` push.
+    /// Pushes resend the whole map, so only a changed value reaches the
+    /// split view — direct setSidebarVisible calls from embedding hosts
+    /// survive unrelated chrome pushes.
+    private var lastAppliedNativeSidebar: Bool?
 
     public init(
         controller: NvimController = NvimController(),
@@ -90,13 +100,18 @@ public final class EditorHostNSView: NSView {
         ])
         chrome.onChromeModeChange = {
             [weak self, weak controller]
-            nativeTabs, nativeStatusbar, nativeMinimap, nativeScrollbars in
+            nativeTabs, nativeStatusbar, nativeMinimap, nativeScrollbars,
+            nativeSidebar in
             tabStripHeight.constant = nativeTabs ? BufferTabStripView.stripHeight : 0
             statusBarHeight.constant = nativeStatusbar ? StatusBarView.barHeight : 0
             // isHidden alongside the collapse: a 0-height NSView still draws
             // its (unclipped) subviews and hit-tests otherwise.
             tabStrip.isHidden = !nativeTabs
             statusBar.isHidden = !nativeStatusbar
+            if let self, nativeSidebar != self.lastAppliedNativeSidebar {
+                self.lastAppliedNativeSidebar = nativeSidebar
+                self.setSidebarVisible(nativeSidebar)
+            }
             self?.layoutSubtreeIfNeeded()
             controller?.setEditorAccessories(
                 minimap: nativeMinimap, scrollbars: nativeScrollbars)
@@ -107,6 +122,10 @@ public final class EditorHostNSView: NSView {
 
         controller.surface = surface
         controller.inputHost = inputHost
+        controller.startupLayoutIsCompact = { [weak self] in
+            (self?.bounds.width ?? frameRect.width)
+                < Self.compactStartupWidthThreshold
+        }
     }
 
     @available(*, unavailable)

@@ -2,9 +2,10 @@
 -- `superlemon.chrome` / `superlemon.buffers`).
 --
 -- nvim is the single source of truth for whether the GUI shows native buffer
--- tabs, status bar, per-window minimaps, and scrollbars: their corresponding
--- g:superlemon_native_* globals seed the state, :SuperlemonChrome flips it,
--- and the GUI merely reflects `superlemon.chrome` notifications.
+-- tabs, status bar, per-window minimaps, scrollbars, and the file sidebar:
+-- their corresponding g:superlemon_native_* globals seed the state,
+-- :SuperlemonChrome flips it, and the GUI merely reflects `superlemon.chrome`
+-- notifications.
 --
 -- Native-statusbar adoption is the one deliberate option bridge: by default
 -- this module saves `laststatus`, sets it to zero while the native bar renders
@@ -20,6 +21,7 @@ local state = {
   native_statusbar = false,
   native_minimap = true,
   native_scrollbars = false,
+  native_sidebar = true,
 }
 
 local buffer_timer
@@ -59,6 +61,7 @@ local function push_chrome()
     native_statusbar = state.native_statusbar,
     native_minimap = state.native_minimap,
     native_scrollbars = state.native_scrollbars,
+    native_sidebar = state.native_sidebar,
   })
 end
 
@@ -117,7 +120,7 @@ local function schedule_buffers()
   buffer_timer:start(50, 0, vim.schedule_wrap(push_buffers))
 end
 
----@param part '"tabs"'|'"statusbar"'|'"minimap"'|'"scrollbars"'
+---@param part '"tabs"'|'"statusbar"'|'"minimap"'|'"scrollbars"'|'"sidebar"'
 ---@param on boolean
 function M.set(part, on)
   if part == "tabs" then
@@ -151,6 +154,11 @@ function M.set(part, on)
     end
     state.native_scrollbars = on
     sync_accessory_provider()
+  elseif part == "sidebar" then
+    if state.native_sidebar == on then
+      return
+    end
+    state.native_sidebar = on
   else
     return
   end
@@ -158,7 +166,7 @@ function M.set(part, on)
 end
 
 
----@param part '"tabs"'|'"statusbar"'|'"minimap"'|'"scrollbars"'
+---@param part '"tabs"'|'"statusbar"'|'"minimap"'|'"scrollbars"'|'"sidebar"'
 function M.toggle(part)
   if part == "tabs" then
     M.set(part, not state.native_tabs)
@@ -168,6 +176,8 @@ function M.toggle(part)
     M.set(part, not state.native_minimap)
   elseif part == "scrollbars" then
     M.set(part, not state.native_scrollbars)
+  elseif part == "sidebar" then
+    M.set(part, not state.native_sidebar)
   end
 end
 
@@ -178,20 +188,27 @@ function M.state()
     native_statusbar = state.native_statusbar,
     native_minimap = state.native_minimap,
     native_scrollbars = state.native_scrollbars,
+    native_sidebar = state.native_sidebar,
   }
 end
 
-function M.setup(group)
+---@param group integer augroup id
+---@param opts { compact: boolean }|nil compact = the GUI started at a narrow
+--- width; sidebar and minimap then default off unless their g: globals are
+--- explicitly set.
+function M.setup(group, opts)
   local function truthy(v, default)
     if v == nil or v == vim.NIL then
       return default == true
     end
     return v == 1 or v == true
   end
+  local compact = opts ~= nil and opts.compact == true
   state.native_tabs = truthy(vim.g.superlemon_native_tabs)
   state.native_statusbar = truthy(vim.g.superlemon_native_statusbar)
-  state.native_minimap = truthy(vim.g.superlemon_native_minimap, true)
+  state.native_minimap = truthy(vim.g.superlemon_native_minimap, not compact)
   state.native_scrollbars = truthy(vim.g.superlemon_native_scrollbars, false)
+  state.native_sidebar = truthy(vim.g.superlemon_native_sidebar, not compact)
   apply_adopt_statusline()
   -- Startup-only (explicit user choice in Settings or config): hide the
   -- editor's own tab line (airline/bufferline tabs) — the native strip
@@ -215,9 +232,9 @@ function M.setup(group)
   end, {
     nargs = "+",
     complete = function()
-      return { "tabs", "statusbar", "minimap", "scrollbars" }
+      return { "tabs", "statusbar", "minimap", "scrollbars", "sidebar" }
     end,
-    desc = "Toggle Superlemon native chrome (tabs|statusbar|minimap|scrollbars) (on|off|toggle)",
+    desc = "Toggle Superlemon native chrome (tabs|statusbar|minimap|scrollbars|sidebar) (on|off|toggle)",
   })
 
   push_chrome()

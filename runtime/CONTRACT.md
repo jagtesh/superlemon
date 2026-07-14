@@ -12,18 +12,21 @@ The GUI prepends the bundled runtime through a pre-init `--cmd`. After
 never sourced by this bootstrap:
 
 ```lua
-local channel, mode = ...
+local channel, mode, compact = ...
 vim.g.superlemon_config_mode = vim.g.superlemon_config_mode or mode
-return require("superlemon").setup(channel)
+return require("superlemon").setup(channel, { compact = compact })
 ```
 
-The GUI passes `[channel_id, config_mode]` as the `nvim_exec_lua` argument
-array. `channel_id` comes from `nvim_get_api_info`; `config_mode` is managed,
-user, or custom launch state used when the managed init did not set it.
+The GUI passes `[channel_id, config_mode, compact]` as the `nvim_exec_lua`
+argument array. `channel_id` comes from `nvim_get_api_info`; `config_mode` is
+managed, user, or custom launch state used when the managed init did not set
+it; `compact` is a boolean that is true when the GUI window started narrower
+than its compact threshold (~800 pt) — the sidebar and minimap then default to
+hidden unless their `g:superlemon_native_*` globals are explicitly set.
 
-`require("superlemon")` has no side effects. `setup(channel)` rejects invalid
-channels, stores a valid one in `g:superlemon_channel`, stays inert when no UI
-is attached, and may be called again safely. It returns structured readiness
+`require("superlemon")` has no side effects. `setup(channel, opts)` rejects
+invalid channels, stores a valid one in `g:superlemon_channel`, stays inert
+when no UI is attached, and may be called again safely. It returns structured readiness
 with `ready`, `runtime_api`, and `config` fields. Active setup installs status,
 clipboard, keymap, chrome, minimap, git, and native-UI adapters, then pushes
 initial settings and status.
@@ -112,19 +115,25 @@ One complete map, pushed during setup and after an actual toggle change:
   native_statusbar = true,
   native_minimap = true,
   native_scrollbars = false,
+  native_sidebar = true,
 }
 ```
 
 Initial state comes from `g:superlemon_native_tabs` and
 `g:superlemon_native_statusbar` (`1`/`true` means enabled), plus
-`g:superlemon_native_minimap` (default enabled) and
-`g:superlemon_native_scrollbars` (default disabled). Later changes go through:
+`g:superlemon_native_minimap` (default enabled),
+`g:superlemon_native_scrollbars` (default disabled), and
+`g:superlemon_native_sidebar` (default enabled). When `setup` receives
+`compact = true` (narrow startup window), `native_minimap` and
+`native_sidebar` default to disabled instead; an explicitly set global always
+wins over that compact default. Later changes go through:
 
 ```vim
 :SuperlemonChrome tabs on|off|toggle
 :SuperlemonChrome statusbar on|off|toggle
 :SuperlemonChrome minimap on|off|toggle
 :SuperlemonChrome scrollbars on|off|toggle
+:SuperlemonChrome sidebar on|off|toggle
 ```
 
 or `require("superlemon").chrome_toggle(part)`. View-menu items call that API
@@ -142,6 +151,20 @@ Native tabs do not change `showtabline` when toggled. Separately,
 `g:superlemon_hide_tabline=1` applies `showtabline=0` once at setup. The managed
 baseline also chooses `cmdheight=0`, `noshowmode`, and `laststatus=0`; the
 personal configuration may override those ordinary Neovim options.
+
+### `superlemon.cwd`
+
+One map argument, pushed from a `DirChanged` autocmd whenever Neovim's global
+working directory changes (`:cd`, `nvim_set_current_dir`, and so on):
+
+```lua
+{ cwd = "/Users/me/project" } -- vim.fn.getcwd()
+```
+
+The GUI re-roots the workspace (file sidebar, quick-open index) at the new
+path when it differs from the current project root. GUI-initiated folder
+changes also call `nvim_set_current_dir`, so this notification fires for those
+too; the GUI's changed-path guard makes the echo a no-op.
 
 ### `superlemon.settings`
 

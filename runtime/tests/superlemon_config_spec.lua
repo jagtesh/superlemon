@@ -12,7 +12,10 @@ H.eq(vim.g.superlemon_native_tabs, 1, "native tabs setting documented and enable
 H.eq(vim.g.superlemon_native_statusbar, 1, "native statusbar setting documented and enabled")
 H.eq(vim.g.superlemon_adopt_statusline, 1, "statusline adoption setting explicit")
 H.eq(vim.g.superlemon_hide_tabline, 0, "tabline hiding setting explicit")
-H.eq(vim.g.superlemon_native_minimap, 1, "native minimap documented and enabled")
+H.eq(vim.g.superlemon_native_minimap, nil,
+  "native minimap documented but unset (narrow-window default applies)")
+H.eq(vim.g.superlemon_native_sidebar, nil,
+  "native sidebar documented but unset (narrow-window default applies)")
 H.eq(vim.g.superlemon_native_scrollbars, 0, "native scrollbars documented and disabled")
 H.eq(vim.g.superlemon_native_ui, 1, "native picker setting explicit")
 H.eq(vim.g.superlemon_default_keymaps, 1, "default keymap setting explicit")

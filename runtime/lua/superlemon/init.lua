@@ -15,7 +15,9 @@ end
 
 --- Idempotent entry point called by the GUI over RPC.
 ---@param channel integer RPC channel id of the GUI
-function M.setup(channel)
+---@param opts { compact: boolean }|nil compact = the GUI window started at a
+--- narrow width; sidebar/minimap then default off (explicit g: globals win).
+function M.setup(channel, opts)
   if type(channel) ~= "number" or channel <= 0 then
     return {
       ready = false,
@@ -43,13 +45,26 @@ function M.setup(channel)
   require("superlemon.status").setup(group)
   require("superlemon.clipboard").setup()
   require("superlemon.keymaps").setup()
-  require("superlemon.chrome").setup(group)
+  require("superlemon.chrome").setup(group, opts)
   local chrome = require("superlemon.chrome").state()
   require("superlemon.minimap").setup(
     group, chrome.native_minimap or chrome.native_scrollbars
   )
   require("superlemon.git").setup(group)
   require("superlemon.ui").setup()
+
+  -- Keep the GUI's workspace (file sidebar, quick-open index) rooted at
+  -- nvim's cwd when the user cds inside nvim (CONTRACT.md `superlemon.cwd`).
+  vim.api.nvim_create_autocmd("DirChanged", {
+    group = group,
+    callback = function()
+      if M.active() then
+        vim.rpcnotify(vim.g.superlemon_channel, "superlemon.cwd", {
+          cwd = vim.fn.getcwd(),
+        })
+      end
+    end,
+  })
 
   -- Seed the GUI with the current configuration and editor state right away.
   require("superlemon.settings").push()
@@ -64,7 +79,7 @@ end
 
 --- GUI menu entry point (View ▸ Native Tabs / Native Status Bar): the menu
 --- is an affordance; this module's state is the truth (CONTRACT.md).
----@param part '"tabs"'|'"statusbar"'|'"minimap"'|'"scrollbars"'
+---@param part '"tabs"'|'"statusbar"'|'"minimap"'|'"scrollbars"'|'"sidebar"'
 function M.chrome_toggle(part)
   require("superlemon.chrome").toggle(part)
 end

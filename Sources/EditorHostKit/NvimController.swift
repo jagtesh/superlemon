@@ -169,6 +169,12 @@ public final class NvimController {
         NSApp.reply(toApplicationShouldTerminate: $0)
     }
 
+    /// Asked once when the runtime bridge bootstraps: true means the host
+    /// started at a compact width, so the runtime defaults the sidebar and
+    /// minimap to hidden unless the user's config sets them explicitly
+    /// (CONTRACT.md `compact`). Nil (or false) keeps the wide defaults.
+    public var startupLayoutIsCompact: (() -> Bool)?
+
     private var attached = false
     private var lastSentGridSize: (rows: Int, cols: Int) = (0, 0)
     private var resizeScheduled = false
@@ -582,12 +588,13 @@ public final class NvimController {
             "nvim_exec_lua",
             [
                 .string(
-                    "local chan, mode = ...\n"
+                    "local chan, mode, compact = ...\n"
                         + "vim.g.superlemon_config_mode = vim.g.superlemon_config_mode or mode\n"
-                        + "return require('superlemon').setup(chan)"),
+                        + "return require('superlemon').setup(chan, { compact = compact })"),
                 .array([
                     .int(Int64(channelID)),
                     .string(safeStartRequested ? "safe" : activeConfigMode.rawValue),
+                    .bool(startupLayoutIsCompact?() ?? false),
                 ]),
             ],
             timeout: .seconds(5))

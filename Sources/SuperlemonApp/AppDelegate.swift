@@ -88,7 +88,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     // MARK: - Window construction
 
     private func makeWindow(for controller: NvimController) {
-        let contentRect = NSRect(x: 0, y: 0, width: 1160, height: 720)
+        // Fit small displays instead of overflowing them; a resulting width
+        // under EditorHostNSView.compactStartupWidthThreshold starts the
+        // sidebar and minimap hidden (unless the user's config sets them).
+        let available = NSScreen.main?.visibleFrame.size
+            ?? NSSize(width: 1160, height: 720)
+        let contentRect = NSRect(
+            x: 0, y: 0,
+            width: min(1160, available.width),
+            height: min(720, available.height))
         let window = NSWindow(
             contentRect: contentRect,
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
@@ -237,7 +245,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
 
     @objc private func toggleSidebar(_ sender: Any?) {
-        editorHost?.toggleSidebar()
+        controller?.toggleNativeChrome("sidebar")
     }
 
     /// View ▸ Native Tabs / Native Status Bar — affordances only; the runtime
@@ -290,6 +298,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             return controller?.editorCommandsAvailable ?? false
         case #selector(toggleMinimap(_:)):
             menuItem.state = (chrome?.nativeMinimap ?? true) ? .on : .off
+            return controller?.editorCommandsAvailable ?? false
+        case #selector(toggleSidebar(_:)):
+            menuItem.state = (chrome?.nativeSidebar ?? true) ? .on : .off
             return controller?.editorCommandsAvailable ?? false
         default:
             return true

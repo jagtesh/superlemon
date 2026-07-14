@@ -69,7 +69,8 @@ public final class WorkspaceChrome {
     /// nvim is the source of truth). The app delegate resizes the layout.
     var onChromeModeChange: ((
         _ nativeTabs: Bool, _ nativeStatusbar: Bool,
-        _ nativeMinimap: Bool, _ nativeScrollbars: Bool
+        _ nativeMinimap: Bool, _ nativeScrollbars: Bool,
+        _ nativeSidebar: Bool
     ) -> Void)?
     /// The default Neovim save mapping requests the native sheet for an
     /// unnamed buffer. AppDelegate supplies the document-panel presentation.
@@ -78,6 +79,7 @@ public final class WorkspaceChrome {
     public private(set) var nativeStatusbar = false
     public private(set) var nativeMinimap = true
     private(set) var nativeScrollbars = false
+    public private(set) var nativeSidebar = true
 
     private unowned let controller: NvimController
     private weak var window: NSWindow?
@@ -203,9 +205,22 @@ public final class WorkspaceChrome {
             nativeStatusbar = payload["native_statusbar"]?.boolValue ?? false
             nativeMinimap = payload["native_minimap"]?.boolValue ?? true
             nativeScrollbars = payload["native_scrollbars"]?.boolValue ?? false
+            nativeSidebar = payload["native_sidebar"]?.boolValue ?? true
             onChromeModeChange?(
-                nativeTabs, nativeStatusbar, nativeMinimap, nativeScrollbars)
+                nativeTabs, nativeStatusbar, nativeMinimap, nativeScrollbars,
+                nativeSidebar)
+            tabStrip.updateAccessoryState(
+                sidebarVisible: nativeSidebar, minimapOn: nativeMinimap)
             syncChrome()  // re-route the cmdline if one is active
+        case "superlemon.cwd":
+            // nvim's global cwd changed (`:cd` inside the editor). Re-root
+            // the workspace; GUI-initiated cds echo back through here too,
+            // so a same-root notification is a no-op.
+            guard let path = params.first?["cwd"]?.stringValue, !path.isEmpty
+            else { return }
+            let root = URL(fileURLWithPath: path, isDirectory: true)
+                .standardizedFileURL
+            if root.path != projectRoot.path { setProjectRoot(root) }
         case "superlemon.statusline":
             // The user's own statusline, evaluated by nvim_eval_statusline —
             // rendered natively instead of the built-in chips (CONTRACT.md).
@@ -464,6 +479,15 @@ public final class WorkspaceChrome {
             self?.controller.promoteBuffer(bufnr)
             self?.restoreFocus?()
         }
+        // Sidebar/minimap visibility round-trips through nvim (the source of
+        // truth); the resulting superlemon.chrome push updates the layout
+        // and the buttons' state.
+        tabStrip.onToggleSidebar = { [weak self] in
+            self?.controller.toggleNativeChrome("sidebar")
+        }
+        tabStrip.onToggleMinimap = { [weak self] in
+            self?.controller.toggleNativeChrome("minimap")
+        }
 
         // VS Code/Sublime semantics: single-click previews (italic tab,
         // replaced by the next preview); double-click opens permanently.
@@ -478,6 +502,11 @@ public final class WorkspaceChrome {
         }
         sidebar.onRequestCreateItem = { [weak self] directory, kind in
             self?.presentCreatePrompt(in: directory, kind: kind)
+        }
+        // ".." row and the folder context menu: cd inside nvim; the tree
+        // re-roots via getcwd readback (and superlemon.cwd for external cds).
+        sidebar.onChangeWorkingDirectory = { [weak self] absolutePath in
+            self?.controller.openFolder(absolutePath)
         }
         sidebar.onFileOperation = { [weak self] op in
             guard let self else { return }

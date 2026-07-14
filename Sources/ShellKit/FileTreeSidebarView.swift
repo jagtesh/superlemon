@@ -215,6 +215,14 @@ private final class FileTreePlaceholder {
     init(parent: FileTreeNode) { self.parent = parent }
 }
 
+/// Synthetic ".." row shown above the root's children: clicking it changes
+/// the working directory to the root's parent. Deliberately not a
+/// FileTreeNode so expansion/refresh/layout logic (which casts to
+/// FileTreeNode) ignores it by construction. One fresh instance per root
+/// keeps outline-item identity from leaking across re-roots.
+@MainActor
+private final class FileTreeParentDirectoryEntry {}
+
 // MARK: - Sidebar view
 
 @MainActor
@@ -236,6 +244,10 @@ public final class FileTreeSidebarView: NSView {
     /// not invent a hard-coded filename; the embedder validates and performs
     /// the resulting mutation.
     public var onRequestCreateItem: ((String, FileTreeCreateKind) -> Void)?
+    /// Fired with an absolute directory path when the user asks to re-root
+    /// the workspace there (the ".." row or a folder's context menu). The
+    /// embedder performs the cd (through nvim) and calls `setRoot` back.
+    public var onChangeWorkingDirectory: ((String) -> Void)?
 
     /// Git badges (superlemon.git): absolute file path → one-letter status
     /// (M A D R C U ?). Directories containing a flagged file get a dot.
@@ -308,6 +320,12 @@ public final class FileTreeSidebarView: NSView {
     public let outlineView = NSOutlineView()
     private let scrollView = NSScrollView()
     private(set) var rootNode: FileTreeNode?
+    private var parentEntry: FileTreeParentDirectoryEntry?
+    /// The ".." row shows whenever the root has a parent to go up to.
+    private var showsParentEntry: Bool {
+        guard let rootNode else { return false }
+        return rootNode.url.path != "/"
+    }
     private let lister: DirectoryLister
     private var isDark = false
     private var treeGeneration: UInt64 = 0
@@ -403,6 +421,7 @@ public final class FileTreeSidebarView: NSView {
         pendingExpansionPaths.removeAll()
         staleDirectoryPaths.removeAll()
         rootNode = FileTreeNode(url: url, isDirectory: true, isHidden: false)
+        parentEntry = FileTreeParentDirectoryEntry()
         outlineView.reloadData()
         if let rootNode { requestChildren(for: rootNode) }
     }
@@ -825,7 +844,15 @@ public final class FileTreeSidebarView: NSView {
     /// `onOpenFilePermanently` (promotes/pins). Directories toggle on
     /// double-click only.
     func performRowAction(row: Int, isDoubleClick: Bool) {
-        guard row >= 0, let node = outlineView.item(atRow: row) as? FileTreeNode else { return }
+        guard row >= 0 else { return }
+        if outlineView.item(atRow: row) is FileTreeParentDirectoryEntry {
+            defer { onRequestEditorFocus?() }
+            guard let rootNode else { return }
+            onChangeWorkingDirectory?(
+                rootNode.url.deletingLastPathComponent().path)
+            return
+        }
+        guard let node = outlineView.item(atRow: row) as? FileTreeNode else { return }
         defer { onRequestEditorFocus?() }
         if node.isDirectory {
             guard isDoubleClick else { return }
@@ -876,6 +903,11 @@ public final class FileTreeSidebarView: NSView {
         onFileOperation?(.revealInFinder(path: node.url.path))
     }
 
+    @objc fileprivate func menuChangeWorkingDirectory(_ sender: NSMenuItem) {
+        guard let node = sender.representedObject as? FileTreeNode else { return }
+        onChangeWorkingDirectory?(node.url.path)
+    }
+
     /// Puts the row's name label into edit mode; committing a changed name
     /// emits `.rename` through `onFileOperation`.
     public func beginRename(of node: FileTreeNode) {
@@ -904,18 +936,26 @@ extension FileTreeSidebarView: NSOutlineViewDataSource, NSOutlineViewDelegate {
 
     public func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
         guard let node = node(for: item) else { return 0 }
+        // The synthetic ".." row occupies index 0 of the root level.
+        let parentRows = item == nil && showsParentEntry ? 1 : 0
         switch node.loadState {
         case .unloaded:
             requestChildren(for: node)
-            return 1
+            return parentRows + 1
         case .loading, .failed:
-            return 1
+            return parentRows + 1
         case .loaded:
-            return node.loadedChildren(showHidden: showsHiddenFiles)?.count ?? 0
+            return parentRows
+                + (node.loadedChildren(showHidden: showsHiddenFiles)?.count ?? 0)
         }
     }
 
     public func outlineView(_ outlineView: NSOutlineView, child index: Int, ofItem item: Any?) -> Any {
+        var index = index
+        if item == nil, showsParentEntry {
+            if index == 0 { return parentEntry! }
+            index -= 1
+        }
         let node = node(for: item)!
         if let children = node.loadedChildren(showHidden: showsHiddenFiles) {
             return children[index]
@@ -981,6 +1021,14 @@ extension FileTreeSidebarView: NSOutlineViewDataSource, NSOutlineViewDelegate {
             }
             return cell
         }
+        if item is FileTreeParentDirectoryEntry {
+            let identifier = NSUserInterfaceItemIdentifier("FileTreeParentCell")
+            let cell = outlineView.makeView(withIdentifier: identifier, owner: nil)
+                as? FileTreeCellView ?? FileTreeCellView(identifier: identifier)
+            let parentPath = rootNode?.url.deletingLastPathComponent().path ?? "/"
+            cell.configureAsParentDirectory(parentPath: parentPath, dark: isDark)
+            return cell
+        }
         guard let node = item as? FileTreeNode else { return nil }
         let identifier = NSUserInterfaceItemIdentifier("FileTreeCell")
         let cell = outlineView.makeView(withIdentifier: identifier, owner: nil)
@@ -1020,9 +1068,7 @@ extension FileTreeSidebarView: NSMenuDelegate {
 
     public func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
-        // Every item mutates or reveals through the LOCAL filesystem; an
-        // empty menu never shows, so remote-sourced trees get no menu.
-        guard allowsFileOperations, let node = contextMenuNode else { return }
+        guard let node = contextMenuNode else { return }
 
         func item(_ title: String, _ action: Selector) -> NSMenuItem {
             let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
@@ -1030,6 +1076,22 @@ extension FileTreeSidebarView: NSMenuDelegate {
             item.representedObject = node
             return item
         }
+
+        // Re-rooting goes through nvim's cwd, not the local filesystem, so
+        // it stays available for remote-sourced trees. The root itself is
+        // excluded (a cd to the current root is a no-op; ".." goes up).
+        if node.isDirectory, node !== rootNode {
+            menu.addItem(
+                item(
+                    "Set as Working Directory",
+                    #selector(menuChangeWorkingDirectory(_:))))
+        }
+
+        // Every remaining item mutates or reveals through the LOCAL
+        // filesystem; an empty menu never shows, so remote-sourced trees get
+        // only the re-root affordance (or no menu at all on files).
+        guard allowsFileOperations else { return }
+        if !menu.items.isEmpty { menu.addItem(.separator()) }
 
         menu.addItem(item("New File", #selector(menuNewFile(_:))))
         menu.addItem(item("New Folder", #selector(menuNewFolder(_:))))
@@ -1190,6 +1252,19 @@ final class FileTreeCellView: NSView {
             )
         }
         gitBadgeLabel.stringValue = ""  // reset; the sidebar re-applies per row
+        endEditing(commit: false)
+    }
+
+    /// The synthetic ".." row: secondary-colored, no type dot, no badge.
+    func configureAsParentDirectory(parentPath: String, dark: Bool) {
+        nameLabel.stringValue = ".."
+        nameLabel.textColor = ShellPalette.secondaryText(dark: dark)
+        dotLabel.stringValue = ""
+        gitBadgeLabel.stringValue = ""
+        toolTip = "Go to parent folder: \(parentPath)"
+        setAccessibilityElement(true)
+        setAccessibilityRole(.staticText)
+        setAccessibilityLabel("Parent folder")
         endEditing(commit: false)
     }
 

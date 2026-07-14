@@ -41,6 +41,12 @@ public final class BufferTabStripView: NSView {
     /// Fired with the tab's `bufnr` on double-click: promote a preview tab
     /// to permanent (no-op for tabs that are already permanent).
     public var onPromote: ((Int) -> Void)?
+    /// Leading accessory button — toggle the file sidebar. The strip only
+    /// fires the request; visibility state arrives back through
+    /// `updateAccessoryState` (nvim owns the truth).
+    public var onToggleSidebar: (() -> Void)?
+    /// Trailing accessory button — toggle the minimap (same round-trip).
+    public var onToggleMinimap: (() -> Void)?
 
     public private(set) var tabs: [BufferTab] = []
     public private(set) var current: Int = -1
@@ -48,6 +54,10 @@ public final class BufferTabStripView: NSView {
     private let scrollView = NSScrollView()
     private let stack = NSStackView()
     private let bottomBorder = NSView()
+    let sidebarButton = NSButton(title: "", target: nil, action: nil)
+    let minimapButton = NSButton(title: "", target: nil, action: nil)
+    private var sidebarVisible = true
+    private var minimapOn = true
     private var isDark = false
 
     public override init(frame frameRect: NSRect) {
@@ -101,11 +111,32 @@ public final class BufferTabStripView: NSView {
         stack.translatesAutoresizingMaskIntoConstraints = false
         scrollView.documentView = stack
 
+        configureAccessoryButton(
+            sidebarButton,
+            symbolName: "sidebar.left",
+            identifier: "tabstrip.toggleSidebar",
+            label: "Toggle Sidebar",
+            action: #selector(sidebarButtonClicked))
+        configureAccessoryButton(
+            minimapButton,
+            symbolName: "map",
+            identifier: "tabstrip.toggleMinimap",
+            label: "Toggle Minimap",
+            action: #selector(minimapButtonClicked))
+
         let clip = scrollView.contentView
         NSLayoutConstraint.activate([
+            sidebarButton.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
+            sidebarButton.centerYAnchor.constraint(equalTo: scrollView.centerYAnchor),
+            sidebarButton.widthAnchor.constraint(equalToConstant: 24),
+            minimapButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
+            minimapButton.centerYAnchor.constraint(equalTo: scrollView.centerYAnchor),
+            minimapButton.widthAnchor.constraint(equalToConstant: 24),
             scrollView.topAnchor.constraint(equalTo: topAnchor),
-            scrollView.leadingAnchor.constraint(equalTo: leadingAnchor),
-            scrollView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            scrollView.leadingAnchor.constraint(
+                equalTo: sidebarButton.trailingAnchor, constant: 4),
+            scrollView.trailingAnchor.constraint(
+                equalTo: minimapButton.leadingAnchor, constant: -4),
             scrollView.bottomAnchor.constraint(equalTo: bottomBorder.topAnchor),
             bottomBorder.leadingAnchor.constraint(equalTo: leadingAnchor),
             bottomBorder.trailingAnchor.constraint(equalTo: trailingAnchor),
@@ -120,6 +151,52 @@ public final class BufferTabStripView: NSView {
         render(tabs: [], current: -1, dark: false)
     }
 
+    private func configureAccessoryButton(
+        _ button: NSButton, symbolName: String, identifier: String,
+        label: String, action: Selector
+    ) {
+        button.isBordered = false
+        button.setButtonType(.momentaryChange)
+        button.image = NSImage(
+            systemSymbolName: symbolName, accessibilityDescription: label)
+        button.imageScaling = .scaleProportionallyDown
+        button.target = self
+        button.action = action
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.setAccessibilityIdentifier(identifier)
+        button.setAccessibilityLabel(label)
+        button.toolTip = label
+        addSubview(button)
+    }
+
+    @objc private func sidebarButtonClicked() {
+        onToggleSidebar?()
+    }
+
+    @objc private func minimapButtonClicked() {
+        onToggleMinimap?()
+    }
+
+    /// Reflects the nvim-owned chrome state (`superlemon.chrome`) on the
+    /// accessory buttons: enabled parts tint like active tab text, disabled
+    /// ones like secondary text.
+    public func updateAccessoryState(sidebarVisible: Bool, minimapOn: Bool) {
+        self.sidebarVisible = sidebarVisible
+        self.minimapOn = minimapOn
+        refreshAccessoryButtons()
+    }
+
+    private func refreshAccessoryButtons() {
+        sidebarButton.contentTintColor = sidebarVisible
+            ? ShellPalette.tabActiveText(dark: isDark)
+            : ShellPalette.secondaryText(dark: isDark)
+        minimapButton.contentTintColor = minimapOn
+            ? ShellPalette.tabActiveText(dark: isDark)
+            : ShellPalette.secondaryText(dark: isDark)
+        sidebarButton.setAccessibilityValue(sidebarVisible ? "visible" : "hidden")
+        minimapButton.setAccessibilityValue(minimapOn ? "visible" : "hidden")
+    }
+
     /// Re-renders the whole strip from the model. Idempotent; call on every
     /// `superlemon.buffers` notification and on appearance changes.
     public func render(tabs: [BufferTab], current: Int, dark: Bool) {
@@ -131,6 +208,7 @@ public final class BufferTabStripView: NSView {
 
         layer?.backgroundColor = ShellPalette.titlebarBackground(dark: dark).cgColor
         bottomBorder.layer?.backgroundColor = ShellPalette.hairline(dark: dark).cgColor
+        refreshAccessoryButtons()
 
         let existing = tabItems
         if existing.map(\.bufnr) == tabs.map(\.bufnr) {

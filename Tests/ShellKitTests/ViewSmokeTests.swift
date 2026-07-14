@@ -331,7 +331,7 @@ struct FileTreeSidebarTests {
         await sidebar.waitForPendingLoads()
         sidebar.outlineView.layoutSubtreeIfNeeded()
 
-        #expect(sidebar.outlineView.numberOfRows == 3) // src, main.swift, notes.md
+        #expect(sidebar.outlineView.numberOfRows == 4) // .., src, main.swift, notes.md
         #expect(sidebar.outlineView.rowHeight == 24)
 
         // Cell content via the delegate path (headless-safe).
@@ -363,7 +363,7 @@ struct FileTreeSidebarTests {
         sidebar.outlineView.expandItem(srcNode)
         await sidebar.waitForPendingLoads()
         sidebar.outlineView.expandItem(srcNode)
-        #expect(sidebar.outlineView.numberOfRows == 4) // + app.js
+        #expect(sidebar.outlineView.numberOfRows == 5) // + app.js
     }
 
     @Test func rowSelectionAndDisclosureActionsRequestEditorFocus() async throws {
@@ -458,9 +458,9 @@ struct FileTreeSidebarTests {
         let sidebar = FileTreeSidebarView(frame: .zero)
         sidebar.setRoot(root)
         await sidebar.waitForPendingLoads()
-        #expect(sidebar.outlineView.numberOfRows == 3)
-        sidebar.showsHiddenFiles = true
         #expect(sidebar.outlineView.numberOfRows == 4)
+        sidebar.showsHiddenFiles = true
+        #expect(sidebar.outlineView.numberOfRows == 5)
     }
 
     @Test func fileTypeDotColorsFollowPalette() {
@@ -528,6 +528,132 @@ struct FileTreeSidebarTests {
         ])
     }
 
+    @Test func parentDirectoryRowChangesWorkingDirectory() async throws {
+        let root = try makeFixtureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let sidebar = FileTreeSidebarView(frame: .zero)
+        sidebar.setRoot(root)
+        await sidebar.waitForPendingLoads()
+
+        // Row 0 is the synthetic ".." entry, rendered without a type dot.
+        let parentItem = try #require(sidebar.outlineView.item(atRow: 0))
+        #expect(!(parentItem is FileTreeNode))
+        #expect(!sidebar.outlineView(sidebar.outlineView, isItemExpandable: parentItem))
+        let cell = try #require(sidebar.outlineView(
+            sidebar.outlineView,
+            viewFor: sidebar.outlineView.tableColumns[0],
+            item: parentItem))
+        #expect(allStrings(in: cell).contains(".."))
+
+        var changedTo: [String] = []
+        var focusRequests = 0
+        sidebar.onChangeWorkingDirectory = { changedTo.append($0) }
+        sidebar.onRequestEditorFocus = { focusRequests += 1 }
+        sidebar.performRowAction(row: 0, isDoubleClick: false)
+        #expect(changedTo == [
+            root.standardizedFileURL.deletingLastPathComponent().path
+        ])
+        #expect(focusRequests == 1)
+    }
+
+    @Test func parentDirectoryRowAbsentAtFilesystemRoot() async throws {
+        struct EmptyLister: DirectoryLister {
+            func list(_ url: URL) throws -> [DirectoryEntry] { [] }
+        }
+        let sidebar = FileTreeSidebarView(frame: .zero, lister: EmptyLister())
+        sidebar.setRoot(URL(fileURLWithPath: "/", isDirectory: true))
+        await sidebar.waitForPendingLoads()
+        #expect(sidebar.outlineView.numberOfRows == 0)
+    }
+
+    /// Right-clicks the given row so `NSOutlineView.clickedRow` targets it,
+    /// then rebuilds the sidebar's context menu the way menu tracking would.
+    private func contextMenu(
+        in sidebar: FileTreeSidebarView, window: NSWindow, row: Int
+    ) throws -> NSMenu {
+        sidebar.layoutSubtreeIfNeeded()
+        let rowRect = sidebar.outlineView.rect(ofRow: row)
+        let locationInWindow = sidebar.outlineView.convert(
+            NSPoint(x: rowRect.midX, y: rowRect.midY), to: nil)
+        let event = try #require(NSEvent.mouseEvent(
+            with: .rightMouseDown, location: locationInWindow,
+            modifierFlags: [], timestamp: 0,
+            windowNumber: window.windowNumber, context: nil,
+            eventNumber: 0, clickCount: 1, pressure: 1))
+        let menu = try #require(sidebar.outlineView.menu(for: event))
+        sidebar.menuNeedsUpdate(menu)
+        return menu
+    }
+
+    @Test func contextMenuOnFolderOffersSetAsWorkingDirectory() async throws {
+        let root = try makeFixtureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sidebar = FileTreeSidebarView(
+            frame: NSRect(x: 0, y: 0, width: 370, height: 240))
+        let window = NSWindow(
+            contentRect: sidebar.frame, styleMask: [.titled],
+            backing: .buffered, defer: false)
+        window.contentView = sidebar
+        sidebar.setRoot(root)
+        await sidebar.waitForPendingLoads()
+
+        let srcRow = try #require((0..<sidebar.outlineView.numberOfRows).first {
+            (sidebar.outlineView.item(atRow: $0) as? FileTreeNode)?.name == "src"
+        })
+        let folderMenu = try contextMenu(in: sidebar, window: window, row: srcRow)
+        #expect(folderMenu.items.filter { !$0.isSeparatorItem }.map(\.title) == [
+            "Set as Working Directory",
+            "New File", "New Folder", "Rename", "Move to Trash",
+            "Reveal in Finder",
+        ])
+
+        var changedTo: [String] = []
+        sidebar.onChangeWorkingDirectory = { changedTo.append($0) }
+        let index = try #require(folderMenu.items.firstIndex {
+            $0.title == "Set as Working Directory"
+        })
+        folderMenu.performActionForItem(at: index)
+        #expect(changedTo == [root.appendingPathComponent("src").path])
+
+        // Files never offer the re-root item.
+        let fileRow = try #require((0..<sidebar.outlineView.numberOfRows).first {
+            (sidebar.outlineView.item(atRow: $0) as? FileTreeNode)?.name
+                == "main.swift"
+        })
+        let fileMenu = try contextMenu(in: sidebar, window: window, row: fileRow)
+        #expect(!fileMenu.items.map(\.title).contains("Set as Working Directory"))
+        _ = window
+    }
+
+    @Test func remoteTreeContextMenuOffersOnlyReRooting() async throws {
+        let root = try makeFixtureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sidebar = FileTreeSidebarView(
+            frame: NSRect(x: 0, y: 0, width: 370, height: 240))
+        sidebar.allowsFileOperations = false
+        let window = NSWindow(
+            contentRect: sidebar.frame, styleMask: [.titled],
+            backing: .buffered, defer: false)
+        window.contentView = sidebar
+        sidebar.setRoot(root)
+        await sidebar.waitForPendingLoads()
+
+        let srcRow = try #require((0..<sidebar.outlineView.numberOfRows).first {
+            (sidebar.outlineView.item(atRow: $0) as? FileTreeNode)?.name == "src"
+        })
+        let folderMenu = try contextMenu(in: sidebar, window: window, row: srcRow)
+        #expect(folderMenu.items.map(\.title) == ["Set as Working Directory"])
+
+        let fileRow = try #require((0..<sidebar.outlineView.numberOfRows).first {
+            (sidebar.outlineView.item(atRow: $0) as? FileTreeNode)?.name
+                == "main.swift"
+        })
+        let fileMenu = try contextMenu(in: sidebar, window: window, row: fileRow)
+        #expect(fileMenu.items.isEmpty)
+        _ = window
+    }
+
     @Test func loadingAndFailureRowsAreVisibleAndRetryable() async throws {
         enum ListingFailure: Error { case unavailable }
         final class RecoveringLister: DirectoryLister, @unchecked Sendable {
@@ -554,8 +680,9 @@ struct FileTreeSidebarTests {
 
         // An unloaded directory is represented immediately instead of
         // looking like an empty folder while its detached read is running.
-        #expect(sidebar.outlineView.numberOfRows == 1)
-        let loadingItem = try #require(sidebar.outlineView.item(atRow: 0))
+        // Row 0 is the synthetic ".." entry; the placeholder follows it.
+        #expect(sidebar.outlineView.numberOfRows == 2)
+        let loadingItem = try #require(sidebar.outlineView.item(atRow: 1))
         let loadingCell = try #require(sidebar.outlineView(
             sidebar.outlineView,
             viewFor: sidebar.outlineView.tableColumns[0],
@@ -567,7 +694,7 @@ struct FileTreeSidebarTests {
             return
         }
 
-        let failureItem = try #require(sidebar.outlineView.item(atRow: 0))
+        let failureItem = try #require(sidebar.outlineView.item(atRow: 1))
         let failureCell = try #require(sidebar.outlineView(
             sidebar.outlineView,
             viewFor: sidebar.outlineView.tableColumns[0],
@@ -578,7 +705,7 @@ struct FileTreeSidebarTests {
         await sidebar.waitForPendingLoads()
 
         #expect(sidebar.rootNode?.loadState == .loaded)
-        let recovered = sidebar.outlineView.item(atRow: 0) as? FileTreeNode
+        let recovered = sidebar.outlineView.item(atRow: 1) as? FileTreeNode
         #expect(recovered?.name == "recovered.swift")
     }
 
@@ -872,17 +999,18 @@ struct FileTreeSidebarTests {
         let sidebar = FileTreeSidebarView(frame: .zero)
         sidebar.setRoot(root)
         await sidebar.waitForPendingLoads()
-        #expect(sidebar.outlineView.numberOfRows == 3)
+        // 3 fixture rows + the synthetic ".." row.
+        #expect(sidebar.outlineView.numberOfRows == 4)
 
         // Simulate the embedder applying an operation, then reloading.
         try FileOperations.perform(.newFile(directory: root.path, name: "extra.txt"))
         sidebar.reload(path: root.path)
         await sidebar.waitForPendingLoads()
-        #expect(sidebar.outlineView.numberOfRows == 4)
+        #expect(sidebar.outlineView.numberOfRows == 5)
 
         sidebar.reload(path: nil)
         await sidebar.waitForPendingLoads()
-        #expect(sidebar.outlineView.numberOfRows == 4)
+        #expect(sidebar.outlineView.numberOfRows == 5)
     }
 }
 

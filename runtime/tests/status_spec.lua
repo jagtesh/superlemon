@@ -83,10 +83,14 @@ p = calls.notify[#calls.notify].args[1]
 H.eq(p.readonly, true, "OptionSet refreshes readonly capability")
 vim.bo.readonly = false
 
--- DirChanged pushes and re-reads project.
+-- DirChanged pushes and re-reads project. (DirChanged also emits a
+-- superlemon.cwd notification, so look at the last status push explicitly.)
 local dir2 = H.tmpdir()
 vim.cmd.cd(dir2)
-p = calls.notify[#calls.notify].args[1]
+local status_pushes = vim.tbl_filter(function(c)
+  return c.method == "superlemon.status"
+end, calls.notify)
+p = status_pushes[#status_pushes].args[1]
 H.eq(p.project, vim.fs.basename(dir2), "DirChanged pushes fresh project")
 
 ---------------------------------------------------------------------------

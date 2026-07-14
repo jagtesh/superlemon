@@ -46,7 +46,16 @@ let g:superlemon_hide_tabline = 0
 
 " Show a syntax-colored native minimap inside every sufficiently wide Neovim
 " split. Narrow splits hide it automatically instead of covering useful text.
-let g:superlemon_native_minimap = 1
+" On by default; when the window starts narrower than ~800 pt it starts hidden
+" instead. Uncomment to force a value either way (an explicit setting always
+" wins over the narrow-window default).
+" let g:superlemon_native_minimap = 1
+
+" Show the native file-navigation sidebar. On by default; when the window
+" starts narrower than ~800 pt it starts hidden instead. Uncomment to force a
+" value either way (an explicit setting always wins over the narrow-window
+" default). Toggle at runtime with :SuperlemonChrome sidebar toggle or Cmd-B.
+" let g:superlemon_native_sidebar = 1
 
 " Keep the independent native overlay scrollbar hidden by default while the
 " minimap provides document position. This can be enabled with or without the

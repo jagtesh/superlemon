@@ -28,7 +28,8 @@ H.eq(chrome, {
   native_statusbar = true,
   native_minimap = true,
   native_scrollbars = false,
-}, "g: vars and native map/scrollbar defaults seed the state")
+  native_sidebar = true,
+}, "g: vars and native map/scrollbar/sidebar defaults seed the state")
 
 -- Adopt-by-default (CONTRACT.md): the native bar RELOCATES the statusline
 -- (laststatus=0 while on, restored exactly when off); cmdheight is never
@@ -95,6 +96,35 @@ H.ok(scrollbar_topology and #scrollbar_topology.windows > 0,
   "scrollbar-only topology identifies its target window")
 require("superlemon").chrome_toggle("minimap")
 H.eq(last_notify("superlemon.chrome").native_minimap, true, "chrome_toggle flips minimap on")
+
+-- Sidebar toggles round-trip like the other chrome parts.
+vim.cmd("SuperlemonChrome sidebar off")
+H.eq(last_notify("superlemon.chrome").native_sidebar, false, "sidebar off state pushed")
+require("superlemon").chrome_toggle("sidebar")
+H.eq(last_notify("superlemon.chrome").native_sidebar, true, "chrome_toggle flips sidebar on")
+
+-- Compact startup (narrow GUI window): sidebar and minimap default off …
+require("superlemon").setup(1, { compact = true })
+local compact_chrome = last_notify("superlemon.chrome")
+H.eq(compact_chrome.native_sidebar, false, "compact startup hides the sidebar by default")
+H.eq(compact_chrome.native_minimap, false, "compact startup hides the minimap by default")
+
+-- … but an explicit g: setting always wins over the compact default.
+vim.g.superlemon_native_minimap = 1
+vim.g.superlemon_native_sidebar = 0
+require("superlemon").setup(1, { compact = true })
+compact_chrome = last_notify("superlemon.chrome")
+H.eq(compact_chrome.native_minimap, true, "explicit minimap global beats compact default")
+H.eq(compact_chrome.native_sidebar, false, "explicit sidebar global beats compact default")
+vim.g.superlemon_native_minimap = nil
+vim.g.superlemon_native_sidebar = nil
+
+-- Explicit sidebar-off global seeds off in a normal (non-compact) startup.
+vim.g.superlemon_native_sidebar = 0
+require("superlemon").setup(1)
+H.eq(last_notify("superlemon.chrome").native_sidebar, false,
+  "g:superlemon_native_sidebar = 0 starts the sidebar hidden")
+vim.g.superlemon_native_sidebar = nil
 
 -- Re-setup stays idempotent with the chrome module in play.
 require("superlemon").setup(1)
