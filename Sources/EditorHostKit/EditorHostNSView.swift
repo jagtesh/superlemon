@@ -146,6 +146,13 @@ public final class EditorHostNSView: NSView {
         chrome.sidebar.isHidden.toggle()
     }
 
+    /// Show or hide the project sidebar. Embedding hosts hide it when its
+    /// local-filesystem view doesn't match the session (e.g. the nvim being
+    /// driven runs on a remote host).
+    public func setSidebarVisible(_ visible: Bool) {
+        chrome.sidebar.isHidden = !visible
+    }
+
     /// Temporary native font-size override (the ⌘= zoom path); nil returns
     /// to the guifont/linespace values from the active Neovim configuration.
     public func setFontSizeOverride(_ size: CGFloat?) {
