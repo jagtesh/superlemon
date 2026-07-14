@@ -9,6 +9,8 @@ import EditorHostKit
 final class SettingsWindowController: NSObject, NSTextFieldDelegate {
     private var window: NSWindow?
     private var selection = NvimConfigSelection(mode: .managed, customInitPath: nil)
+    /// The last mode actually written to preferences (see persistValues()).
+    private var persistedMode: NvimConfigMode = .managed
 
     private let modePopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let modeDescription = NSTextField(wrappingLabelWithString: "")
@@ -28,6 +30,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
     func show() {
         if window == nil { build() }
         selection = NvimConfigPreferences.loadAndMigrate()
+        persistedMode = selection.mode
         loadValues()
         window?.center()
         window?.makeKeyAndOrderFront(nil)
@@ -128,7 +131,17 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         selection = NvimConfigSelection(
             mode: selectedMode,
             customInitPath: path.isEmpty ? nil : path)
-        NvimConfigPreferences.save(selection)
+        // Closing Settings with a half-configured custom selection must not
+        // strand the next launch on a missing init file: the path is always
+        // saved, but .custom is only saved once that path validates. Until
+        // then the last persisted mode is kept (demoted to .managed if that
+        // mode was .custom, whose saved path is being replaced).
+        var persisted = selection
+        if persisted.mode == .custom, customPathValidationError() != nil {
+            persisted.mode = persistedMode == .custom ? .managed : persistedMode
+        }
+        persistedMode = persisted.mode
+        NvimConfigPreferences.save(persisted)
     }
 
     private func updateControls() {

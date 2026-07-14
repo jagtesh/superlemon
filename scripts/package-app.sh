@@ -31,7 +31,7 @@ cp "$root/packaging/licenses/Neovim.txt" "$contents/Resources/Licenses/Neovim.tx
 cp "$root/packaging/THIRD_PARTY_NOTICES.md" "$contents/Resources/THIRD_PARTY_NOTICES.md"
 cp "$manifest" "$contents/Resources/dependencies.json"
 
-nvim_distribution=${SUPERLEMON_NVIM_DIST:-$($root/scripts/fetch-neovim.sh)}
+nvim_distribution=${SUPERLEMON_NVIM_DIST:-$("$root/scripts/fetch-neovim.sh")}
 if [[ ! -x "$nvim_distribution/bin/nvim" ]]; then
   echo "invalid Neovim distribution: $nvim_distribution" >&2
   exit 1
