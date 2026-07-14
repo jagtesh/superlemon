@@ -259,7 +259,8 @@ struct NvimLaunchPlanTests {
 
     @Test("Neovim versions below 0.12 are rejected")
     func minimumNeovimVersion() {
-        #expect(!NvimController.isSupportedNvimVersion("0.11.9"))
+        #expect(!NvimController.isSupportedNvimVersion("0.10.4"))
+        #expect(NvimController.isSupportedNvimVersion("0.11.2"))
         #expect(NvimController.isSupportedNvimVersion("0.12.0"))
         #expect(NvimController.isSupportedNvimVersion("0.12.4-dev-10"))
         #expect(NvimController.isSupportedNvimVersion("1.0.0"))

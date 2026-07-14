@@ -91,7 +91,7 @@ public final class NvimController {
             case .nvimNotFound:
                 "No usable Neovim executable was found. Packaged builds require the bundled copy."
             case .unsupportedNvimVersion(let version):
-                "Superlemon requires Neovim 0.12 or newer; found \(version)."
+                "Superlemon requires Neovim 0.11 or newer; found \(version)."
             case .bridgeNotReady(let reason):
                 "The Superlemon runtime bridge did not become ready: \(reason)"
             case .config(let path, let message):
@@ -558,7 +558,11 @@ public final class NvimController {
     nonisolated static func isSupportedNvimVersion(_ version: String) -> Bool {
         let parts = version.split(separator: ".").prefix(3).map { Int($0) ?? 0 }
         guard parts.count >= 2 else { return false }
-        return parts[0] > 0 || parts[1] >= 12
+        // Floor 0.11: a static audit of every nvim API the runtime
+        // calls found nothing newer than vim.fs.relpath (0.11); the redraw
+        // decoder tolerates older event payloads. 0.10 and below would
+        // need a compat prelude (vim.fs.joinpath/vim.uv/vim.system).
+        return parts[0] > 0 || parts[1] >= 11
     }
 
     /// Apply the renderer half of superlemon.vim. Neovim remains authoritative
