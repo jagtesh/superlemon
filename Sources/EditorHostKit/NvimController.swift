@@ -133,6 +133,9 @@ public final class NvimController {
     }
     private var sessionGeneration: Int { lifecycle.generation }
     private var activeConfigMode: NvimConfigMode = .managed
+    /// When set, `launchSession` uses this configuration verbatim instead of
+    /// resolving a local binary and building a launch plan.
+    private let customLaunchConfiguration: NvimLaunchConfiguration?
     private var activeConfigPath: String?
     private var safeStartRequested = false
 
@@ -261,16 +264,28 @@ public final class NvimController {
         self.init(nvimBinaryResolver: { try await NvimController.resolveNvimBinary() })
     }
 
+    /// Host-supplied transport: the configuration's process IS the RPC
+    /// channel (e.g. an ssh bridge whose stdio connects to a remote
+    /// `nvim --headless --listen` socket). Bypasses local binary resolution,
+    /// config selection, and the launch plan — the far side owns nvim's
+    /// runtimepath and config. The handshake version gate still applies and
+    /// validates the nvim actually reached.
+    public convenience init(launchConfiguration: NvimLaunchConfiguration) {
+        self.init(customLaunchConfiguration: launchConfiguration)
+    }
+
     init(
         nvimBinaryResolver: @escaping @Sendable () async throws -> URL = {
             try await NvimController.resolveNvimBinary()
         },
         configSelectionProvider: @escaping @MainActor () -> NvimConfigSelection = {
             NvimConfigPreferences.loadAndMigrate()
-        }
+        },
+        customLaunchConfiguration: NvimLaunchConfiguration? = nil
     ) {
         self.nvimBinaryResolver = nvimBinaryResolver
         self.configSelectionProvider = configSelectionProvider
+        self.customLaunchConfiguration = customLaunchConfiguration
         minimapBridge = MinimapBridge(
             surface: nil,
             notify: { [weak self] method, params in
@@ -325,29 +340,40 @@ public final class NvimController {
         let generation = lifecycle.beginGeneration()
         var launchedSession: NvimSession?
         do {
-            guard let runtime = Self.runtimeDirectory() else { throw StartupError.runtimeMissing }
-            let selection = safeStart
-                ? NvimConfigSelection(mode: .managed, customInitPath: nil)
-                : configSelectionProvider()
-            let binary = try await nvimBinaryResolver()
-            guard lifecycle.accepts(generation: generation), phase == .starting,
-                !stopRequested
-            else { return }
-            let plan = try NvimLaunchPlan.make(
-                selection: selection,
-                executableURL: binary,
-                runtimeURL: runtime,
-                baseEnvironment: ProcessInfo.processInfo.environment,
-                safeStart: safeStart)
-            activeConfigMode = plan.mode
-            activeConfigPath = plan.configURL?.path
+            let configuration: NvimLaunchConfiguration
+            if let custom = customLaunchConfiguration {
+                // Host-supplied transport: no local plan; the far side owns
+                // nvim's runtimepath and config.
+                activeConfigMode = .custom
+                activeConfigPath = nil
+                configuration = custom
+            } else {
+                guard let runtime = Self.runtimeDirectory() else {
+                    throw StartupError.runtimeMissing
+                }
+                let selection = safeStart
+                    ? NvimConfigSelection(mode: .managed, customInitPath: nil)
+                    : configSelectionProvider()
+                let binary = try await nvimBinaryResolver()
+                guard lifecycle.accepts(generation: generation), phase == .starting,
+                    !stopRequested
+                else { return }
+                let plan = try NvimLaunchPlan.make(
+                    selection: selection,
+                    executableURL: binary,
+                    runtimeURL: runtime,
+                    baseEnvironment: ProcessInfo.processInfo.environment,
+                    safeStart: safeStart)
+                activeConfigMode = plan.mode
+                activeConfigPath = plan.configURL?.path
 
-            let configuration = NvimLaunchConfiguration(
-                binaryURL: plan.executableURL,
-                arguments: plan.arguments,
-                workingDirectory: Self.workingDirectory(),
-                environment: plan.environment
-            )
+                configuration = NvimLaunchConfiguration(
+                    binaryURL: plan.executableURL,
+                    arguments: plan.arguments,
+                    workingDirectory: Self.workingDirectory(),
+                    environment: plan.environment
+                )
+            }
             let session = NvimSession(configuration: configuration)
             launchedSession = session
             // Clipboard provider handlers must be in place before any bytes
