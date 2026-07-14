@@ -228,3 +228,74 @@ struct GitIgnoreRulesTests {
         #expect(reversed.matches("keep.log", isDirectory: false))
     }
 }
+
+// MARK: - Injected index sources (the remote-session seam)
+
+/// Scripted WorkspaceIndexSource: one queued listing (or error) per refresh.
+private final class ScriptedIndexSource: WorkspaceIndexSource, @unchecked Sendable {
+    enum Step {
+        case listing(WorkspaceIndexListing)
+        case failure(Error)
+    }
+    struct Exhausted: Error {}
+
+    private let lock = NSLock()
+    private var steps: [Step]
+    private(set) var requestedRoots: [URL] = []
+    private(set) var requestedCaps: [Int] = []
+
+    init(_ steps: [Step]) { self.steps = steps }
+
+    func listFiles(root: URL, maxFiles: Int) async throws -> WorkspaceIndexListing {
+        let step: Step = lock.withLock {
+            requestedRoots.append(root)
+            requestedCaps.append(maxFiles)
+            return steps.isEmpty ? .failure(Exhausted()) : steps.removeFirst()
+        }
+        switch step {
+        case .listing(let listing): return listing
+        case .failure(let error): throw error
+        }
+    }
+}
+
+@Suite("FileIndex with an injected source")
+struct FileIndexSourceTests {
+
+    @Test func publishesSourceEntriesNewestFirstWithTruncation() async {
+        let source = ScriptedIndexSource([
+            .listing(WorkspaceIndexListing(
+                entries: [
+                    WorkspaceIndexEntry(path: "old.txt", mtime: Date(timeIntervalSince1970: 100)),
+                    WorkspaceIndexEntry(path: "new.txt", mtime: Date(timeIntervalSince1970: 300)),
+                    WorkspaceIndexEntry(path: "mid.txt", mtime: Date(timeIntervalSince1970: 200)),
+                ],
+                isTruncated: true))
+        ])
+        let index = FileIndex(
+            root: URL(fileURLWithPath: "/remote/project"), maxFiles: 3, source: source)
+        await index.refresh()
+
+        #expect(await index.allFiles() == ["new.txt", "mid.txt", "old.txt"])
+        #expect(await index.isTruncated)
+        #expect(source.requestedRoots == [URL(fileURLWithPath: "/remote/project")])
+        #expect(source.requestedCaps == [3])
+    }
+
+    @Test func failedRefreshKeepsThePreviousIndex() async {
+        struct Unavailable: Error {}
+        let source = ScriptedIndexSource([
+            .listing(WorkspaceIndexListing(
+                entries: [WorkspaceIndexEntry(path: "kept.swift", mtime: .distantPast)],
+                isTruncated: false)),
+            .failure(Unavailable()),
+        ])
+        let index = FileIndex(root: URL(fileURLWithPath: "/remote"), source: source)
+
+        await index.refresh()
+        #expect(await index.allFiles() == ["kept.swift"])
+
+        await index.refresh()  // source now fails (e.g. session not running)
+        #expect(await index.allFiles() == ["kept.swift"])
+    }
+}

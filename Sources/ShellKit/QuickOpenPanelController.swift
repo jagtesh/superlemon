@@ -248,7 +248,7 @@ public final class QuickOpenPanelController: NSObject {
         // Re-presenting while open must never stack a second scrim/child
         // window (the ⌘P-piles-up bug): just refocus the existing session.
         if sessionActive {
-            panel.makeKeyAndOrderFront(nil)
+            orderPanelFrontIfParentOnScreen()
             panel.makeFirstResponder(searchField)
             return
         }
@@ -285,8 +285,18 @@ public final class QuickOpenPanelController: NSObject {
         } else {
             panel.setContentSize(Self.panelSize)
         }
-        panel.makeKeyAndOrderFront(nil)
+        orderPanelFrontIfParentOnScreen()
         panel.makeFirstResponder(searchField)
+    }
+
+    /// Matches the ChromeKit panels' convention: skip ordering when the
+    /// parent window is absent or off screen, so headless tests never put a
+    /// real palette over the developer's desktop (or strand one there when a
+    /// run dies mid-test). Session state, geometry, and callbacks behave
+    /// identically either way.
+    private func orderPanelFrontIfParentOnScreen() {
+        guard parentWindow?.isVisible == true else { return }
+        panel.makeKeyAndOrderFront(nil)
     }
 
     public func close() {

@@ -16,9 +16,9 @@ final class CountingLister: DirectoryLister, @unchecked Sendable {
         self.wrapped = wrapped
     }
 
-    func list(_ url: URL) throws -> [DirectoryEntry] {
+    func list(_ url: URL) async throws -> [DirectoryEntry] {
         lock.withLock { recordedPaths.append(url.path) }
-        return try wrapped.list(url)
+        return try await wrapped.list(url)
     }
 }
 
@@ -42,7 +42,7 @@ struct FileTreeModelTests {
         return root
     }
 
-    @Test func childrenAreNotReadUntilFirstAccess() throws {
+    @Test func childrenAreNotReadUntilFirstAccess() async throws {
         let root = try makeFixtureTree()
         defer { try? FileManager.default.removeItem(at: root) }
         let lister = CountingLister()
@@ -52,7 +52,7 @@ struct FileTreeModelTests {
         #expect(!node.childrenLoaded)
         #expect(node.loadState == .unloaded)
 
-        let children = node.children(using: lister, showHidden: false)
+        let children = await node.children(using: lister, showHidden: false)
         #expect(lister.totalCalls == 1)
         #expect(node.childrenLoaded)
         #expect(node.loadState == .loaded)
@@ -64,63 +64,65 @@ struct FileTreeModelTests {
         #expect(lister.listedPaths == [root.path])
 
         // Repeated access is cached — no extra I/O.
-        _ = node.children(using: lister, showHidden: false)
+        _ = await node.children(using: lister, showHidden: false)
         #expect(lister.totalCalls == 1)
 
         // Expanding src lists exactly src — not src/deep.
-        let srcChildren = src.children(using: lister, showHidden: false)
+        let srcChildren = await src.children(using: lister, showHidden: false)
         #expect(lister.totalCalls == 2)
         #expect(lister.listedPaths.last == root.appendingPathComponent("src").path)
         let deep = try #require(srcChildren.first { $0.name == "deep" })
         #expect(!deep.childrenLoaded)
     }
 
-    @Test func directoriesSortFirstThenCaseInsensitiveNames() throws {
+    @Test func directoriesSortFirstThenCaseInsensitiveNames() async throws {
         let root = try makeFixtureTree()
         defer { try? FileManager.default.removeItem(at: root) }
 
         let node = FileTreeNode(url: root, isDirectory: true)
-        let names = node.children(using: FileSystemLister(), showHidden: false).map(\.name)
+        let names = await node.children(using: FileSystemLister(), showHidden: false).map(\.name)
         #expect(names == ["docs", "src", "main.swift"])
     }
 
-    @Test func hiddenFilesToggleAndGitAlwaysHidden() throws {
+    @Test func hiddenFilesToggleAndGitAlwaysHidden() async throws {
         let root = try makeFixtureTree()
         defer { try? FileManager.default.removeItem(at: root) }
 
         let node = FileTreeNode(url: root, isDirectory: true)
         let lister = FileSystemLister()
 
-        let visible = node.children(using: lister, showHidden: false).map(\.name)
+        let visible = await node.children(using: lister, showHidden: false).map(\.name)
         #expect(!visible.contains(".hidden"))
         #expect(!visible.contains(".git"))
 
-        let withHidden = node.children(using: lister, showHidden: true).map(\.name)
+        let withHidden = await node.children(using: lister, showHidden: true).map(\.name)
         #expect(withHidden.contains(".hidden"))
         #expect(!withHidden.contains(".git"))  // .git never shows
     }
 
-    @Test func invalidateChildrenReloadsFromDisk() throws {
+    @Test func invalidateChildrenReloadsFromDisk() async throws {
         let root = try makeFixtureTree()
         defer { try? FileManager.default.removeItem(at: root) }
         let lister = CountingLister()
 
         let node = FileTreeNode(url: root, isDirectory: true)
-        let before = node.children(using: lister, showHidden: false).map(\.name)
+        let before = await node.children(using: lister, showHidden: false).map(\.name)
         #expect(!before.contains("added.txt"))
 
         FileManager.default.createFile(
             atPath: root.appendingPathComponent("added.txt").path, contents: Data()
         )
         // Cached until invalidated.
-        #expect(!node.children(using: lister, showHidden: false).map(\.name).contains("added.txt"))
+        let cached = await node.children(using: lister, showHidden: false).map(\.name)
+        #expect(!cached.contains("added.txt"))
         node.invalidateChildren()
         #expect(node.loadState == .unloaded)
-        #expect(node.children(using: lister, showHidden: false).map(\.name).contains("added.txt"))
+        let reloaded = await node.children(using: lister, showHidden: false).map(\.name)
+        #expect(reloaded.contains("added.txt"))
         #expect(lister.totalCalls == 2)
     }
 
-    @Test func reconciliationPreservesUnchangedLoadedSubtreeIdentity() throws {
+    @Test func reconciliationPreservesUnchangedLoadedSubtreeIdentity() async throws {
         let rootURL = URL(fileURLWithPath: "/project")
         let root = FileTreeNode(url: rootURL, isDirectory: true)
         root.installChildren([
@@ -147,13 +149,13 @@ struct FileTreeModelTests {
         #expect(root.findLoadedNode(path: "/project/LICENSE") != nil)
     }
 
-    @Test func findLoadedNodeNeverTriggersIO() throws {
+    @Test func findLoadedNodeNeverTriggersIO() async throws {
         let root = try makeFixtureTree()
         defer { try? FileManager.default.removeItem(at: root) }
         let lister = CountingLister()
 
         let node = FileTreeNode(url: root, isDirectory: true)
-        _ = node.children(using: lister, showHidden: false)
+        _ = await node.children(using: lister, showHidden: false)
         let callsAfterLoad = lister.totalCalls
 
         // Finds a loaded node...

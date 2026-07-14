@@ -28,7 +28,20 @@ public final class EditorHostNSView: NSView {
         frame frameRect: NSRect = NSRect(x: 0, y: 0, width: 1160, height: 720)
     ) {
         self.controller = controller
-        let chrome = WorkspaceChrome(controller: controller, projectRoot: projectRoot)
+        // A remote-filesystem session sources the sidebar tree and quick-open
+        // index through the RPC channel (superlemon.workspace); the local
+        // FileManager/FSEvents fast path stays the default. One source
+        // instance serves both roles and survives session relaunches.
+        let fileAccess: WorkspaceFileAccess
+        if controller.hasRemoteFilesystem {
+            let source = NvimWorkspaceFileSource(controller: controller)
+            fileAccess = WorkspaceFileAccess(
+                lister: source, indexSource: source, isLocal: false)
+        } else {
+            fileAccess = .local
+        }
+        let chrome = WorkspaceChrome(
+            controller: controller, projectRoot: projectRoot, fileAccess: fileAccess)
         self.chrome = chrome
 
         // FontSpec default (nil name → system mono 13pt) until guifont arrives.
@@ -146,9 +159,11 @@ public final class EditorHostNSView: NSView {
         chrome.sidebar.isHidden.toggle()
     }
 
-    /// Show or hide the project sidebar. Embedding hosts hide it when its
-    /// local-filesystem view doesn't match the session (e.g. the nvim being
-    /// driven runs on a remote host).
+    /// Show or hide the project sidebar. Remote-filesystem sessions
+    /// (`NvimController.hasRemoteFilesystem`) now source the tree and
+    /// quick-open index through the session's RPC channel, so embedding
+    /// hosts no longer need to hide the sidebar for correctness — this
+    /// remains a purely presentational choice.
     public func setSidebarVisible(_ visible: Bool) {
         chrome.sidebar.isHidden = !visible
     }

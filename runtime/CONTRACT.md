@@ -637,6 +637,50 @@ Quick Open and Open File use `:drop`. Sidebar single/double clicks instead use
 the filesystem and refresh the sidebar/index, but currently do not rename or
 wipe matching open Neovim buffers.
 
+### Workspace file listings (`superlemon.workspace`)
+
+When the session's filesystem is not the GUI machine's (host-supplied remote
+transports; `NvimController.hasRemoteFilesystem`), the GUI sources the native
+sidebar tree and Quick Open index through `nvim_exec_lua` instead of its local
+filesystem. `vim.uv` on this side of the transport always enumerates the
+filesystem the session actually sees. Both calls are pure request/response
+with no side effects and are safe before `setup()`.
+
+Sidebar directory expansion (one level, never recursive):
+
+```lua
+return require("superlemon.workspace").list_dir(path)
+-- { { name = "Sources", dir = true, hidden = false }, ... }
+```
+
+Symlinks are resolved one level so a link to a directory expands. `hidden` is
+a dotfile-prefix judgment. An unreadable directory raises; the GUI shows its
+per-row failure/retry placeholder.
+
+Quick Open index (bounded synchronous walk):
+
+```lua
+return require("superlemon.workspace").list_files(root, max)
+-- { files = { { path = "Sources/a.swift", mtime = 1720000000 }, ... },
+--   truncated = false }
+```
+
+`path` is root-relative; `mtime` is epoch seconds (0 when unavailable) and
+drives the GUI's recency ordering. `.git` is always pruned. The root
+`.gitignore` is honored with the same documented subset as the GUI's local
+index (blank/`#` lines, `!` negation with last-match-wins, trailing `/`
+directory-only rules, `/`-containing patterns anchored to the relative path,
+basename match otherwise, `glob2regpat` wildcard semantics where `*` may cross
+`/`). An ignored directory is pruned whole. The walk stops at `max` files;
+`truncated` distinguishes exactly-`max` from more-than-`max`. Only regular
+files are indexed.
+
+The walk runs on Neovim's main loop, so `max` (50 000 from the GUI) is also
+the latency bound. The GUI therefore refreshes sparingly: at project-root
+adoption/changes and when the Quick Open palette is presented. There is no
+remote FSEvents equivalent; the sidebar instead re-lists a directory each time
+it is expanded.
+
 ## Guarantees and health
 
 - Merely requiring the plugin under terminal Neovim has no side effects.
@@ -668,4 +712,6 @@ resolution, configuration precedence, renderer settings, chrome/adopt mode,
 bounded minimap topology/content/invalidation behavior, buffer and preview
 semantics, evaluated statuslines, keymap ownership and Save As,
 clipboard/user-provider behavior, git parsing and stale-result suppression, and
-the canonical `superlemon.ui` transport/callback lifecycle.
+the canonical `superlemon.ui` transport/callback lifecycle, and the
+`superlemon.workspace` listings (directory shapes, gitignore-subset pruning,
+and truncation semantics).

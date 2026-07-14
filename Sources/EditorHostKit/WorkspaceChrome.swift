@@ -54,10 +54,16 @@ public final class WorkspaceChrome {
     public let toasts = MessageToastController()
 
     let statusBar = StatusBarView()
-    let sidebar = FileTreeSidebarView()
+    let sidebar: FileTreeSidebarView
     let quickOpen = QuickOpenPanelController()
     let tabStrip = BufferTabStripView()
     private(set) var fileIndex: FileIndex
+    /// Where the sidebar tree and quick-open index come from. `.local` reads
+    /// this machine's filesystem; a session-backed access reads through the
+    /// nvim RPC channel (remote transports). Local-only affordances —
+    /// FSEvents watching, sidebar file operations, and pre-open stat
+    /// validation — are gated on `fileAccess.isLocal`.
+    private let fileAccess: WorkspaceFileAccess
 
     /// Native-chrome toggles, mirrored from nvim (`superlemon.chrome` —
     /// nvim is the source of truth). The app delegate resizes the layout.
@@ -105,10 +111,19 @@ public final class WorkspaceChrome {
     /// The attached window; UIComponentRouter presents panels/sheets over it.
     var attachedWindow: NSWindow? { window }
 
-    init(controller: NvimController, projectRoot: URL) {
+    init(
+        controller: NvimController,
+        projectRoot: URL,
+        fileAccess: WorkspaceFileAccess = .local
+    ) {
         self.controller = controller
         self.projectRoot = projectRoot
-        self.fileIndex = FileIndex(root: projectRoot)
+        self.fileAccess = fileAccess
+        self.fileIndex = FileIndex(root: projectRoot, source: fileAccess.indexSource)
+        self.sidebar = FileTreeSidebarView(lister: fileAccess.lister)
+        sidebar.allowsFileOperations = fileAccess.isLocal
+        // No change notifications reach a non-local tree; poll on expansion.
+        sidebar.refreshesOnExpand = !fileAccess.isLocal
         let mono = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
         self.cmdlinePanel = CmdlinePanelController(font: mono)
         self.popupMenu = PopupMenuPanelController(font: mono)
@@ -147,7 +162,7 @@ public final class WorkspaceChrome {
 
         fileIndexGeneration &+= 1
         projectRoot = root
-        fileIndex = FileIndex(root: root)
+        fileIndex = FileIndex(root: root, source: fileAccess.indexSource)
 
         sidebar.setGitStatus([:])
         uiRouter.setProjectRoot(root)
@@ -522,6 +537,19 @@ public final class WorkspaceChrome {
     /// an obsolete workspace generation and a deleted/directory result before
     /// asking Neovim to open anything.
     private func openQuickOpenSelection(_ relativePath: String) {
+        guard fileAccess.isLocal else {
+            // The local stat below reads the wrong filesystem for a remote
+            // session. Containment is pure path logic and still applies;
+            // existence is nvim's to judge (openFile surfaces its error).
+            do {
+                let url = try Self.containedQuickOpenURL(
+                    relativePath: relativePath, projectRoot: projectRoot)
+                controller.openFile(url.path)
+            } catch let error as QuickOpenSelectionError {
+                presentQuickOpenSelectionError(error)
+            } catch {}
+            return
+        }
         let generation = fileIndexGeneration
         let root = projectRoot
         let index = fileIndex
@@ -552,7 +580,9 @@ public final class WorkspaceChrome {
         }
     }
 
-    nonisolated static func validatedQuickOpenURL(
+    /// Path containment only — no filesystem access, so it is also valid for
+    /// paths on a remote session's filesystem.
+    nonisolated static func containedQuickOpenURL(
         relativePath: String, projectRoot: URL
     ) throws -> URL {
         let root = projectRoot.standardizedFileURL
@@ -563,6 +593,14 @@ public final class WorkspaceChrome {
         else {
             throw QuickOpenSelectionError.outsideWorkspace(candidate.path)
         }
+        return candidate
+    }
+
+    nonisolated static func validatedQuickOpenURL(
+        relativePath: String, projectRoot: URL
+    ) throws -> URL {
+        let candidate = try containedQuickOpenURL(
+            relativePath: relativePath, projectRoot: projectRoot)
         var isDirectory = ObjCBool(false)
         guard FileManager.default.fileExists(
             atPath: candidate.path, isDirectory: &isDirectory), !isDirectory.boolValue
@@ -694,6 +732,10 @@ public final class WorkspaceChrome {
     }
 
     private func startWorkspaceWatcher() {
+        // FSEvents watches this machine's filesystem only. A non-local tree
+        // polls instead: directories refresh on expansion and the quick-open
+        // index refreshes when the palette is presented.
+        guard fileAccess.isLocal else { return }
         do {
             try fileWatcher.start(watching: projectRoot)
         } catch {
@@ -754,6 +796,29 @@ public final class WorkspaceChrome {
         // built-in file-picker wiring (restored on session close) is live.
         uiRouter.closePaletteSession()
         quickOpen.present(over: window)
+        guard !fileAccess.isLocal else { return }
+        // No FSEvents reach a remote filesystem, so the index refreshes when
+        // the palette opens: stale results show instantly, and the active
+        // query re-runs once the fresh listing lands.
+        refreshQuickOpenIndexWithoutWatcher()
+    }
+
+    private func refreshQuickOpenIndexWithoutWatcher() {
+        workspaceRefreshTask?.cancel()
+        let generation = fileIndexGeneration
+        let presentationGeneration = quickOpen.presentationGeneration
+        let index = fileIndex
+        workspaceRefreshTask = Task { [weak self] in
+            await index.refresh()
+            guard !Task.isCancelled, let self,
+                generation == self.fileIndexGeneration
+            else { return }
+            self.workspaceRefreshTask = nil
+            guard self.quickOpen.sessionActive,
+                presentationGeneration == self.quickOpen.presentationGeneration
+            else { return }
+            self.queryQuickOpen(self.quickOpen.query)
+        }
     }
 
     // MARK: - helpers

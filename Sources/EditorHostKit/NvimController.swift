@@ -136,6 +136,13 @@ public final class NvimController {
     /// When set, `launchSession` uses this configuration verbatim instead of
     /// resolving a local binary and building a launch plan.
     private let customLaunchConfiguration: NvimLaunchConfiguration?
+    /// True when the connected session's filesystem is not this machine's
+    /// (host-supplied transports such as an ssh bridge). Native workspace
+    /// chrome then sources the sidebar tree and quick-open index through the
+    /// RPC channel (`superlemon.workspace`, runtime/CONTRACT.md) instead of
+    /// the local filesystem, and the session's own cwd — not the host's —
+    /// becomes the project root once startup completes.
+    public let hasRemoteFilesystem: Bool
     private var activeConfigPath: String?
     private var safeStartRequested = false
 
@@ -270,8 +277,20 @@ public final class NvimController {
     /// config selection, and the launch plan — the far side owns nvim's
     /// runtimepath and config. The handshake version gate still applies and
     /// validates the nvim actually reached.
-    public convenience init(launchConfiguration: NvimLaunchConfiguration) {
-        self.init(customLaunchConfiguration: launchConfiguration)
+    ///
+    /// `remoteFilesystem` defaults to true: sourcing workspace file data
+    /// through the RPC channel is correct for any transport (the session
+    /// always sees its own filesystem), while assuming "local" against an
+    /// actually-remote nvim shows the wrong tree. A host bridging to an nvim
+    /// on THIS machine may pass false to keep FSEvents watching and native
+    /// file operations.
+    public convenience init(
+        launchConfiguration: NvimLaunchConfiguration,
+        remoteFilesystem: Bool = true
+    ) {
+        self.init(
+            customLaunchConfiguration: launchConfiguration,
+            remoteFilesystem: remoteFilesystem)
     }
 
     init(
@@ -281,11 +300,13 @@ public final class NvimController {
         configSelectionProvider: @escaping @MainActor () -> NvimConfigSelection = {
             NvimConfigPreferences.loadAndMigrate()
         },
-        customLaunchConfiguration: NvimLaunchConfiguration? = nil
+        customLaunchConfiguration: NvimLaunchConfiguration? = nil,
+        remoteFilesystem: Bool = false
     ) {
         self.nvimBinaryResolver = nvimBinaryResolver
         self.configSelectionProvider = configSelectionProvider
         self.customLaunchConfiguration = customLaunchConfiguration
+        self.hasRemoteFilesystem = remoteFilesystem
         minimapBridge = MinimapBridge(
             surface: nil,
             notify: { [weak self] method, params in
@@ -297,6 +318,16 @@ public final class NvimController {
     private func currentSessionContext() -> SessionContext? {
         guard let session, !sessionExited else { return nil }
         return SessionContext(session: session, generation: sessionGeneration)
+    }
+
+    /// Live RPC session for NvimWorkspaceFileSource (sidebar/quick-open
+    /// listings on a remote filesystem); nil before startup and after exit.
+    /// Requiring only a live stream — not `.running` — lets the sidebar's
+    /// first listing overlap the tail of startup: `superlemon.workspace` is
+    /// on the runtimepath and side-effect-free before `setup()`.
+    var workspaceFileSession: NvimSession? {
+        guard let session, !sessionExited else { return nil }
+        return session
     }
 
     private func isCurrent(_ context: SessionContext) -> Bool {
@@ -442,6 +473,13 @@ public final class NvimController {
             runtimeReady = true
             phase = .running
             deliverFirstFlushIfReady()
+            if hasRemoteFilesystem {
+                // Off the startup path: a slow/failed cwd probe must not
+                // delay first-flush consumers or a queued quit.
+                Task { [weak self] in
+                    await self?.adoptSessionWorkingDirectory(context)
+                }
+            }
             beginQueuedStartupQuitIfNeeded(context)
         } catch {
             guard sessionGeneration == generation else { return }
@@ -553,6 +591,23 @@ public final class NvimController {
                 path: error?["path"]?.stringValue ?? result["config"]?["path"]?.stringValue,
                 message: error?["message"]?.stringValue ?? "unknown configuration error")
         }
+    }
+
+    /// Remote transports start with a host-guessed project root, but the
+    /// session's own cwd is authoritative for the filesystem it sees.
+    /// Re-root the native workspace chrome once startup completes; failure
+    /// keeps the host-provided root (the sidebar surfaces its own listing
+    /// error and Quick Open stays empty until the next successful refresh).
+    private func adoptSessionWorkingDirectory(_ context: SessionContext) async {
+        guard
+            let reply = try? await context.session.request(
+                "nvim_exec_lua",
+                [.string("return vim.fn.getcwd()"), .array([])],
+                timeout: .seconds(5)),
+            isCurrent(context),
+            let path = reply.stringValue, !path.isEmpty
+        else { return }
+        chrome?.setProjectRoot(URL(fileURLWithPath: path, isDirectory: true))
     }
 
     nonisolated static func isSupportedNvimVersion(_ version: String) -> Bool {

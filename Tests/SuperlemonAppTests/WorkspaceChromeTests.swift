@@ -1,4 +1,5 @@
 import Foundation
+import NvimKit
 import Testing
 
 @testable import EditorHostKit
@@ -37,5 +38,35 @@ struct WorkspaceChromeTests {
             try WorkspaceChrome.validatedQuickOpenURL(
                 relativePath: "../outside.swift", projectRoot: root)
         }
+    }
+
+    @Test("Remote selections keep containment checks without a local stat")
+    func containsQuickOpenSelectionWithoutLocalFilesystem() throws {
+        // The root deliberately does not exist on this machine: containment
+        // is pure path logic, valid for a remote session's filesystem.
+        let root = URL(fileURLWithPath: "/remote/workspace", isDirectory: true)
+
+        let resolved = try WorkspaceChrome.containedQuickOpenURL(
+            relativePath: "Sources/app.swift", projectRoot: root)
+        #expect(resolved.path == "/remote/workspace/Sources/app.swift")
+
+        #expect(throws: QuickOpenSelectionError.outsideWorkspace("/remote/outside.swift")) {
+            try WorkspaceChrome.containedQuickOpenURL(
+                relativePath: "../outside.swift", projectRoot: root)
+        }
+    }
+
+    @Test("hasRemoteFilesystem follows the host-supplied launch configuration")
+    @MainActor
+    func remoteFilesystemFlag() {
+        #expect(!NvimController().hasRemoteFilesystem)
+
+        let bridge = NvimLaunchConfiguration(
+            binaryURL: URL(fileURLWithPath: "/usr/bin/nc"),
+            arguments: ["-U", "/tmp/nvim.sock"])
+        #expect(NvimController(launchConfiguration: bridge).hasRemoteFilesystem)
+        #expect(
+            !NvimController(launchConfiguration: bridge, remoteFilesystem: false)
+                .hasRemoteFilesystem)
     }
 }

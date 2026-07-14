@@ -1,13 +1,111 @@
-// FileIndex — actor that walks a project root and serves the quick-open
+// FileIndex — actor that lists a project root and serves the quick-open
 // palette: full file list (modification-time ordered) and fuzzy queries via
 // FuzzyScorer.
 //
-// Walking happens on the actor's executor (off the main thread). `.git` is
-// always skipped. Root-level `.gitignore` rules are honored per the subset
-// documented on `GitIgnoreRules`. The index caps at `maxFiles` (50 000)
-// entries; refresh() re-walks from scratch.
+// Enumeration goes through a `WorkspaceIndexSource` (off the main thread).
+// The local source walks FileManager: `.git` is always skipped and
+// root-level `.gitignore` rules are honored per the subset documented on
+// `GitIgnoreRules`. The index caps at `maxFiles` (50 000) entries;
+// refresh() re-lists from scratch.
 
 import Foundation
+
+/// One indexable file: a root-relative path plus its modification time
+/// (recency drives the empty-query ordering).
+public struct WorkspaceIndexEntry: Sendable {
+    public let path: String
+    public let mtime: Date
+
+    public init(path: String, mtime: Date) {
+        self.path = path
+        self.mtime = mtime
+    }
+}
+
+public struct WorkspaceIndexListing: Sendable {
+    public let entries: [WorkspaceIndexEntry]
+    /// True when the enumeration found more files than the requested cap.
+    public let isTruncated: Bool
+
+    public init(entries: [WorkspaceIndexEntry], isTruncated: Bool) {
+        self.entries = entries
+        self.isTruncated = isTruncated
+    }
+}
+
+/// Enumerates every indexable file under a project root. The local source
+/// walks FileManager; a session-backed source may read the filesystem the
+/// connected editor actually sees, which need not be this machine's. A
+/// thrown error (including CancellationError) leaves the previous index
+/// intact rather than publishing a partial listing.
+public protocol WorkspaceIndexSource: Sendable {
+    func listFiles(root: URL, maxFiles: Int) async throws -> WorkspaceIndexListing
+}
+
+/// The local-filesystem walk (the production default and the fast path).
+public struct LocalWorkspaceIndexSource: WorkspaceIndexSource {
+    public init() {}
+
+    public func listFiles(root: URL, maxFiles: Int) async throws -> WorkspaceIndexListing {
+        // NSEnumerator iteration is unavailable in async contexts; the walk
+        // itself is synchronous (cancellation is polled per item).
+        try walk(root: root, maxFiles: maxFiles)
+    }
+
+    private func walk(root: URL, maxFiles: Int) throws -> WorkspaceIndexListing {
+        let fm = FileManager.default
+        let ignore = GitIgnoreRules(contentsOf: root.appendingPathComponent(".gitignore"))
+        let rootPath = root.path
+
+        var collected: [WorkspaceIndexEntry] = []
+        let keys: [URLResourceKey] = [.isDirectoryKey, .isRegularFileKey, .contentModificationDateKey]
+        guard let enumerator = fm.enumerator(
+            at: root,
+            includingPropertiesForKeys: keys,
+            options: [] // hidden files included; .gitignore decides, .git skipped below
+        ) else {
+            return WorkspaceIndexListing(entries: [], isTruncated: false)
+        }
+
+        var truncated = false
+        for case let url as URL in enumerator {
+            // A superseded refresh should leave the last complete index
+            // intact instead of publishing a partial walk.
+            try Task.checkCancellation()
+            let values = try? url.resourceValues(forKeys: Set(keys))
+            let isDirectory = values?.isDirectory ?? false
+            let relative = relativePath(of: url.standardizedFileURL.path, under: rootPath)
+
+            if isDirectory {
+                if url.lastPathComponent == ".git" || ignore.matches(relative, isDirectory: true) {
+                    enumerator.skipDescendants()
+                }
+                continue
+            }
+            guard values?.isRegularFile ?? false else { continue }
+            if ignore.matches(relative, isDirectory: false) { continue }
+
+            collected.append(WorkspaceIndexEntry(
+                path: relative,
+                mtime: values?.contentModificationDate ?? .distantPast))
+            // Read one item beyond the cap so the UI can distinguish exactly
+            // `maxFiles` files from a truncated index.
+            if collected.count > maxFiles {
+                collected.removeLast()
+                truncated = true
+                break
+            }
+        }
+        return WorkspaceIndexListing(entries: collected, isTruncated: truncated)
+    }
+
+    private func relativePath(of path: String, under rootPath: String) -> String {
+        guard path.hasPrefix(rootPath) else { return path }
+        var rel = String(path.dropFirst(rootPath.count))
+        if rel.hasPrefix("/") { rel.removeFirst() }
+        return rel
+    }
+}
 
 public struct FileIndexQueryResult: Sendable {
     public let matches: [(path: String, positions: [Int])]
@@ -37,15 +135,21 @@ public actor FileIndex {
     public let root: URL
     /// Hard cap on indexed files (injectable for tests; 50k in production).
     public let maxFiles: Int
+    private let source: WorkspaceIndexSource
 
     /// Relative paths ordered by modification date, newest first.
     private var files: [String] = []
-    /// True when the last completed walk found more files than `maxFiles`.
+    /// True when the last completed listing found more files than `maxFiles`.
     public private(set) var isTruncated = false
 
-    public init(root: URL, maxFiles: Int = FileIndex.defaultMaxFiles) {
+    public init(
+        root: URL,
+        maxFiles: Int = FileIndex.defaultMaxFiles,
+        source: WorkspaceIndexSource = LocalWorkspaceIndexSource()
+    ) {
         self.root = root.standardizedFileURL
         self.maxFiles = max(0, maxFiles)
+        self.source = source
     }
 
     /// All indexed relative paths, most recently modified first.
@@ -54,58 +158,19 @@ public actor FileIndex {
     /// Number of indexed files (the live "32 files" count).
     public func count() -> Int { files.count }
 
-    /// Re-walks the root directory, rebuilding the index.
-    public func refresh() {
-        let fm = FileManager.default
-        let ignore = GitIgnoreRules(contentsOf: root.appendingPathComponent(".gitignore"))
-        let rootPath = root.path
-
-        var collected: [(path: String, mtime: Date)] = []
-        let keys: [URLResourceKey] = [.isDirectoryKey, .isRegularFileKey, .contentModificationDateKey]
-        guard let enumerator = fm.enumerator(
-            at: root,
-            includingPropertiesForKeys: keys,
-            options: [] // hidden files included; .gitignore decides, .git skipped below
-        ) else {
-            files = []
-            isTruncated = false
-            return
-        }
-
-        var truncated = false
-        for case let url as URL in enumerator {
-            // A superseded root refresh should leave the last complete index
-            // intact instead of publishing a partial walk.
-            if Task.isCancelled { return }
-            let values = try? url.resourceValues(forKeys: Set(keys))
-            let isDirectory = values?.isDirectory ?? false
-            let relative = relativePath(of: url.standardizedFileURL.path, under: rootPath)
-
-            if isDirectory {
-                if url.lastPathComponent == ".git" || ignore.matches(relative, isDirectory: true) {
-                    enumerator.skipDescendants()
-                }
-                continue
-            }
-            guard values?.isRegularFile ?? false else { continue }
-            if ignore.matches(relative, isDirectory: false) { continue }
-
-            collected.append((relative, values?.contentModificationDate ?? .distantPast))
-            // Read one item beyond the cap so the UI can distinguish exactly
-            // `maxFiles` files from a truncated index.
-            if collected.count > maxFiles {
-                collected.removeLast()
-                truncated = true
-                break
-            }
-        }
-
-        if Task.isCancelled { return }
+    /// Re-lists the root directory, rebuilding the index. A cancelled or
+    /// failed listing (e.g. the session-backed source without a live
+    /// session) leaves the last complete index intact.
+    public func refresh() async {
+        guard let listing = try? await source.listFiles(root: root, maxFiles: maxFiles),
+            !Task.isCancelled
+        else { return }
+        var collected = listing.entries
         collected.sort { lhs, rhs in
             lhs.mtime != rhs.mtime ? lhs.mtime > rhs.mtime : lhs.path < rhs.path
         }
         files = collected.map(\.path)
-        isTruncated = truncated
+        isTruncated = listing.isTruncated
     }
 
     /// Fuzzy query over the index. Empty query returns the most recently
@@ -196,13 +261,6 @@ public actor FileIndex {
             matchingCount: ranked.matchingCount,
             totalCount: files.count,
             isTruncated: isTruncated)
-    }
-
-    private func relativePath(of path: String, under rootPath: String) -> String {
-        guard path.hasPrefix(rootPath) else { return path }
-        var rel = String(path.dropFirst(rootPath.count))
-        if rel.hasPrefix("/") { rel.removeFirst() }
-        return rel
     }
 }
 

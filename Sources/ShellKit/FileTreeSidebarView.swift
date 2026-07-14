@@ -29,13 +29,15 @@ public struct DirectoryEntry: Equatable, Sendable {
 public protocol DirectoryLister: Sendable {
     /// Immediate children of `url` (no recursion). Order is not required;
     /// the tree sorts directories-first, then case-insensitive by name.
-    func list(_ url: URL) throws -> [DirectoryEntry]
+    /// May suspend: a session-backed lister fetches the listing over RPC
+    /// from the filesystem the connected editor sees.
+    func list(_ url: URL) async throws -> [DirectoryEntry]
 }
 
 public struct FileSystemLister: DirectoryLister {
     public init() {}
 
-    public func list(_ url: URL) throws -> [DirectoryEntry] {
+    public func list(_ url: URL) async throws -> [DirectoryEntry] {
         let fm = FileManager.default
         let keys: [URLResourceKey] = [.isDirectoryKey, .isHiddenKey]
         let urls = try fm.contentsOfDirectory(
@@ -94,12 +96,12 @@ public final class FileTreeNode {
 
     /// Lazily lists children. `showHidden` filters dotfiles; `.git` is
     /// always hidden regardless.
-    public func children(using lister: DirectoryLister, showHidden: Bool) -> [FileTreeNode] {
+    public func children(using lister: DirectoryLister, showHidden: Bool) async -> [FileTreeNode] {
         guard isDirectory else { return [] }
         if !childrenLoaded {
             beginLoading()
             do {
-                installChildren(try lister.list(url))
+                installChildren(try await lister.list(url))
             } catch {
                 failLoading(error.localizedDescription)
             }
@@ -283,6 +285,18 @@ public final class FileTreeSidebarView: NSView {
         }
     }
     public var onFileOperation: ((FileOperation) -> Void)?
+
+    /// Whether rows offer local-filesystem affordances (the context menu's
+    /// New File/Folder, Rename, Move to Trash, and Reveal in Finder). Turned
+    /// off when the tree is sourced from a filesystem this machine's
+    /// FileManager and Finder cannot reach (remote sessions).
+    public var allowsFileOperations = true
+
+    /// Refresh a loaded directory every time it is expanded, not only when a
+    /// filesystem event marked it stale. Trees sourced without change
+    /// notifications (a remote filesystem has no FSEvents equivalent) use
+    /// this as a cheap poll on expansion.
+    public var refreshesOnExpand = false
 
     /// Show dotfiles (`.git` stays hidden always).
     public var showsHiddenFiles: Bool = false {
@@ -639,7 +653,7 @@ public final class FileTreeSidebarView: NSView {
         loadingTasks[path] = Task { [weak self, weak node] in
             let result = await Task.detached(priority: .userInitiated) {
                 do {
-                    return DirectoryListingResult.success(try lister.list(url))
+                    return DirectoryListingResult.success(try await lister.list(url))
                 } catch {
                     return DirectoryListingResult.failure(error.localizedDescription)
                 }
@@ -665,7 +679,15 @@ public final class FileTreeSidebarView: NSView {
                     self.outlineView.reloadData()
                 } else {
                     self.outlineView.reloadItem(node, reloadChildren: true)
-                    if shouldExpand { self.outlineView.expandItem(node) }
+                    if shouldExpand {
+                        // Programmatic follow-through of the user's expansion,
+                        // whose listing just arrived: it must not read as a
+                        // fresh user expand (poll-on-expand would immediately
+                        // re-list, doubling every first remote expansion).
+                        self.isRestoringLayout = true
+                        defer { self.isRestoringLayout = false }
+                        self.outlineView.expandItem(node)
+                    }
                 }
             case .refresh:
                 guard case .success(let entries) = result else {
@@ -912,9 +934,14 @@ extension FileTreeSidebarView: NSOutlineViewDataSource, NSOutlineViewDelegate {
         if !node.childrenLoaded {
             pendingExpansionPaths.insert(node.url.path)
             requestChildren(for: node)
-        } else if staleDirectoryPaths.remove(node.url.path) != nil {
+        } else if staleDirectoryPaths.remove(node.url.path) != nil
+            || (refreshesOnExpand && !isRestoringLayout)
+        {
             // A collapsed loaded branch stayed untouched while FSEvents were
-            // arriving. Refresh only now that it is becoming visible.
+            // arriving. Refresh only now that it is becoming visible. The
+            // poll-on-expand mode must ignore restoreLayout's re-expansions:
+            // a refresh completion restores layout, so polling there would
+            // schedule the next refresh forever.
             requestRefresh(for: node)
         }
         return true
@@ -993,7 +1020,9 @@ extension FileTreeSidebarView: NSMenuDelegate {
 
     public func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
-        guard let node = contextMenuNode else { return }
+        // Every item mutates or reveals through the LOCAL filesystem; an
+        // empty menu never shows, so remote-sourced trees get no menu.
+        guard allowsFileOperations, let node = contextMenuNode else { return }
 
         func item(_ title: String, _ action: Selector) -> NSMenuItem {
             let item = NSMenuItem(title: title, action: action, keyEquivalent: "")

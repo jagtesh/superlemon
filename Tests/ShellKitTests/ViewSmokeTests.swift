@@ -912,3 +912,89 @@ struct FileTreeSidebarTests {
         controller.close()
     }
 }
+
+// MARK: - Remote-sourced trees (no local filesystem behind the rows)
+
+@Suite("FileTreeSidebarView remote sourcing", .serialized)
+@MainActor
+struct FileTreeSidebarRemoteTests {
+
+    /// Counts list() calls per path; backed by the real local filesystem so
+    /// the outline view sees ordinary listings.
+    private final class CountingLister: DirectoryLister, @unchecked Sendable {
+        private let lock = NSLock()
+        private var recorded: [String] = []
+        var listedPaths: [String] { lock.withLock { recorded } }
+
+        func list(_ url: URL) async throws -> [DirectoryEntry] {
+            lock.withLock { recorded.append(url.path) }
+            return try await FileSystemLister().list(url)
+        }
+
+        func calls(for path: String) -> Int {
+            listedPaths.filter { $0 == path }.count
+        }
+    }
+
+    @Test func disabledFileOperationsSuppressTheWholeContextMenu() async throws {
+        let root = try makeFixtureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let sidebar = FileTreeSidebarView(frame: .zero)
+        sidebar.allowsFileOperations = false
+        sidebar.setRoot(root)
+        await sidebar.waitForPendingLoads()
+
+        let menu = try #require(sidebar.outlineView.menu)
+        sidebar.menuNeedsUpdate(menu)
+        #expect(menu.items.isEmpty, "every item is a local-FS mutation or Finder reveal")
+
+        sidebar.allowsFileOperations = true
+        sidebar.menuNeedsUpdate(menu)
+        #expect(!menu.items.isEmpty)
+    }
+
+    @Test func refreshesOnExpandReListsALoadedDirectory() async throws {
+        let root = try makeFixtureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let lister = CountingLister()
+
+        // Real frame + host window: the refresh path restores layout via
+        // layoutSubtreeIfNeeded, which spins in temporary-engine Auto Layout
+        // recursion for a zero-sized, windowless outline view.
+        let sidebar = FileTreeSidebarView(
+            frame: NSRect(x: 0, y: 0, width: 370, height: 400), lister: lister)
+        let window = NSWindow(
+            contentRect: sidebar.frame, styleMask: [.titled],
+            backing: .buffered, defer: false)
+        window.contentView = sidebar
+        defer { window.orderOut(nil) }
+        sidebar.refreshesOnExpand = true
+        sidebar.setRoot(root)
+        await sidebar.waitForPendingLoads()
+
+        let srcPath = root.appendingPathComponent("src").path
+        let srcRow = try #require((0..<sidebar.outlineView.numberOfRows).first {
+            (sidebar.outlineView.item(atRow: $0) as? FileTreeNode)?.name == "src"
+        })
+        let srcNode = try #require(sidebar.outlineView.item(atRow: srcRow) as? FileTreeNode)
+
+        // First expansion: the ordinary lazy initial listing.
+        sidebar.outlineView.expandItem(srcNode)
+        await sidebar.waitForPendingLoads()
+        #expect(lister.calls(for: srcPath) == 1)
+
+        // Collapse and re-expand: no FSEvents marked src stale, but a tree
+        // without change notifications must poll it again on expansion.
+        sidebar.outlineView.collapseItem(srcNode)
+        #expect(sidebar.outlineView(sidebar.outlineView, shouldExpandItem: srcNode))
+        await sidebar.waitForPendingLoads()
+        #expect(lister.calls(for: srcPath) == 2)
+
+        // The local default keeps expansion I/O-free for loaded branches.
+        sidebar.refreshesOnExpand = false
+        #expect(sidebar.outlineView(sidebar.outlineView, shouldExpandItem: srcNode))
+        await sidebar.waitForPendingLoads()
+        #expect(lister.calls(for: srcPath) == 2)
+    }
+}
