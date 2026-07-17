@@ -693,6 +693,35 @@ Quick Open and Open File use `:drop`. Sidebar single/double clicks instead use
 the filesystem and refresh the sidebar/index, but currently do not rename or
 wipe matching open Neovim buffers.
 
+### Appearance (`superlemon.appearance`)
+
+`:h 'background'` assigns UIs the job of reporting the detected background.
+The GUI does so with:
+
+```lua
+return require("superlemon.appearance").apply(value, force)
+-- value: "dark" | "light";  force: boolean
+```
+
+It reports once during startup (after bridge setup, before the
+authoritative redraw, so the first presented frame carries the right
+colors) and again whenever the report would change: a macOS appearance
+switch in the Auto appearance mode, or a Settings change between Auto,
+Light, and Dark. Auto reports the system appearance with `force = false`;
+Light/Dark report their value with `force = true`.
+
+An unforced report backs off when `'background'` was set explicitly by
+anything other than a previous report — user configuration, a manual
+`:set`, or a colorscheme that pins one background (bundled habamax does) —
+so system-following never overrides a deliberate choice. The managed
+configuration uses the adaptive bundled `default` scheme for exactly this
+reason. A forced
+report always applies, and records itself in
+`g:superlemon_applied_background` like any report, so returning the
+setting to Auto resumes system-following cleanly. Setting `'background'`
+reloads an adaptive colorscheme; a colorscheme that ignores it keeps its
+own colors, and Neovim remains the pixel authority.
+
 ### Workspace file listings (`superlemon.workspace`)
 
 When the session's filesystem is not the GUI machine's (host-supplied remote

@@ -155,7 +155,12 @@ public final class EditorHostNSView: NSView {
         window.layoutIfNeeded()
         splitView.setPosition(260, ofDividerAt: 0)
 
-        appearanceObservation = window.observe(\.effectiveAppearance) {
+        // `.initial` styles the chrome for the appearance the window opens
+        // with; without it the first styling only happened on the first
+        // appearance *change*, leaving a dark-system launch light-themed.
+        appearanceObservation = window.observe(
+            \.effectiveAppearance, options: [.initial]
+        ) {
             [weak chrome, weak window] _, _ in
             Task { @MainActor in
                 guard let window, let chrome else { return }

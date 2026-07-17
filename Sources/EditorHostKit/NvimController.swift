@@ -151,6 +151,15 @@ public final class NvimController {
     /// a user-owned interactive session may disable this to leave the far
     /// side's configuration untouched. Ignored for locally planned launches.
     public var adoptsManagedConfiguration = true
+    /// The Appearance setting (Auto/Light/Dark). Auto reports the macOS
+    /// system appearance into the session's 'background' at bridge startup
+    /// and on every system switch — the UI-detection role `:h 'background'`
+    /// describes; Light/Dark report a forced value. Overridable seam for
+    /// embedding hosts and tests; the default reads Settings.
+    public var appearanceModeProvider: @MainActor () -> AppearanceMode = {
+        AppearancePreferences.load()
+    }
+    private var systemAppearanceObservation: NSKeyValueObservation?
     private var activeConfigPath: String?
     private var safeStartRequested = false
 
@@ -331,6 +340,14 @@ public final class NvimController {
         self.configSelectionProvider = configSelectionProvider
         self.customLaunchConfiguration = customLaunchConfiguration
         self.hasRemoteFilesystem = remoteFilesystem
+        // App-level appearance follows the system even while the window's
+        // own appearance is pinned to the colorscheme, so this fires on
+        // every system light/dark switch.
+        systemAppearanceObservation = NSApplication.shared.observe(
+            \.effectiveAppearance
+        ) { [weak self] _, _ in
+            Task { @MainActor in self?.systemAppearanceDidChange() }
+        }
         minimapBridge = MinimapBridge(
             surface: nil,
             notify: { [weak self] method, params in
@@ -486,6 +503,11 @@ public final class NvimController {
             guard isCurrent(context), phase == .starting else { return }
             try await bootstrapRuntimePlugin(session)
             guard isCurrent(context), phase == .starting else { return }
+            // Report the resolved appearance before the authoritative
+            // redraw so the first presented frame already carries the
+            // right light/dark colors — no light flash on a dark system.
+            await pushAppearanceBackground(session)
+            guard isCurrent(context), phase == .starting else { return }
             // Startup/config can flush partial frames before the bridge has
             // installed its final chrome and notification state. Discard those
             // candidates, force one authoritative redraw through the now-ready
@@ -621,6 +643,37 @@ public final class NvimController {
                 path: error?["path"]?.stringValue ?? result["config"]?["path"]?.stringValue,
                 message: error?["message"]?.stringValue ?? "unknown configuration error")
         }
+    }
+
+    /// Re-report the appearance to the live session; Settings calls this
+    /// when the Appearance mode changes so the switch applies immediately.
+    public func applyAppearancePreference() {
+        guard let session, !sessionExited, phase == .running else { return }
+        Task { await self.pushAppearanceBackground(session) }
+    }
+
+    private func systemAppearanceDidChange() {
+        guard appearanceModeProvider() == .auto else { return }
+        applyAppearancePreference()
+    }
+
+    /// Report the resolved 'background' (`superlemon.appearance`,
+    /// runtime/CONTRACT.md). Failure must never gate startup — a session
+    /// without the runtime module simply keeps its own background.
+    private func pushAppearanceBackground(_ session: NvimSession) async {
+        let systemIsDark = NSApplication.shared.effectiveAppearance
+            .bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        let report = appearanceModeProvider()
+            .resolvedBackground(systemIsDark: systemIsDark)
+        _ = try? await session.request(
+            "nvim_exec_lua",
+            [
+                .string(
+                    "local value, force = ...\n"
+                        + "return require('superlemon.appearance').apply(value, force)"),
+                .array([.string(report.value), .bool(report.force)]),
+            ],
+            timeout: .seconds(5))
     }
 
     /// Remote transports start with a host-guessed project root, but the

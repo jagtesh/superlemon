@@ -12,6 +12,11 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
     /// The last mode actually written to preferences (see persistValues()).
     private var persistedMode: NvimConfigMode = .managed
 
+    private let appearancePopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let appearanceDescription = NSTextField(
+        wrappingLabelWithString:
+            "Auto follows the macOS appearance. All modes report Neovim's "
+            + "'background'; the active colorscheme decides the actual colors.")
     private let modePopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let modeDescription = NSTextField(wrappingLabelWithString: "")
     private let customPathField = NSTextField(string: "")
@@ -26,6 +31,9 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
     /// Neovim so the selected configuration remains the single authority.
     var onEditConfiguration: ((NvimConfigSelection) -> Void)?
     var onRelaunch: (() -> Void)?
+    /// Fired after the Appearance mode is persisted; the embedder re-reports
+    /// the resolved background to the live session (no relaunch needed).
+    var onAppearanceModeChanged: (() -> Void)?
 
     func show() {
         if window == nil { build() }
@@ -46,10 +54,18 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
 
     private func build() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: 340),
+            contentRect: NSRect(x: 0, y: 0, width: 560, height: 430),
             styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "Settings"
         window.isReleasedWhenClosed = false
+
+        for mode in AppearanceMode.allCases {
+            appearancePopup.addItem(withTitle: mode.displayName)
+        }
+        appearancePopup.target = self
+        appearancePopup.action = #selector(appearanceModeChanged)
+        appearanceDescription.textColor = .secondaryLabelColor
+        appearanceDescription.font = .systemFont(ofSize: 11)
 
         for mode in NvimConfigMode.allCases {
             modePopup.addItem(withTitle: mode.displayName)
@@ -83,6 +99,9 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         relaunchButton.action = #selector(relaunch)
 
         let stack = NSStackView(views: [
+            sectionLabel("APPEARANCE"),
+            appearancePopup,
+            appearanceDescription,
             sectionLabel("NEOVIM CONFIGURATION"),
             modePopup,
             modeDescription,
@@ -96,6 +115,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 10
+        stack.setCustomSpacing(18, after: appearanceDescription)
         stack.setCustomSpacing(18, after: validationLabel)
         stack.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -106,6 +126,8 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
             stack.leadingAnchor.constraint(equalTo: window.contentView!.leadingAnchor),
             stack.trailingAnchor.constraint(equalTo: window.contentView!.trailingAnchor),
             stack.bottomAnchor.constraint(lessThanOrEqualTo: window.contentView!.bottomAnchor),
+            appearancePopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 260),
+            appearanceDescription.widthAnchor.constraint(lessThanOrEqualToConstant: 510),
             modePopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 260),
             customPathField.widthAnchor.constraint(greaterThanOrEqualToConstant: 380),
             modeDescription.widthAnchor.constraint(lessThanOrEqualToConstant: 510),
@@ -115,9 +137,18 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
     }
 
     private func loadValues() {
+        appearancePopup.selectItem(
+            at: AppearanceMode.allCases.firstIndex(of: AppearancePreferences.load()) ?? 0)
         modePopup.selectItem(at: NvimConfigMode.allCases.firstIndex(of: selection.mode) ?? 0)
         customPathField.stringValue = selection.customInitPath ?? ""
         updateControls()
+    }
+
+    @objc private func appearanceModeChanged() {
+        let index = appearancePopup.indexOfSelectedItem
+        guard AppearanceMode.allCases.indices.contains(index) else { return }
+        AppearancePreferences.save(AppearanceMode.allCases[index])
+        onAppearanceModeChanged?()
     }
 
     private var selectedMode: NvimConfigMode {

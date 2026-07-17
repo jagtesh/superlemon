@@ -34,6 +34,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                 }
             }
             settings.onRelaunch = { [weak self] in self?.relaunch() }
+            settings.onAppearanceModeChanged = { [weak controller] in
+                controller?.applyAppearancePreference()
+            }
             self.settings = settings
         }
         settings?.show()

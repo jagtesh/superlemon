@@ -39,8 +39,10 @@ local function apply_editor_defaults()
   vim.cmd("filetype plugin indent on")
   vim.cmd("syntax enable")
 
-  -- Ships with nvim; calm and readable in both appearances.
-  vim.cmd.colorscheme("habamax")
+  -- Ships with nvim, and — unlike bundled schemes such as habamax that pin
+  -- 'background' to one value — adapts to it, so the Appearance setting
+  -- (Auto/Light/Dark, CONTRACT.md "Appearance") can follow the system.
+  vim.cmd.colorscheme("default")
 end
 
 --- Apply the complete managed configuration: editor defaults, the annotated
