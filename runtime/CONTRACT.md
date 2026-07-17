@@ -704,6 +704,38 @@ adoption/changes and when the Quick Open palette is presented. There is no
 remote FSEvents equivalent; the sidebar instead re-lists a directory each time
 it is expanded.
 
+#### File transfers (sidebar drag & drop)
+
+The GUI's sidebar drag-and-drop streams file bytes between its machine and
+the session's filesystem through chunked, handle-based calls. Chunks are
+base64 strings (`vim.base64`): Lua strings are 8-bit clean, but arbitrary
+bytes must not round-trip through msgpack STR/UTF-8 decoding on the GUI
+side. All calls are synchronous request/response with no side effects
+beyond the named file.
+
+```lua
+ws.stat(path)            -- { type = "file"|"directory"|..., size = n } | vim.NIL
+ws.mkdir(path)           -- mkdir -p; true (existing directory is success)
+ws.rename(from, to)      -- move; ERRORS if `to` exists (moves never overwrite)
+
+id = ws.write_open(path)          -- opens `path .. ".superlemon-partial-<id>"`
+ws.write_chunk(id, b64)           -- append; returns cumulative bytes written
+ws.write_close(id, commit)        -- true: rename partial over `path`
+                                  -- (atomic replace); false: unlink partial
+
+r = ws.read_open(path)            -- { id, size }; errors unless a regular file
+ws.read_chunk(r.id, max_bytes)    -- next base64 chunk | vim.NIL at EOF
+ws.read_close(r.id)
+```
+
+Writes are atomic: until `write_close(id, true)` the target is untouched,
+so a cancelled or failed upload never leaves a torn file. Handles live in a
+session registry keyed by id; a stale or wrong-kind id errors. Handles are
+GUI-owned — a GUI that dies mid-transfer leaks its handle until this nvim
+exits (bounded; never data loss). The GUI streams 512 KiB of raw bytes per
+chunk (~700 KB encoded) to keep the remote event loop responsive and
+progress ticks flowing.
+
 ## Guarantees and health
 
 - Merely requiring the plugin under terminal Neovim has no side effects.

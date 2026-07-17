@@ -310,6 +310,34 @@ public final class FileTreeSidebarView: NSView {
     /// this as a cheap poll on expansion.
     public var refreshesOnExpand = false
 
+    // MARK: Drag & drop (WorkspaceFileTransfer.swift)
+
+    /// External drop: local file URLs land in a workspace directory. The
+    /// embedder runs the transfer (local copy or RPC upload). Unset
+    /// disables drops.
+    public var onDropFiles: ((_ urls: [URL], _ directoryPath: String) -> Void)?
+    /// Internal drag between tree directories: a MOVE within the workspace.
+    /// Unset disables internal drags.
+    public var onMoveItems: ((_ sourcePaths: [String], _ directoryPath: String) -> Void)?
+    /// Pasteboard writer for dragging a row OUT of the tree: a plain file
+    /// URL when the workspace is this machine's filesystem (Finder performs
+    /// the copy), or an NSFilePromiseProvider whose fulfillment streams a
+    /// download. Unset disables dragging out.
+    public var dragWriterProvider: ((_ path: String, _ isDirectory: Bool) -> NSPasteboardWriting?)?
+    /// Cancel button in the transfer band.
+    public var onCancelTransfers: (() -> Void)? {
+        get { transferBand.onCancel }
+        set { transferBand.onCancel = newValue }
+    }
+
+    /// Paths captured at drag start; internal drops consume these instead
+    /// of round-tripping through the pasteboard (a remote tree's writers
+    /// are promises, not URLs).
+    var draggedNodePaths: [String] = []
+    private let transferBand = FileTransferProgressView()
+    private var transferBandHeight: NSLayoutConstraint!
+    private let promiseReceiveQueue = OperationQueue()
+
     /// Show dotfiles (`.git` stays hidden always).
     public var showsHiddenFiles: Bool = false {
         didSet {
@@ -386,26 +414,63 @@ public final class FileTreeSidebarView: NSView {
         menu.delegate = self
         outlineView.menu = menu
 
+        // Dragging: rows drag out (writer supplied by the embedder), Finder
+        // items and file promises drop in, and rows move between the tree's
+        // own directories.
+        var draggedTypes: [NSPasteboard.PasteboardType] = [.fileURL]
+        draggedTypes += NSFilePromiseReceiver.readableDraggedTypes.map {
+            NSPasteboard.PasteboardType($0)
+        }
+        outlineView.registerForDraggedTypes(draggedTypes)
+        outlineView.setDraggingSourceOperationMask(.copy, forLocal: false)
+        // In-app drags cover BOTH cases: a move within this tree and a copy
+        // into a sibling editor pane's tree (which is a different outline
+        // view, so it validates as an external .copy drop).
+        outlineView.setDraggingSourceOperationMask([.copy, .move], forLocal: true)
+
         scrollView.documentView = outlineView
         scrollView.hasVerticalScroller = true
         scrollView.autohidesScrollers = true
         scrollView.drawsBackground = false
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         addSubview(scrollView)
+        transferBand.translatesAutoresizingMaskIntoConstraints = false
+        transferBand.isHidden = true
+        addSubview(transferBand)
+        transferBandHeight = transferBand.heightAnchor.constraint(equalToConstant: 0)
         NSLayoutConstraint.activate([
             scrollView.topAnchor.constraint(equalTo: topAnchor),
-            scrollView.bottomAnchor.constraint(equalTo: bottomAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: transferBand.topAnchor),
             scrollView.leadingAnchor.constraint(equalTo: leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            transferBand.leadingAnchor.constraint(equalTo: leadingAnchor),
+            transferBand.trailingAnchor.constraint(equalTo: trailingAnchor),
+            transferBand.bottomAnchor.constraint(equalTo: bottomAnchor),
+            transferBandHeight,
         ])
 
         applyAppearance(dark: false)
+    }
+
+    /// Shows/updates the bottom transfer band; nil collapses it.
+    public func renderTransferProgress(_ progress: WorkspaceTransferProgress?) {
+        guard let progress else {
+            transferBandHeight.constant = 0
+            transferBand.isHidden = true
+            return
+        }
+        transferBand.render(progress)
+        if transferBand.isHidden {
+            transferBandHeight.constant = FileTransferProgressView.bandHeight
+            transferBand.isHidden = false
+        }
     }
 
     public func applyAppearance(dark: Bool) {
         isDark = dark
         layer?.backgroundColor = ShellPalette.surfaceBackground(dark: dark).cgColor
         outlineView.backgroundColor = .clear
+        transferBand.applyAppearance(dark: dark)
         reloadAllRowsPreservingLayout()
     }
 
@@ -1059,6 +1124,138 @@ extension FileTreeSidebarView: NSOutlineViewDataSource, NSOutlineViewDelegate {
 
     public func outlineView(_ outlineView: NSOutlineView, rowViewForItem item: Any) -> NSTableRowView? {
         FileTreeRowView(dark: isDark)
+    }
+
+    // MARK: Drag source
+
+    public func outlineView(
+        _ outlineView: NSOutlineView, pasteboardWriterForItem item: Any
+    ) -> NSPasteboardWriting? {
+        guard let node = item as? FileTreeNode, node !== rootNode else { return nil }
+        return dragWriterProvider?(node.url.path, node.isDirectory)
+    }
+
+    public func outlineView(
+        _ outlineView: NSOutlineView, draggingSession session: NSDraggingSession,
+        willBeginAt screenPoint: NSPoint, forItems draggedItems: [Any]
+    ) {
+        draggedNodePaths = draggedItems.compactMap { ($0 as? FileTreeNode)?.url.path }
+    }
+
+    public func outlineView(
+        _ outlineView: NSOutlineView, draggingSession session: NSDraggingSession,
+        endedAt screenPoint: NSPoint, operation: NSDragOperation
+    ) {
+        draggedNodePaths = []
+    }
+
+    // MARK: Drop target
+
+    /// Any row is a valid landing spot: a directory receives directly, a
+    /// file forwards to its parent, and the empty area targets the root.
+    /// Internal for tests (NSDraggingInfo cannot be constructed headless).
+    func dropTargetDirectory(for item: Any?) -> FileTreeNode? {
+        guard let node = (item as? FileTreeNode) ?? rootNode else { return nil }
+        if node.isDirectory { return node }
+        return node === rootNode
+            ? node
+            : rootNode?.findLoadedNode(path: node.url.deletingLastPathComponent().path)
+    }
+
+    private func isInternalDrag(_ info: NSDraggingInfo) -> Bool {
+        (info.draggingSource as? NSOutlineView) === outlineView
+    }
+
+    /// Paths that actually change parent, excluding drops into a dragged
+    /// item's own subtree. Internal for tests.
+    func movablePaths(into directory: String) -> [String] {
+        guard !draggedNodePaths.contains(where: {
+            directory == $0 || directory.hasPrefix($0 + "/")
+        }) else { return [] }
+        return draggedNodePaths.filter {
+            ($0 as NSString).deletingLastPathComponent != directory
+        }
+    }
+
+    public func outlineView(
+        _ outlineView: NSOutlineView, validateDrop info: NSDraggingInfo,
+        proposedItem item: Any?, proposedChildIndex index: Int
+    ) -> NSDragOperation {
+        guard let target = dropTargetDirectory(for: item) else { return [] }
+        outlineView.setDropItem(
+            target === rootNode ? nil : target,
+            dropChildIndex: NSOutlineViewDropOnItemIndex)
+        if isInternalDrag(info) {
+            guard onMoveItems != nil, !movablePaths(into: target.url.path).isEmpty else {
+                return []
+            }
+            return .move
+        }
+        guard onDropFiles != nil else { return [] }
+        let pasteboard = info.draggingPasteboard
+        let hasFiles =
+            pasteboard.canReadObject(
+                forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true])
+            || pasteboard.canReadObject(forClasses: [NSFilePromiseReceiver.self], options: nil)
+        return hasFiles ? .copy : []
+    }
+
+    public func outlineView(
+        _ outlineView: NSOutlineView, acceptDrop info: NSDraggingInfo,
+        item: Any?, childIndex index: Int
+    ) -> Bool {
+        guard let target = dropTargetDirectory(for: item) else { return false }
+        let directory = target.url.path
+        if isInternalDrag(info) {
+            let paths = movablePaths(into: directory)
+            guard !paths.isEmpty else { return false }
+            onMoveItems?(paths, directory)
+            return true
+        }
+        let pasteboard = info.draggingPasteboard
+        if let receivers = pasteboard.readObjects(forClasses: [NSFilePromiseReceiver.self])
+            as? [NSFilePromiseReceiver], !receivers.isEmpty
+        {
+            receivePromisedFiles(receivers, into: directory)
+            return true
+        }
+        if let urls = pasteboard.readObjects(
+            forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL],
+            !urls.isEmpty
+        {
+            onDropFiles?(urls, directory)
+            return true
+        }
+        return false
+    }
+
+    /// Promise-based drags (Photos, Mail, another Superlemon's remote tree)
+    /// materialize in a private staging directory first, then enter the
+    /// normal dropped-URL flow.
+    private func receivePromisedFiles(
+        _ receivers: [NSFilePromiseReceiver], into directory: String
+    ) {
+        let staging = FileManager.default.temporaryDirectory
+            .appendingPathComponent("superlemon-promised-\(UUID().uuidString)")
+        try? FileManager.default.createDirectory(
+            at: staging, withIntermediateDirectories: true)
+        let lock = NSLock()
+        nonisolated(unsafe) var received: [URL] = []
+        for receiver in receivers {
+            receiver.receivePromisedFiles(
+                atDestination: staging, options: [:], operationQueue: promiseReceiveQueue
+            ) { url, error in
+                guard error == nil else { return }
+                lock.withLock { received.append(url) }
+            }
+        }
+        promiseReceiveQueue.addBarrierBlock { [weak self] in
+            let urls = lock.withLock { received }
+            guard !urls.isEmpty else { return }
+            Task { @MainActor [weak self] in
+                self?.onDropFiles?(urls, directory)
+            }
+        }
     }
 }
 

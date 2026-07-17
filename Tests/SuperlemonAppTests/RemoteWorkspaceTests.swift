@@ -106,5 +106,45 @@ struct RemoteWorkspaceTests {
         await #expect(throws: (any Error).self) {
             _ = try await source.list(project.appendingPathComponent("missing"))
         }
+
+        // Drag & drop transport: upload, stat, download, move — every byte
+        // crossing the bridge base64-chunked (multiple chunks: payload is
+        // larger than one 512 KiB chunk, and includes every byte value).
+        let payload: Data = {
+            var data = Data()
+            for _ in 0..<(3 * 1024) {
+                data.append(contentsOf: (0...255).map { UInt8($0) })
+            }
+            return data
+        }()
+        let localSource = scratch.appendingPathComponent("upload-source.bin")
+        try payload.write(to: localSource)
+
+        let uploaded = project.appendingPathComponent("data/upload.bin").path
+        try await source.createDirectory(project.appendingPathComponent("data").path)
+        let progressLock = NSLock()
+        nonisolated(unsafe) var uploadTicks: [Int64] = []
+        try await source.writeFile(from: localSource, to: uploaded) { transferred, total in
+            progressLock.withLock { uploadTicks.append(transferred) }
+            #expect(total == Int64(payload.count))
+        }
+        let uploadedStat = try await source.stat(uploaded)
+        #expect(uploadedStat?.isDirectory == false)
+        #expect(uploadedStat?.size == Int64(payload.count))
+        let observedTicks = progressLock.withLock { uploadTicks }
+        #expect(observedTicks.count > 1, "multi-chunk uploads tick progress per chunk")
+        #expect(observedTicks == observedTicks.sorted())
+
+        let downloaded = scratch.appendingPathComponent("download.bin")
+        try await source.readFile(uploaded, to: downloaded) { _, _ in }
+        #expect(try Data(contentsOf: downloaded) == payload)
+
+        let movedPath = project.appendingPathComponent("data/moved.bin").path
+        try await source.move(uploaded, to: movedPath)
+        #expect(try await source.stat(uploaded) == nil)
+        #expect(try await source.stat(movedPath)?.size == Int64(payload.count))
+        await #expect(throws: (any Error).self, "moves never overwrite") {
+            try await source.move(movedPath, to: project.appendingPathComponent("main.swift").path)
+        }
     }
 }

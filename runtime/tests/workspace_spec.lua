@@ -109,6 +109,79 @@ local capped = workspace.list_files(root, total - 1)
 H.eq(#capped.files, total - 1, "cap bounds the listing")
 H.eq(capped.truncated, true, "more-than-max reports truncation")
 
+-- stat / mkdir / rename ------------------------------------------------------
+
+H.eq(workspace.stat(vim.fs.joinpath(root, "missing.txt")), vim.NIL, "stat reports absence as NIL")
+local main_stat = workspace.stat(vim.fs.joinpath(root, "main.swift"))
+H.ok(main_stat.type == "file" and main_stat.size == 1, "stat reports file type and size")
+H.eq(workspace.stat(vim.fs.joinpath(root, "src")).type, "directory", "stat reports directories")
+
+local nested = vim.fs.joinpath(root, "made/a/b")
+H.ok(workspace.mkdir(nested) and workspace.stat(nested).type == "directory", "mkdir creates parents")
+H.ok(workspace.mkdir(nested), "mkdir tolerates an existing directory")
+
+local moved = vim.fs.joinpath(root, "made/moved.swift")
+H.ok(workspace.rename(vim.fs.joinpath(root, "main.swift"), moved), "rename moves a file")
+H.eq(workspace.stat(vim.fs.joinpath(root, "main.swift")), vim.NIL, "rename removed the source")
+local clobber_ok = pcall(workspace.rename, moved, vim.fs.joinpath(root, "keep.log"))
+H.ok(not clobber_ok, "rename refuses to replace an existing destination")
+workspace.rename(moved, vim.fs.joinpath(root, "main.swift"))
+
+-- chunked write / read transfers ---------------------------------------------
+
+local payload = ""
+for i = 0, 255 do
+  payload = payload .. string.char(i)
+end
+payload = payload:rep(64) -- 16 KiB of every byte value: must survive base64
+
+local target = vim.fs.joinpath(root, "made/upload.bin")
+local wid = workspace.write_open(target)
+local sent = 0
+for offset = 1, #payload, 5000 do
+  local chunk = payload:sub(offset, offset + 4999)
+  sent = workspace.write_chunk(wid, vim.base64.encode(chunk))
+end
+H.eq(sent, #payload, "write_chunk reports cumulative bytes")
+H.eq(workspace.stat(target), vim.NIL, "target does not exist before commit")
+workspace.write_close(wid, true)
+H.eq(workspace.stat(target).size, #payload, "commit publishes the full file")
+
+local rid_info = workspace.read_open(target)
+H.eq(rid_info.size, #payload, "read_open reports size")
+local got = {}
+while true do
+  local chunk = workspace.read_chunk(rid_info.id, 3000)
+  if chunk == vim.NIL then
+    break
+  end
+  got[#got + 1] = vim.base64.decode(chunk)
+end
+workspace.read_close(rid_info.id)
+H.ok(table.concat(got) == payload, "read round-trips every byte value")
+
+-- aborting a write leaves no partials and no target.
+local aid = workspace.write_open(vim.fs.joinpath(root, "made/aborted.bin"))
+workspace.write_chunk(aid, vim.base64.encode("doomed"))
+workspace.write_close(aid, false)
+H.eq(workspace.stat(vim.fs.joinpath(root, "made/aborted.bin")), vim.NIL, "abort leaves no target")
+local leftovers = 0
+for _, entry in ipairs(workspace.list_dir(vim.fs.joinpath(root, "made"))) do
+  if entry.name:find("superlemon%-partial") then
+    leftovers = leftovers + 1
+  end
+end
+H.eq(leftovers, 0, "abort removes the partial file")
+
+-- committing over an existing file replaces it atomically.
+local rid2 = workspace.write_open(target)
+workspace.write_chunk(rid2, vim.base64.encode("replaced"))
+workspace.write_close(rid2, true)
+H.eq(workspace.stat(target).size, 8, "commit replaces an existing target")
+
+local stale_ok = pcall(workspace.write_chunk, wid, vim.base64.encode("x"))
+H.ok(not stale_ok, "closed handles are invalid")
+
 vim.fn.delete(root, "rf")
 
 H.finish()

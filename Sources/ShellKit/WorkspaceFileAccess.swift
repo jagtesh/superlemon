@@ -15,21 +15,28 @@ import Foundation
 public struct WorkspaceFileAccess: Sendable {
     public let lister: any DirectoryLister
     public let indexSource: any WorkspaceIndexSource
-    /// True when `lister`/`indexSource` read this machine's filesystem.
+    /// Streams drag-and-drop file transfers between this machine and the
+    /// workspace filesystem (WorkspaceFileTransfer.swift).
+    public let transport: any WorkspaceFileTransport
+    /// True when `lister`/`indexSource`/`transport` read this machine's
+    /// filesystem.
     public let isLocal: Bool
 
     public init(
         lister: any DirectoryLister,
         indexSource: any WorkspaceIndexSource,
+        transport: any WorkspaceFileTransport,
         isLocal: Bool
     ) {
         self.lister = lister
         self.indexSource = indexSource
+        self.transport = transport
         self.isLocal = isLocal
     }
 
     public static let local = WorkspaceFileAccess(
         lister: FileSystemLister(),
         indexSource: LocalWorkspaceIndexSource(),
+        transport: LocalWorkspaceFileTransport(),
         isLocal: true)
 }

@@ -151,4 +151,145 @@ function M.list_files(root, max)
   return { files = files, truncated = truncated }
 end
 
+-- File transfer (CONTRACT.md "superlemon.workspace" — drag & drop) --------
+--
+-- Chunked, handle-based reads/writes so the GUI can stream files of any
+-- size across the RPC channel with progress. Chunks travel as base64
+-- (vim.base64, 0.10+): Lua strings are 8-bit clean, but arbitrary bytes
+-- must not round-trip through the GUI's UTF-8 msgpack STR decoding.
+-- Writes land in a ".superlemon-partial" sibling and rename over the
+-- target only on commit, so a cancelled or failed transfer never leaves a
+-- torn file. Handles are GUI-owned; a GUI that dies mid-transfer leaks the
+-- handle until this nvim exits (bounded by the registry, never data loss).
+
+local transfers = { next_id = 1, open = {} }
+
+local function take_handle(id, kind)
+  local handle = transfers.open[id]
+  if not handle or handle.kind ~= kind then
+    error("workspace: unknown " .. kind .. " transfer handle: " .. tostring(id), 0)
+  end
+  return handle
+end
+
+--- { type = "file"|"directory"|..., size = integer } or vim.NIL when absent.
+function M.stat(path)
+  assert(type(path) == "string" and path ~= "", "workspace.stat: path required")
+  local stat = vim.uv.fs_stat(path)
+  if not stat then
+    return vim.NIL
+  end
+  return { type = stat.type, size = stat.size }
+end
+
+--- mkdir -p; succeeds when the directory already exists.
+function M.mkdir(path)
+  assert(type(path) == "string" and path ~= "", "workspace.mkdir: path required")
+  vim.fn.mkdir(path, "p")
+  local stat = vim.uv.fs_stat(path)
+  if not stat or stat.type ~= "directory" then
+    error("could not create directory: " .. path, 0)
+  end
+  return true
+end
+
+--- Move/rename. Refuses to replace an existing destination: sidebar moves
+--- are rearrangements, never silent overwrites.
+function M.rename(from, to)
+  assert(type(from) == "string" and from ~= "", "workspace.rename: from required")
+  assert(type(to) == "string" and to ~= "", "workspace.rename: to required")
+  if vim.uv.fs_stat(to) then
+    error("destination already exists: " .. to, 0)
+  end
+  local ok, err = vim.uv.fs_rename(from, to)
+  if not ok then
+    error(err or ("could not move " .. from .. " to " .. to), 0)
+  end
+  return true
+end
+
+--- Opens a write transfer targeting `path`. Bytes accumulate in a partial
+--- sibling; `write_close(id, true)` renames it over the target.
+function M.write_open(path)
+  assert(type(path) == "string" and path ~= "", "workspace.write_open: path required")
+  local id = transfers.next_id
+  transfers.next_id = transfers.next_id + 1
+  local partial = path .. ".superlemon-partial-" .. id
+  local fd, err = vim.uv.fs_open(partial, "w", 384) -- 0600
+  if not fd then
+    error(err or ("could not open for writing: " .. partial), 0)
+  end
+  transfers.open[id] = { kind = "write", fd = fd, path = path, partial = partial }
+  return id
+end
+
+--- Appends one base64 chunk; returns total bytes written so far.
+function M.write_chunk(id, b64)
+  local handle = take_handle(id, "write")
+  local data = vim.base64.decode(b64)
+  local written, err = vim.uv.fs_write(handle.fd, data)
+  if not written or written ~= #data then
+    error(err or ("short write to " .. handle.partial), 0)
+  end
+  handle.written = (handle.written or 0) + written
+  return handle.written
+end
+
+--- Commit renames the partial over the target (replacing it atomically);
+--- abort unlinks the partial. Either way the handle is freed.
+function M.write_close(id, commit)
+  local handle = take_handle(id, "write")
+  transfers.open[id] = nil
+  vim.uv.fs_close(handle.fd)
+  if not commit then
+    vim.uv.fs_unlink(handle.partial)
+    return true
+  end
+  local ok, err = vim.uv.fs_rename(handle.partial, handle.path)
+  if not ok then
+    vim.uv.fs_unlink(handle.partial)
+    error(err or ("could not finalize " .. handle.path), 0)
+  end
+  return true
+end
+
+--- Opens a read transfer; returns { id, size }.
+function M.read_open(path)
+  assert(type(path) == "string" and path ~= "", "workspace.read_open: path required")
+  local stat = vim.uv.fs_stat(path)
+  if not stat or stat.type ~= "file" then
+    error("not a readable file: " .. path, 0)
+  end
+  local fd, err = vim.uv.fs_open(path, "r", 292) -- 0444
+  if not fd then
+    error(err or ("could not open for reading: " .. path), 0)
+  end
+  local id = transfers.next_id
+  transfers.next_id = transfers.next_id + 1
+  transfers.open[id] = { kind = "read", fd = fd, path = path, offset = 0 }
+  return { id = id, size = stat.size }
+end
+
+--- Next base64 chunk of at most `max_bytes` raw bytes; vim.NIL at EOF.
+function M.read_chunk(id, max_bytes)
+  local handle = take_handle(id, "read")
+  max_bytes = math.max(1, math.floor(tonumber(max_bytes) or 0))
+  local data, err = vim.uv.fs_read(handle.fd, max_bytes, handle.offset)
+  if data == nil then
+    error(err or ("could not read " .. handle.path), 0)
+  end
+  if #data == 0 then
+    return vim.NIL
+  end
+  handle.offset = handle.offset + #data
+  return vim.base64.encode(data)
+end
+
+function M.read_close(id)
+  local handle = take_handle(id, "read")
+  transfers.open[id] = nil
+  vim.uv.fs_close(handle.fd)
+  return true
+end
+
 return M

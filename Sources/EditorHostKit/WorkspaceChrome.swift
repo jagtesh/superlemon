@@ -9,6 +9,7 @@ import GridKit
 import NvimKit
 import ShellKit
 import SurfaceKit
+import UniformTypeIdentifiers
 
 private struct WorkspaceFileMutationResult: Sendable {
     let errorDescription: String?
@@ -92,6 +93,12 @@ public final class WorkspaceChrome {
     private var workspaceRefreshTask: Task<Void, Never>?
     private let fileMutationQueue = WorkspaceFileMutationQueue()
     private let fileWatcher = WorkspaceFileWatcher()
+    /// Drag-and-drop transfer batches between this machine and the
+    /// workspace filesystem (WorkspaceFileTransfer.swift).
+    let fileTransfers: WorkspaceFileTransferCoordinator
+    /// Shared delegate for remote drag-out promises; NSFilePromiseProvider
+    /// does not retain its delegate, so the chrome owns it.
+    private var remoteDragPromiseDelegate: RemoteDragPromiseDelegate?
     private var confirmAlertShowing = false
     /// Identity of the last-presented popup menu: selection changes preserve
     /// it; anything else forces a re-anchor (see syncChrome).
@@ -123,6 +130,8 @@ public final class WorkspaceChrome {
         self.fileAccess = fileAccess
         self.fileIndex = FileIndex(root: projectRoot, source: fileAccess.indexSource)
         self.sidebar = FileTreeSidebarView(lister: fileAccess.lister)
+        self.fileTransfers = WorkspaceFileTransferCoordinator(
+            transport: fileAccess.transport, lister: fileAccess.lister)
         sidebar.allowsFileOperations = fileAccess.isLocal
         // No change notifications reach a non-local tree; poll on expansion.
         sidebar.refreshesOnExpand = !fileAccess.isLocal
@@ -524,6 +533,120 @@ public final class WorkspaceChrome {
         fileWatcher.onChange = { [weak self] batch in
             self?.workspaceFilesChanged(batch)
         }
+
+        // Drag & drop: drops import, internal drags move, row drags export.
+        sidebar.onDropFiles = { [weak self] urls, directory in
+            self?.fileTransfers.importItems(urls, into: directory)
+        }
+        sidebar.onMoveItems = { [weak self] paths, directory in
+            self?.fileTransfers.moveItems(paths, into: directory)
+        }
+        sidebar.onCancelTransfers = { [weak self] in
+            self?.fileTransfers.cancelActiveTransfers()
+        }
+        sidebar.dragWriterProvider = { [weak self] path, isDirectory in
+            self?.dragWriter(forPath: path, isDirectory: isDirectory)
+        }
+        fileTransfers.onProgress = { [weak self] progress in
+            self?.sidebar.renderTransferProgress(progress)
+        }
+        fileTransfers.onError = { [weak self] message in
+            self?.presentTransferError(message)
+        }
+        fileTransfers.onWorkspaceChanged = { [weak self] directories in
+            self?.workspaceTransferChanged(directories)
+        }
+        fileTransfers.resolveConflicts = { [weak self] names in
+            await self?.confirmTransferConflicts(names) ?? .cancel
+        }
+    }
+
+    // MARK: - Drag & drop wiring
+
+    /// Local workspaces drag real file URLs (Finder performs the copy
+    /// itself); remote workspaces drag file promises whose fulfillment
+    /// streams a download through the transfer coordinator.
+    private func dragWriter(forPath path: String, isDirectory: Bool) -> NSPasteboardWriting? {
+        if fileAccess.isLocal {
+            return URL(fileURLWithPath: path, isDirectory: isDirectory) as NSURL
+        }
+        let delegate = remoteDragPromiseDelegate ?? RemoteDragPromiseDelegate(
+            exporter: { [weak self] path, isDirectory, destination in
+                guard let self else { throw CocoaError(.fileNoSuchFile) }
+                try await self.fileTransfers.exportItem(
+                    at: path, isDirectory: isDirectory, to: destination)
+            })
+        remoteDragPromiseDelegate = delegate
+        let type: UTType = isDirectory
+            ? .folder
+            : UTType(filenameExtension: (path as NSString).pathExtension) ?? .data
+        let provider = NSFilePromiseProvider(fileType: type.identifier, delegate: delegate)
+        provider.userInfo = RemoteDragPromiseDelegate.Payload(
+            path: path, isDirectory: isDirectory)
+        return provider
+    }
+
+    /// A finished batch is authoritative about what changed: reload those
+    /// directories and rebuild the quick-open index (FSEvents also fires
+    /// for local workspaces; the explicit reload keeps remote trees honest).
+    private func workspaceTransferChanged(_ directories: Set<String>) {
+        for directory in directories {
+            sidebar.reload(path: directory)
+        }
+        workspaceRefreshTask?.cancel()
+        let generation = fileIndexGeneration
+        let index = fileIndex
+        workspaceRefreshTask = Task { [weak self] in
+            await index.refresh()
+            guard !Task.isCancelled, let self,
+                generation == self.fileIndexGeneration
+            else { return }
+            self.workspaceRefreshTask = nil
+        }
+    }
+
+    private func confirmTransferConflicts(
+        _ names: [String]
+    ) async -> WorkspaceFileTransferCoordinator.ConflictResolution {
+        guard let window else { return .keepBoth }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText =
+            names.count == 1
+            ? "“\(names[0])” already exists in this folder"
+            : "\(names.count) items already exist in this folder"
+        let shown = names.prefix(6).joined(separator: "\n")
+        alert.informativeText =
+            (names.count > 6 ? shown + "\n… and \(names.count - 6) more" : shown)
+            + "\n\nKeep Both adds a numbered copy; Replace overwrites the existing items."
+        alert.addButton(withTitle: "Keep Both")
+        alert.addButton(withTitle: "Replace")
+        alert.addButton(withTitle: "Cancel")
+        return await withCheckedContinuation { continuation in
+            alert.beginSheetModal(for: window) { response in
+                switch response {
+                case .alertFirstButtonReturn:
+                    continuation.resume(returning: .keepBoth)
+                case .alertSecondButtonReturn:
+                    continuation.resume(returning: .replace)
+                default:
+                    continuation.resume(returning: .cancel)
+                }
+            }
+        }
+    }
+
+    private func presentTransferError(_ message: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Couldn’t Transfer Files"
+        alert.informativeText = message
+        alert.addButton(withTitle: "OK")
+        if let window {
+            alert.beginSheetModal(for: window)
+        } else {
+            alert.runModal()
+        }
     }
 
     private func queryQuickOpen(_ query: String) {
@@ -866,6 +989,62 @@ public final class WorkspaceChrome {
             col: payload["col"]?.intValue ?? 1,
             totalLines: payload["total_lines"]?.intValue ?? 1,
             project: payload["project"]?.stringValue ?? "")
+    }
+}
+
+/// Fulfills remote drag-out promises. AppKit calls the delegate on its
+/// fulfillment queue; the export itself hops to the main actor and streams
+/// through the transfer coordinator. One shared instance serves every
+/// provider; the dragged item's identity travels in `userInfo`.
+private final class RemoteDragPromiseDelegate: NSObject, NSFilePromiseProviderDelegate,
+    @unchecked Sendable
+{
+    struct Payload: Sendable {
+        let path: String
+        let isDirectory: Bool
+    }
+
+    typealias Exporter = @MainActor @Sendable (
+        _ path: String, _ isDirectory: Bool, _ destination: URL
+    ) async throws -> Void
+
+    private let exporter: Exporter
+    private let fulfillmentQueue = OperationQueue()
+
+    init(exporter: @escaping Exporter) {
+        self.exporter = exporter
+        fulfillmentQueue.maxConcurrentOperationCount = 1
+    }
+
+    func filePromiseProvider(
+        _ filePromiseProvider: NSFilePromiseProvider, fileNameForType fileType: String
+    ) -> String {
+        guard let payload = filePromiseProvider.userInfo as? Payload else { return "file" }
+        return (payload.path as NSString).lastPathComponent
+    }
+
+    func operationQueue(for filePromiseProvider: NSFilePromiseProvider) -> OperationQueue {
+        fulfillmentQueue
+    }
+
+    func filePromiseProvider(
+        _ filePromiseProvider: NSFilePromiseProvider,
+        writePromiseTo url: URL,
+        completionHandler: @escaping @Sendable (Error?) -> Void
+    ) {
+        guard let payload = filePromiseProvider.userInfo as? Payload else {
+            completionHandler(CocoaError(.fileNoSuchFile))
+            return
+        }
+        let exporter = self.exporter
+        Task {
+            do {
+                try await exporter(payload.path, payload.isDirectory, url)
+                completionHandler(nil)
+            } catch {
+                completionHandler(error)
+            }
+        }
     }
 }
 

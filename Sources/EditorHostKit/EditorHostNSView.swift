@@ -46,7 +46,7 @@ public final class EditorHostNSView: NSView {
         if controller.hasRemoteFilesystem {
             let source = NvimWorkspaceFileSource(controller: controller)
             fileAccess = WorkspaceFileAccess(
-                lister: source, indexSource: source, isLocal: false)
+                lister: source, indexSource: source, transport: source, isLocal: false)
         } else {
             fileAccess = .local
         }
