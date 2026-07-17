@@ -336,6 +336,12 @@ public final class FileTreeSidebarView: NSView {
     var draggedNodePaths: [String] = []
     private let transferBand = FileTransferProgressView()
     private var transferBandHeight: NSLayoutConstraint!
+    /// Names the workspace root at the top of the tree (see the layout
+    /// comment in `init`); `setRoot` keeps it current across re-roots.
+    private let rootHeaderLabel = NSTextField(labelWithString: "")
+
+    /// Test seam: the root-node title shown above the tree.
+    var displayedRootName: String { rootHeaderLabel.stringValue }
     private let promiseReceiveQueue = OperationQueue()
 
     /// Show dotfiles (`.git` stays hidden always).
@@ -428,6 +434,15 @@ public final class FileTreeSidebarView: NSView {
         // view, so it validates as an external .copy drop).
         outlineView.setDraggingSourceOperationMask([.copy, .move], forLocal: true)
 
+        // The workspace root reads as the root node of the tree: its name
+        // sits above the rows, and everything below — the ".." parent row
+        // included — is visually its child.
+        rootHeaderLabel.font = .boldSystemFont(ofSize: 13)
+        rootHeaderLabel.lineBreakMode = .byTruncatingMiddle
+        rootHeaderLabel.translatesAutoresizingMaskIntoConstraints = false
+        rootHeaderLabel.setAccessibilityIdentifier("sidebar.rootHeader")
+        addSubview(rootHeaderLabel)
+
         scrollView.documentView = outlineView
         scrollView.hasVerticalScroller = true
         scrollView.autohidesScrollers = true
@@ -439,7 +454,12 @@ public final class FileTreeSidebarView: NSView {
         addSubview(transferBand)
         transferBandHeight = transferBand.heightAnchor.constraint(equalToConstant: 0)
         NSLayoutConstraint.activate([
-            scrollView.topAnchor.constraint(equalTo: topAnchor),
+            rootHeaderLabel.topAnchor.constraint(equalTo: topAnchor, constant: 6),
+            rootHeaderLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+            rootHeaderLabel.trailingAnchor.constraint(
+                lessThanOrEqualTo: trailingAnchor, constant: -8),
+            scrollView.topAnchor.constraint(
+                equalTo: rootHeaderLabel.bottomAnchor, constant: 5),
             scrollView.bottomAnchor.constraint(equalTo: transferBand.topAnchor),
             scrollView.leadingAnchor.constraint(equalTo: leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: trailingAnchor),
@@ -470,6 +490,7 @@ public final class FileTreeSidebarView: NSView {
         isDark = dark
         layer?.backgroundColor = ShellPalette.surfaceBackground(dark: dark).cgColor
         outlineView.backgroundColor = .clear
+        rootHeaderLabel.textColor = ShellPalette.primaryText(dark: dark)
         transferBand.applyAppearance(dark: dark)
         reloadAllRowsPreservingLayout()
     }
@@ -487,6 +508,13 @@ public final class FileTreeSidebarView: NSView {
         staleDirectoryPaths.removeAll()
         rootNode = FileTreeNode(url: url, isDirectory: true, isHidden: false)
         parentEntry = FileTreeParentDirectoryEntry()
+        let standardized = url.standardizedFileURL
+        rootHeaderLabel.stringValue = standardized.lastPathComponent.isEmpty
+            ? standardized.path
+            : standardized.lastPathComponent
+        rootHeaderLabel.toolTip = standardized.path
+        rootHeaderLabel.setAccessibilityLabel(
+            "Workspace root \(rootHeaderLabel.stringValue)")
         outlineView.reloadData()
         if let rootNode { requestChildren(for: rootNode) }
     }

@@ -562,6 +562,23 @@ struct FileTreeSidebarTests {
         #expect(focusRequests == 1)
     }
 
+    @Test func rootHeaderNamesTheWorkspaceRootAndFollowsReroots() async throws {
+        let root = try makeFixtureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let sidebar = FileTreeSidebarView(frame: .zero)
+        sidebar.setRoot(root)
+        await sidebar.waitForPendingLoads()
+        #expect(sidebar.displayedRootName
+            == root.standardizedFileURL.lastPathComponent)
+
+        // Re-rooting (the ".." row's action) renames the tree root.
+        let parent = root.standardizedFileURL.deletingLastPathComponent()
+        sidebar.setRoot(parent)
+        await sidebar.waitForPendingLoads()
+        #expect(sidebar.displayedRootName == parent.lastPathComponent)
+    }
+
     @Test func parentDirectoryRowAbsentAtFilesystemRoot() async throws {
         struct EmptyLister: DirectoryLister {
             func list(_ url: URL) throws -> [DirectoryEntry] { [] }
