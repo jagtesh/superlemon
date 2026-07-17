@@ -567,7 +567,7 @@ public final class GridSurfaceView: NSView {
                     semanticDelta: redrawAll ? nil : flush.viewportScrollDeltas[frame.gridID],
                     semanticMotion: redrawAll ? nil : viewportMotion,
                     cellSize: cellSize, scale: scale, host: gridLayer,
-                    animate: animate)
+                    animate: animate, arrivalTimestamp: CACurrentMediaTime())
                 motionStarted = motionStarted || started
                 assert(state.currentRowsMatch(rowSnapshots),
                        "filmstrip must end on authoritative row revisions")
@@ -855,7 +855,8 @@ public final class GridSurfaceView: NSView {
                 + "\"acceleration\":\(sample.acceleration),"
                 + "\"snappedTranslationPixels\":\(sample.snappedTranslationPixels),"
                 + "\"cursorAuthoritativeY\":\(authoritative),"
-                + "\"cursorVisualY\":\(visual)}"
+                + "\"cursorVisualY\":\(visual),"
+                + "\"envelopeDuration\":\(sample.envelopeDuration)}"
         }
         guard let payload = (lines.joined(separator: "\n") + "\n").data(using: .utf8)
         else { return }

@@ -685,6 +685,105 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
                 "settling must expose the exact authoritative backing image")
     }
 
+    /// One 1-row scroll present against a 6×10 grid, tagged with an arrival
+    /// timestamp for the latency-adaptive cadence estimate.
+    private func presentOneRowStep(
+        _ state: SmoothViewportState, image: CGImage, host: CALayer,
+        at timestamp: CFTimeInterval?
+    ) -> Bool {
+        state.present(
+            image: image, rows: 6, cols: 10, margins: nil,
+            scrolls: [ScrollDelta(
+                top: 0, bottom: 6, left: 0, right: 10, rows: 1, cols: 0)],
+            semanticDelta: 1, cellSize: cellSize, scale: 1, host: host,
+            animate: true, arrivalTimestamp: timestamp)
+    }
+
+    @Test func burstyArrivalCadenceStretchesTheEnvelopeAcrossGaps() {
+        let host = CALayer()
+        let image = solidImage(width: 80, height: 96)
+        let state = SmoothViewportState(gridID: 11)
+        _ = state.present(
+            image: image, rows: 6, cols: 10, margins: nil, scrolls: [],
+            semanticDelta: nil, cellSize: cellSize, scale: 1, host: host,
+            animate: true, arrivalTimestamp: 10.0)
+
+        // The first movement arrival has no measurable gap: base width.
+        #expect(presentOneRowStep(state, image: image, host: host, at: 10.0))
+        #expect(state.adaptiveEnvelopeDuration
+            == SmoothViewportState.motionEnvelopeDuration)
+
+        // The base envelope settles before a 250 ms round trip completes —
+        // this is the inter-burst lurch on a high-latency transport.
+        for _ in 0..<30 { _ = state.advance(by: 1.0 / 120.0) }
+        #expect(!state.isActive)
+
+        // The second arrival, one round trip later, teaches the cadence and
+        // stretches new residuals to the bounded two-gap width.
+        #expect(presentOneRowStep(state, image: image, host: host, at: 10.25))
+        #expect(abs(state.estimatedArrivalGap - 0.25) < 0.000_001)
+        #expect(abs(state.adaptiveEnvelopeDuration
+            - SmoothViewportState.maximumMotionEnvelopeDuration) < 0.000_001)
+
+        // The stretched envelope is still carrying velocity when the next
+        // burst lands one gap later, so the camera never comes to rest.
+        for _ in 0..<30 { _ = state.advance(by: 1.0 / 120.0) }
+        #expect(state.isActive)
+        #expect(presentOneRowStep(state, image: image, host: host, at: 10.50))
+        #expect(state.isActive)
+    }
+
+    @Test func denseLocalCadenceKeepsAndRestoresTheBaseEnvelope() {
+        let host = CALayer()
+        let image = solidImage(width: 80, height: 96)
+        let state = SmoothViewportState(gridID: 12)
+        _ = state.present(
+            image: image, rows: 6, cols: 10, margins: nil, scrolls: [],
+            semanticDelta: nil, cellSize: cellSize, scale: 1, host: host,
+            animate: true, arrivalTimestamp: 10.0)
+
+        // Learn a remote cadence first.
+        _ = presentOneRowStep(state, image: image, host: host, at: 10.0)
+        _ = presentOneRowStep(state, image: image, host: host, at: 10.30)
+        #expect(state.adaptiveEnvelopeDuration
+            > SmoothViewportState.motionEnvelopeDuration)
+
+        // A dense local stream (about 60 Hz) decays the peak-hold estimate
+        // back below the stretch threshold within a fraction of a second.
+        var time: CFTimeInterval = 10.30
+        for _ in 0..<25 {
+            time += 0.016
+            _ = presentOneRowStep(state, image: image, host: host, at: time)
+            _ = state.advance(by: 0.016)
+        }
+        #expect(state.estimatedArrivalGap
+            <= SmoothViewportState.cadenceStretchThreshold)
+        #expect(state.adaptiveEnvelopeDuration
+            == SmoothViewportState.motionEnvelopeDuration)
+    }
+
+    @Test func idleGapsAndUntimestampedPresentsLeaveTheCadenceUntouched() {
+        let host = CALayer()
+        let image = solidImage(width: 80, height: 96)
+        let state = SmoothViewportState(gridID: 13)
+        _ = state.present(
+            image: image, rows: 6, cols: 10, margins: nil, scrolls: [],
+            semanticDelta: nil, cellSize: cellSize, scale: 1, host: host,
+            animate: true, arrivalTimestamp: 10.0)
+
+        _ = presentOneRowStep(state, image: image, host: host, at: 10.0)
+        for _ in 0..<40 { _ = state.advance(by: 1.0 / 120.0) }
+
+        // Two seconds later is a pause between gestures, not delivery
+        // cadence; deterministic (nil-timestamp) presents change nothing.
+        _ = presentOneRowStep(state, image: image, host: host, at: 12.0)
+        #expect(state.estimatedArrivalGap == 0)
+        _ = presentOneRowStep(state, image: image, host: host, at: nil)
+        #expect(state.estimatedArrivalGap == 0)
+        #expect(state.adaptiveEnvelopeDuration
+            == SmoothViewportState.motionEnvelopeDuration)
+    }
+
     @Test func reversalPreservesC2MotionAndReturnsToExactViewport() {
         let rowPixels = Int(cellSize.height * 2)
         let period = 1.0 / 120.0

@@ -270,6 +270,8 @@ package struct ScrollDiagnosticSample: Sendable, Equatable {
     package let snappedTranslationPixels: Int
     package let cursorAuthoritativeY: CGFloat?
     package let cursorVisualY: CGFloat?
+    /// The latency-adaptive residual duration in effect for new arrivals.
+    package let envelopeDuration: CFTimeInterval
 }
 
 private struct RowLayerBinding: Equatable {
@@ -290,7 +292,30 @@ private struct FilmstripSlot {
 final class SmoothViewportState {
     /// At this width, three 60 ms row steps already overlap; denser wheel and
     /// key-repeat streams converge on a nearly flat, continuous velocity.
+    /// This is the base residual duration for local-cadence delivery; see
+    /// `adaptiveEnvelopeDuration` for high-latency transports.
     static let motionEnvelopeDuration: CFTimeInterval = 0.180
+    /// Latency-adaptive ceiling. High-latency transports (an ssh bridge to a
+    /// remote nvim) deliver scroll frames in RTT-sized bursts 100–300 ms
+    /// apart; a base-width envelope decays to rest between bursts and the
+    /// gesture lurches. Residuals may stretch up to this long so velocity
+    /// spans the gap to the next burst instead of settling at each one.
+    static let maximumMotionEnvelopeDuration: CFTimeInterval = 0.480
+    /// Arrival gaps at or below this are local-pipe cadence and keep the base
+    /// envelope. `threshold × stretch factor == base duration`, so the
+    /// stretched duration is continuous across this boundary.
+    static let cadenceStretchThreshold: CFTimeInterval = 0.090
+    /// A gap longer than this is a pause between gestures, not delivery
+    /// cadence; it neither feeds nor resets the estimate (transport latency
+    /// is a session property, not a gesture property).
+    static let cadenceGestureWindow: CFTimeInterval = 0.600
+    /// Per-arrival decay of the peak-hold cadence estimate. About fifteen
+    /// dense local arrivals — a fraction of a second of wheel motion — fully
+    /// unlearn a stretched remote cadence after a transport hiccup.
+    static let cadenceDecay: Double = 0.9
+    /// The envelope outlives roughly two observed arrival gaps, so the next
+    /// burst always lands mid-envelope with velocity still nonzero.
+    static let cadenceStretchFactor: Double = 2.0
 
     let gridID: Int
 
@@ -306,6 +331,11 @@ final class SmoothViewportState {
         animationLength: SmoothViewportState.motionEnvelopeDuration)
     private(set) var isActive = false
     private(set) var lastSemanticDelta = 0
+    /// Peak-hold-with-decay estimate of the gap between scroll-frame
+    /// arrivals. Zero until two movement-carrying frames arrive within one
+    /// gesture window of each other.
+    private(set) var estimatedArrivalGap: CFTimeInterval = 0
+    private var lastScrollArrival: CFTimeInterval?
 
     private weak var hostLayer: CALayer?
     private let baseLayer = CALayer()
@@ -335,6 +365,18 @@ final class SmoothViewportState {
         clipLayer.addSublayer(rowContainerLayer)
     }
 
+    /// The residual duration for newly arriving displacement: the base
+    /// envelope on a local-cadence stream, stretched toward two observed
+    /// arrival gaps (bounded) when frames arrive in high-latency bursts.
+    var adaptiveEnvelopeDuration: CFTimeInterval {
+        guard estimatedArrivalGap > Self.cadenceStretchThreshold else {
+            return Self.motionEnvelopeDuration
+        }
+        return min(
+            Self.maximumMotionEnvelopeDuration,
+            estimatedArrivalGap * Self.cadenceStretchFactor)
+    }
+
     var position: CGFloat { motion.position + catchUp.position }
     var velocity: CGFloat { motion.velocity + catchUp.velocity }
     var acceleration: CGFloat { motion.acceleration }
@@ -358,12 +400,15 @@ final class SmoothViewportState {
     var translatedContainerLayer: CALayer { rowContainerLayer }
 
     /// Production entry point: install cached row-sized renderer revisions.
+    /// `arrivalTimestamp` feeds the arrival-cadence estimate; nil (the
+    /// default, used by deterministic tests) leaves the estimate untouched.
     @discardableResult
     func present(
         rowSnapshots: [RenderedRowSnapshot], rows: Int, cols: Int,
         margins: ViewportMargins?, scrolls: [ScrollDelta], semanticDelta: Int?,
         semanticMotion: ViewportScrollMotion? = nil,
-        cellSize: CGSize, scale: CGFloat, host: CALayer, animate: Bool
+        cellSize: CGSize, scale: CGFloat, host: CALayer, animate: Bool,
+        arrivalTimestamp: CFTimeInterval? = nil
     ) -> Bool {
         let sourceRows = rowSnapshots.enumerated().map { row, snapshot in
             SharedImageRow(
@@ -378,7 +423,8 @@ final class SmoothViewportState {
             authoritativeRows: sourceRows, rows: rows, cols: cols,
             margins: margins, scrolls: scrolls, semanticDelta: semanticDelta,
             semanticMotion: semanticMotion,
-            cellSize: cellSize, scale: scale, host: host, animate: animate)
+            cellSize: cellSize, scale: scale, host: host, animate: animate,
+            arrivalTimestamp: arrivalTimestamp)
     }
 
     /// Testing/snapshot compatibility. The application never takes this
@@ -388,7 +434,8 @@ final class SmoothViewportState {
         image: CGImage, rows: Int, cols: Int, margins: ViewportMargins?,
         scrolls: [ScrollDelta], semanticDelta: Int?,
         semanticMotion: ViewportScrollMotion? = nil, cellSize: CGSize,
-        scale: CGFloat, host: CALayer, animate: Bool
+        scale: CGFloat, host: CALayer, animate: Bool,
+        arrivalTimestamp: CFTimeInterval? = nil
     ) -> Bool {
         presentationGeneration &+= 1
         let rowHeight = 1 / CGFloat(max(1, rows))
@@ -410,7 +457,8 @@ final class SmoothViewportState {
             authoritativeRows: sourceRows, rows: rows, cols: cols,
             margins: margins, scrolls: scrolls, semanticDelta: semanticDelta,
             semanticMotion: semanticMotion,
-            cellSize: cellSize, scale: scale, host: host, animate: animate)
+            cellSize: cellSize, scale: scale, host: host, animate: animate,
+            arrivalTimestamp: arrivalTimestamp)
     }
 
     @discardableResult
@@ -418,7 +466,8 @@ final class SmoothViewportState {
         authoritativeRows nextRows: [SharedImageRow], rows: Int, cols: Int,
         margins: ViewportMargins?, scrolls: [ScrollDelta], semanticDelta: Int?,
         semanticMotion: ViewportScrollMotion?,
-        cellSize: CGSize, scale: CGFloat, host: CALayer, animate: Bool
+        cellSize: CGSize, scale: CGFloat, host: CALayer, animate: Bool,
+        arrivalTimestamp: CFTimeInterval?
     ) -> Bool {
         let nextGeometry = SmoothViewportGeometry(rows: rows, cols: cols, margins: margins)
         let nextScale = max(1, scale)
@@ -447,6 +496,9 @@ final class SmoothViewportState {
         let carriesMovement = !scrolls.isEmpty
             || semanticMotion?.hasMovement == true
             || (semanticDelta != nil && delta != 0)
+        if animate, carriesMovement, let arrivalTimestamp {
+            updateArrivalCadence(arrivalTimestamp)
+        }
         if !animate, isActive {
             // An explicitly atomic/Reduce Motion frame supersedes any visual
             // tail even when it contains only edits or highlight changes.
@@ -562,7 +614,21 @@ final class SmoothViewportState {
             velocity: motion.velocity, acceleration: motion.acceleration,
             snappedTranslationPixels: snappedTranslationPixels,
             cursorAuthoritativeY: cursorAuthoritativeY,
-            cursorVisualY: cursorVisualY)
+            cursorVisualY: cursorVisualY,
+            envelopeDuration: adaptiveEnvelopeDuration)
+    }
+
+    /// Fold one movement-carrying arrival into the cadence estimate. The
+    /// peak-hold keeps the estimate at the burst spacing rather than the
+    /// intra-burst spacing (a burst delivers several frames a few ms apart
+    /// and then nothing for a round trip), while the per-arrival decay lets
+    /// a dense local stream unlearn a stretched cadence quickly.
+    private func updateArrivalCadence(_ timestamp: CFTimeInterval) {
+        defer { lastScrollArrival = timestamp }
+        guard let lastScrollArrival else { return }
+        let gap = timestamp - lastScrollArrival
+        guard gap > 0, gap <= Self.cadenceGestureWindow else { return }
+        estimatedArrivalGap = max(gap, estimatedArrivalGap * Self.cadenceDecay)
     }
 
     // MARK: - History
@@ -608,7 +674,7 @@ final class SmoothViewportState {
             if abs(requestedOffset) <= available {
                 motion.add(
                     positionOffset: requestedOffset,
-                    duration: Self.motionEnvelopeDuration)
+                    duration: adaptiveEnvelopeDuration)
                 return true
             }
         }
@@ -616,7 +682,10 @@ final class SmoothViewportState {
         // Catch-up regime: migrating the envelope's position and velocity
         // into the spring keeps the camera continuous; only the retained-
         // history screenful remains a hard bound, and in equilibrium the
-        // spring's backlog-proportional drain stays below it.
+        // spring's backlog-proportional drain stays below it. The spring
+        // matches the adaptive width so it, too, spans inter-burst gaps on
+        // high-latency transports instead of settling between them.
+        catchUp.animationLength = adaptiveEnvelopeDuration
         catchUp.position += motion.position
         catchUp.velocity += motion.velocity
         motion.settle()

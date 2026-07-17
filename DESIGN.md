@@ -443,9 +443,17 @@ disabled-actions transaction. A new delta is therefore never pre-aged by the
 interval before it arrived. Immediate model changes still drain pending scroll
 state before presenting.
 
-The motion model is a gesture-level sum of analytical 180 ms quintic
-minimum-jerk residuals in row units. When the authoritative viewport advances
-by `d` rows, a new residual begins at `-d` with zero velocity and acceleration.
+The motion model is a gesture-level sum of analytical quintic minimum-jerk
+residuals in row units. Residuals are 180 ms wide on a local-cadence stream.
+Delivery cadence is estimated per grid from the gaps between movement-carrying
+presents (peak-hold with per-arrival decay, ignoring gaps beyond a gesture
+window); when frames arrive in high-latency bursts — an ssh bridge to a remote
+nvim delivers scroll frames one round trip apart — new residuals stretch to
+twice the observed gap, bounded at 480 ms, so velocity spans the space between
+bursts instead of settling at each one. A dense local stream unlearns a
+stretched cadence within a fraction of a second. When the authoritative
+viewport advances by `d` rows, a new residual begins at `-d` with zero
+velocity and acceleration.
 That position exactly cancels the discrete row rotation for the current frame,
 while the zero derivatives leave the existing envelope's velocity and
 acceleration unchanged. Each residual reaches zero position, velocity, and
