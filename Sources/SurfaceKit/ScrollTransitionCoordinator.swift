@@ -507,14 +507,31 @@ final class SmoothViewportState {
             settle()
         }
 
+        // Wrapped lines ('wrap') and virtual lines make one document line
+        // span several screen rows, so win_viewport's line-based delta
+        // understates how many rows the grid actually rotated — animating a
+        // five-row wrapped step as one row is the field-reported wrap judder.
+        // The wire grid_scroll rows are the screen-space truth; the semantic
+        // delta remains provenance and the fallback for scrolls that redraw
+        // without rotation damage (far jumps).
+        let wireRows = scrolls.reduce(0) { $0 + $1.rows }
+        let displacement = wireRows != 0 ? wireRows : delta
         if eligible, hasAuthoritativeRows {
-            if delta != 0 {
-                let largestStep = semanticMotion?.largestStepMagnitude
-                    ?? Int(min(UInt(Int.max), delta.magnitude))
+            if displacement != 0 {
+                let largestStep: Int
+                let farDirection: Int
+                if wireRows != 0 {
+                    largestStep = Int(min(UInt(Int.max), wireRows.magnitude))
+                    farDirection = wireRows.signum()
+                } else {
+                    largestStep = semanticMotion?.largestStepMagnitude
+                        ?? Int(min(UInt(Int.max), delta.magnitude))
+                    farDirection = semanticMotion?.largestStepDelta.signum()
+                        ?? delta.signum()
+                }
                 eligible = rotateForNewViewport(
-                    delta, trueFar: largestStep > geometry.innerRows,
-                    farDirection: semanticMotion?.largestStepDelta.signum()
-                        ?? delta.signum())
+                    displacement, trueFar: largestStep > geometry.innerRows,
+                    farDirection: farDirection)
                 if !eligible { settle() }
             } else {
                 // Coalesced reversal can return to the same viewport. It is
@@ -529,7 +546,9 @@ final class SmoothViewportState {
         seedCurrentRows()
 
         if eligible, hasAuthoritativeRows {
-            lastSemanticDelta = semanticMotion?.lastDelta ?? delta
+            lastSemanticDelta = displacement != 0
+                ? displacement
+                : (semanticMotion?.lastDelta ?? delta)
             isActive = motion.isActive || !catchUp.isSettled
         }
         render(forceBindings: false)

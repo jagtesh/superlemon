@@ -699,6 +699,60 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
             animate: true, arrivalTimestamp: timestamp)
     }
 
+    @Test func wrappedLineScrollAnimatesWireRowsNotSemanticLines() {
+        let host = CALayer()
+        let first = solidImage(width: 80, height: 96)
+        let final = solidImage(width: 80, height: 96)
+        let state = SmoothViewportState(gridID: 21)
+        _ = state.present(
+            image: first, rows: 6, cols: 10, margins: nil, scrolls: [],
+            semanticDelta: nil, cellSize: cellSize, scale: 1, host: host,
+            animate: true)
+
+        // One wrapped document line occupying three screen rows:
+        // win_viewport reports a one-line advance while grid_scroll rotates
+        // three rows. The camera must move the three screen rows.
+        let started = state.present(
+            image: final, rows: 6, cols: 10, margins: nil,
+            scrolls: [ScrollDelta(
+                top: 0, bottom: 6, left: 0, right: 10, rows: 3, cols: 0)],
+            semanticDelta: 1, cellSize: cellSize, scale: 1, host: host,
+            animate: true)
+        #expect(started)
+        #expect(state.position == -3)
+        #expect(state.historyHead == 3)
+
+        for _ in 0..<240 where state.isActive {
+            _ = state.advance(by: 1.0 / 120.0)
+        }
+        #expect(!state.isActive)
+        #expect(state.currentRowsReference(final))
+    }
+
+    @Test func wireRowsBeyondTheViewportCutWithOneRowCue() {
+        let host = CALayer()
+        let first = solidImage(width: 80, height: 96)
+        let final = solidImage(width: 80, height: 96)
+        let state = SmoothViewportState(gridID: 22)
+        _ = state.present(
+            image: first, rows: 6, cols: 10, margins: nil, scrolls: [],
+            semanticDelta: nil, cellSize: cellSize, scale: 1, host: host,
+            animate: true)
+
+        // Seven rotated rows on a six-row inner viewport is a far jump in
+        // screen space even though the document advanced only one line
+        // (e.g. one enormous wrapped line): teleport with the one-row cue.
+        let started = state.present(
+            image: final, rows: 6, cols: 10, margins: nil,
+            scrolls: [ScrollDelta(
+                top: 0, bottom: 6, left: 0, right: 10, rows: 7, cols: 0)],
+            semanticDelta: 1, cellSize: cellSize, scale: 1, host: host,
+            animate: true)
+        #expect(started)
+        #expect(state.position == -1)
+        #expect(state.isActive)
+    }
+
     @Test func burstyArrivalCadenceStretchesTheEnvelopeAcrossGaps() {
         let host = CALayer()
         let image = solidImage(width: 80, height: 96)

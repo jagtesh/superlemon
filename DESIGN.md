@@ -454,6 +454,13 @@ bursts instead of settling at each one. A dense local stream unlearns a
 stretched cadence within a fraction of a second. When the authoritative
 viewport advances by `d` rows, a new residual begins at `-d` with zero
 velocity and acceleration.
+
+Displacement is measured in screen rows, not document lines: wrapped
+(`'wrap'`) and virtual lines make one document line span several rows, so
+`win_viewport`'s line-based delta understates the rotation. When a frame
+carries `grid_scroll` damage, the summed wire rows are the animated
+displacement (and the far-jump classification); the semantic delta remains
+provenance and the fallback for scrolls that redraw without rotation damage.
 That position exactly cancels the discrete row rotation for the current frame,
 while the zero derivatives leave the existing envelope's velocity and
 acceleration unchanged. Each residual reaches zero position, velocity, and
