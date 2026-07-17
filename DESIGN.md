@@ -462,6 +462,15 @@ carries `grid_scroll` damage, the summed wire rows are the animated
 displacement (and the far-jump classification); the semantic delta remains
 provenance and the fallback for scrolls that redraw without rotation damage.
 
+Row repaints may accompany display-linked motion when they hug the scroll
+region's edges: the newly exposed strip, plus `'wrap'`'s partially visible
+boundary line, which grows or shrinks (with its `@@@`/lastline rendering) at
+the bottom of the window on every step in either direction. A repainted row
+belonging to neither edge-anchored band is a concurrent edit and the frame
+presents atomically. Repaints on a non-scrolling grid (an in-grid
+`laststatus=2` statusline) still force atomic presentation; the managed
+configuration releases that row to the native bar.
+
 While a wheel step's authoritative response is still in flight, the input
 host reports it (`noteScrollInputPending`) and the grid's active envelope is
 C2-consolidated to keep at least one adaptive duration of motion remaining —

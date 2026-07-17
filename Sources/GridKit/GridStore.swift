@@ -412,9 +412,11 @@ public final class GridStore {
     }
 }
 
-/// Classification is intentionally conservative. Only row updates, cursor
-/// movement and viewport metadata may accompany display-linked vertical
-/// motion. Resize, chrome/layout, highlight, horizontal, and conflicting
+/// Classification is intentionally conservative. Only row updates hugging
+/// the scroll region's edges (newly exposed strips plus 'wrap's partially
+/// visible boundary lines), cursor movement, and viewport metadata may
+/// accompany display-linked vertical motion. Resize, chrome/layout,
+/// highlight, horizontal, interior row edits, and conflicting
 /// partial-region changes retain immediate atomic presentation.
 private struct DeferredFrameClassification {
     private struct Region: Equatable {
@@ -428,7 +430,6 @@ private struct DeferredFrameClassification {
     private var requiresImmediate = false
     private var regions: [Int: Region] = [:]
     private var scrollDirections: [Int: Int] = [:]
-    private var scrollDistances: [Int: Int] = [:]
     private var semanticDeltas: [Int: Int] = [:]
     /// Authoritative semantic reports in wire order, including zero. A zero
     /// report can validate an ordered pixel reversal whose net is also zero.
@@ -477,14 +478,21 @@ private struct DeferredFrameClassification {
                 else { return false }
             }
 
-            if let region = regions[grid], let rows = lineRows[grid] {
-                let distance = min(
-                    region.bottom - region.top,
-                    max(0, scrollDistances[grid] ?? 0))
-                let exposed = direction > 0
-                    ? (region.bottom - distance)..<region.bottom
-                    : region.top..<(region.top + distance)
-                guard rows.allSatisfy(exposed.contains) else { return false }
+            if let region = regions[grid], let rows = lineRows[grid], !rows.isEmpty {
+                // Newly exposed strips hug the scrolled-from edge, and
+                // 'wrap' legitimately repaints a band hugging either edge
+                // in the same frame: the partially visible wrapped line at
+                // the bottom boundary grows or shrinks with every step (its
+                // "@@@"/lastline rendering included), regardless of scroll
+                // direction. A redrawn row belonging to neither
+                // edge-anchored band is a concurrent non-scroll change (an
+                // edit inside the viewport) and presents atomically.
+                var topBand = region.top
+                while rows.contains(topBand) { topBand += 1 }
+                var bottomBand = region.bottom - 1
+                while rows.contains(bottomBand) { bottomBand -= 1 }
+                guard rows.allSatisfy({ $0 < topBand || $0 > bottomBand })
+                else { return false }
             }
         }
         return true
@@ -522,7 +530,6 @@ private struct DeferredFrameClassification {
         requiresImmediate = false
         regions.removeAll(keepingCapacity: true)
         scrollDirections.removeAll(keepingCapacity: true)
-        scrollDistances.removeAll(keepingCapacity: true)
         semanticDeltas.removeAll(keepingCapacity: true)
         semanticReports.removeAll(keepingCapacity: true)
         viewportScrollSteps.removeAll(keepingCapacity: true)
@@ -575,11 +582,6 @@ private struct DeferredFrameClassification {
                 requiresImmediate = true
             } else {
                 scrollDirections[gridID] = direction
-                let regionHeight = bottom - top
-                let oldDistance = scrollDistances[gridID] ?? 0
-                let added = min(regionHeight, Int(min(UInt(regionHeight), rows.magnitude)))
-                scrollDistances[gridID] =
-                    oldDistance + min(regionHeight - oldDistance, added)
             }
             let region = Region(top: top, bottom: bottom, left: left, right: right)
             if let existing = regions[gridID], existing != region {

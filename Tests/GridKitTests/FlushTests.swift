@@ -503,6 +503,63 @@ import NvimKit
         #expect(store.consumePendingPresentation() != nil)
     }
 
+    @Test func wrappedBoundaryRepaintsHuggingEitherEdgeStayDisplayLinked() {
+        let store = makeStore(rows: 10, cols: 40)
+
+        // Real wire shape from nvim with 'wrap': a one-row down-scroll
+        // exposes row 9, and the partially visible wrapped line at the
+        // bottom boundary grows, repainting row 8 as well.
+        #expect(store.applyDeferred(batch(
+            .gridScroll(
+                grid: 1, top: 0, bottom: 10, left: 0, right: 40,
+                rows: 1, cols: 0),
+            line(1, 8, 0, runs("wrapped")),
+            line(1, 9, 0, runs("content")),
+            .winViewport(
+                grid: 1, win: 10, topline: 1, botline: 7,
+                curline: 1, curcol: 0, lineCount: 40, scrollDelta: 1),
+            .flush
+        )) == .displayLinked)
+        #expect(store.consumePendingPresentation()?
+            .allowsScrollInterpolation == true)
+
+        // Up-scroll repaints both edges: the exposed strip at the top and
+        // the shrinking wrapped boundary line at the bottom.
+        #expect(store.applyDeferred(batch(
+            .gridScroll(
+                grid: 1, top: 0, bottom: 10, left: 0, right: 40,
+                rows: -5, cols: 0),
+            line(1, 0, 0, runs("wrap0")),
+            line(1, 1, 0, runs("wrap1")),
+            line(1, 2, 0, runs("wrap2")),
+            line(1, 3, 0, runs("wrap3")),
+            line(1, 4, 0, runs("wrap4")),
+            line(1, 9, 0, runs("bound")),
+            .winViewport(
+                grid: 1, win: 10, topline: 0, botline: 6,
+                curline: 2, curcol: 0, lineCount: 40, scrollDelta: -5),
+            .flush
+        )) == .displayLinked)
+        #expect(store.consumePendingPresentation()?
+            .allowsScrollInterpolation == true)
+
+        // An interior row disconnected from both edges is a concurrent
+        // edit, not a scroll by-product: atomic.
+        #expect(store.applyDeferred(batch(
+            .gridScroll(
+                grid: 1, top: 0, bottom: 10, left: 0, right: 40,
+                rows: 1, cols: 0),
+            line(1, 4, 0, runs("edited")),
+            line(1, 9, 0, runs("exposed")),
+            .winViewport(
+                grid: 1, win: 10, topline: 2, botline: 8,
+                curline: 4, curcol: 0, lineCount: 40, scrollDelta: 1),
+            .flush
+        )) == .immediate)
+        #expect(store.consumePendingPresentation()?
+            .allowsScrollInterpolation == false)
+    }
+
     @Test func deferredScrollRequiresMatchingSemanticDirectionAndTouchedGrids() {
         let store = makeStore(rows: 6, cols: 6)
         _ = store.apply(batch(.gridResize(grid: 2, width: 6, height: 6), .flush))
