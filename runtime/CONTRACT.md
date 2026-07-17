@@ -8,21 +8,26 @@ sides together when changing a wire shape.
 ## Bootstrap and configuration
 
 The GUI prepends the bundled runtime through a pre-init `--cmd`. After
-`nvim_ui_attach`, it starts the bridge. Configuration is startup input and is
-never sourced by this bootstrap:
+`nvim_ui_attach`, it starts the bridge. For locally planned launches,
+configuration is startup input and is never sourced by this bootstrap; the
+one exception is managed adoption on host-supplied transports, described
+below:
 
 ```lua
-local channel, mode, compact = ...
+local channel, mode, compact, remote = ...
 vim.g.superlemon_config_mode = vim.g.superlemon_config_mode or mode
-return require("superlemon").setup(channel, { compact = compact })
+return require("superlemon").setup(channel, { compact = compact, remote = remote })
 ```
 
-The GUI passes `[channel_id, config_mode, compact]` as the `nvim_exec_lua`
-argument array. `channel_id` comes from `nvim_get_api_info`; `config_mode` is
-managed, user, or custom launch state used when the managed init did not set
-it; `compact` is a boolean that is true when the GUI window started narrower
-than its compact threshold (~800 pt) — the sidebar and minimap then default to
-hidden unless their `g:superlemon_native_*` globals are explicitly set.
+The GUI passes `[channel_id, config_mode, compact, remote]` as the
+`nvim_exec_lua` argument array. `channel_id` comes from `nvim_get_api_info`;
+`config_mode` is managed, user, custom, or safe launch state used when the
+managed init did not set it; `compact` is a boolean that is true when the GUI
+window started narrower than its compact threshold (~800 pt) — the sidebar and
+minimap then default to hidden unless their `g:superlemon_native_*` globals
+are explicitly set. `remote` is true for host-supplied transport sessions
+that should adopt the managed configuration at setup (see "Managed
+adoption").
 
 `require("superlemon")` has no side effects. `setup(channel, opts)` rejects
 invalid channels, stores a valid one in `g:superlemon_channel`, stays inert
@@ -68,6 +73,34 @@ Settings creates the personal file from the minimal `config/user-init.vim`
 template only when it does not already exist. Editor, scrolling, native chrome,
 minimap, native UI, keymap, statusline, and renderer preferences live in these
 Vim files rather than a parallel native preference store.
+
+### Managed adoption (host-supplied transports)
+
+A host-supplied transport session (for example an ssh bridge to a remote
+`nvim --headless --listen`) never ran a local launch plan, so none of the
+managed configuration applied at its startup — the session would otherwise
+behave unlike a local managed one (terminal-oriented `mousescroll`, in-grid
+statusline, no native chrome globals). When bridge setup receives
+`remote = true`, it calls `require("superlemon.managed").adopt()` before any
+adapter reads option or global state.
+
+Adoption applies the identical managed configuration that a local `-u`
+launch would: the ordinary editor defaults, the annotated baseline
+`config/superlemon.vim` from the deployed runtime directory, then the
+*session machine's own* `$XDG_CONFIG_HOME/superlemon/init.vim` personal
+override with the standard state markers and structured error diagnostics. A
+broken personal file keeps the baseline active and is reported through the
+setup result's `config` field like any managed-config error. When the GUI
+passes launch state `safe`, adoption skips the executable personal override
+and reports state `safe_start`.
+
+Adoption is skipped when `g:superlemon_config_mode` is already `managed`
+(the far side's startup ran the managed init itself), which also makes
+repeated bridge setup idempotent. The far side's normal init has already
+executed by the time the bridge connects; adoption layers the managed
+experience over it rather than preventing it. The GUI omits or clears
+`remote` for locally planned launches, whose configuration modes keep their
+documented mutual exclusivity.
 
 ## Neovim to GUI notifications
 

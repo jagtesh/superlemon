@@ -5,7 +5,9 @@
 " ~/.config/superlemon/init.vim) as the primary personal override. Settings >
 " Edit Superlemon Configuration creates and opens that home-directory copy.
 " Normal-user and custom-init modes bypass both this managed baseline and its
-" personal override; bridge setup never sources editor configuration later.
+" personal override. Host-supplied transport sessions (remote nvim) adopt
+" this same baseline and the session machine's personal override at bridge
+" setup instead (CONTRACT.md "Managed adoption").
 "
 " Every boolean below uses 1 for enabled and 0 for disabled. Changes take
 " effect on the next Superlemon launch because the runtime bridge reads one

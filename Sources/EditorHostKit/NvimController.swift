@@ -143,6 +143,14 @@ public final class NvimController {
     /// the local filesystem, and the session's own cwd — not the host's —
     /// becomes the project root once startup completes.
     public let hasRemoteFilesystem: Bool
+    /// Whether a host-supplied transport session adopts Superlemon's managed
+    /// configuration at bridge setup. The far side's nvim never ran a local
+    /// launch plan, so without adoption none of the managed baseline
+    /// (mousescroll, native chrome globals, statusline) applies there and
+    /// the session behaves unlike a local managed one. Hosts bridging into
+    /// a user-owned interactive session may disable this to leave the far
+    /// side's configuration untouched. Ignored for locally planned launches.
+    public var adoptsManagedConfiguration = true
     private var activeConfigPath: String?
     private var safeStartRequested = false
 
@@ -579,22 +587,27 @@ public final class NvimController {
             message: context.isEmpty ? message : context)
     }
 
-    /// Bridge setup is deliberately configuration-free: every startup file
-    /// has already run, and this call only installs GUI adapters from the
-    /// final user-visible option/global state.
+    /// Bridge setup is configuration-free for locally planned launches:
+    /// every startup file has already run, and this call only installs GUI
+    /// adapters from the final option/global state. Host-supplied transport
+    /// sessions are the exception — no local plan ran, so setup first adopts
+    /// the managed configuration on the far side (CONTRACT.md "Managed
+    /// adoption") unless the host disabled `adoptsManagedConfiguration`.
     private func bootstrapRuntimePlugin(_ session: NvimSession) async throws {
         guard let channelID else { throw StartupError.bridgeNotReady("missing channel") }
         let result = try await session.request(
             "nvim_exec_lua",
             [
                 .string(
-                    "local chan, mode, compact = ...\n"
+                    "local chan, mode, compact, remote = ...\n"
                         + "vim.g.superlemon_config_mode = vim.g.superlemon_config_mode or mode\n"
-                        + "return require('superlemon').setup(chan, { compact = compact })"),
+                        + "return require('superlemon').setup("
+                        + "chan, { compact = compact, remote = remote })"),
                 .array([
                     .int(Int64(channelID)),
                     .string(safeStartRequested ? "safe" : activeConfigMode.rawValue),
                     .bool(startupLayoutIsCompact?() ?? false),
+                    .bool(customLaunchConfiguration != nil && adoptsManagedConfiguration),
                 ]),
             ],
             timeout: .seconds(5))

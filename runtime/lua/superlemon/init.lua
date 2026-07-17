@@ -15,8 +15,11 @@ end
 
 --- Idempotent entry point called by the GUI over RPC.
 ---@param channel integer RPC channel id of the GUI
----@param opts { compact: boolean }|nil compact = the GUI window started at a
---- narrow width; sidebar/minimap then default off (explicit g: globals win).
+---@param opts { compact: boolean, remote: boolean }|nil compact = the GUI
+--- window started at a narrow width; sidebar/minimap then default off
+--- (explicit g: globals win). remote = the session reached this nvim through
+--- a host-supplied transport, so no local launch plan ran; the managed
+--- configuration is adopted before any adapter reads option/global state.
 function M.setup(channel, opts)
   if type(channel) ~= "number" or channel <= 0 then
     return {
@@ -37,6 +40,14 @@ function M.setup(channel, opts)
       runtime_api = 1,
       config = require("superlemon.settings").config_status(),
     }
+  end
+
+  -- Host-supplied transports (e.g. an ssh bridge to a remote nvim) never ran
+  -- a local launch plan, so the managed baseline was not applied at startup.
+  -- Adopt it before the adapters below read option/global state; a session
+  -- whose startup already ran the managed init is left untouched.
+  if opts and opts.remote then
+    require("superlemon.managed").adopt()
   end
 
   -- All autocmds live in this augroup; clearing it makes setup() idempotent.
