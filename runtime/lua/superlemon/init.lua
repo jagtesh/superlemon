@@ -56,6 +56,9 @@ function M.setup(channel, opts)
   require("superlemon.status").setup(group)
   require("superlemon.clipboard").setup()
   require("superlemon.keymaps").setup()
+  -- After every configuration file has run: a user 'statusline' wins over
+  -- the managed theme (CONTRACT.md `superlemon.statusline`).
+  require("superlemon.sltheme").apply()
   require("superlemon.chrome").setup(group, opts)
   local chrome = require("superlemon.chrome").state()
   require("superlemon.minimap").setup(

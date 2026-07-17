@@ -145,73 +145,20 @@ let g:superlemon_minimap_pitch = 3.0
 let g:superlemon_minimap_min_editor_columns = 40
 
 " ---------------------------------------------------------------------------
-" Native status bar appearance and contents
+" Native status bar theme
 " ---------------------------------------------------------------------------
 "
-" The native bar renders the normal Neovim 'statusline'. The SL* highlight
-" groups below control each segment's colors, while the final table controls
-" segment order and text. You may replace this entire section with lualine,
-" airline, or any ordinary statusline configuration; Superlemon harvests the
-" evaluated result and its highlight groups rather than drawing a second bar.
-
-lua << LUA
-local hl = vim.api.nvim_set_hl
-
--- Mode badge colors. Each table is { foreground, background, bold? }.
-hl(0, "SLModeNormal", { fg = "#FFFFFF", bg = "#004DC8", bold = true })
-hl(0, "SLModeInsert", { fg = "#1B2023", bg = "#ADC694", bold = true })
-hl(0, "SLModeVisual", { fg = "#FFFFFF", bg = "#8E24AA", bold = true })
-hl(0, "SLModeReplace", { fg = "#FFFFFF", bg = "#C42B1C", bold = true })
-hl(0, "SLModeCommand", { fg = "#1B2023", bg = "#E0B268", bold = true })
-
--- Remaining statusline segment colors.
-hl(0, "SLGit", { fg = "#CDD2D7", bg = "#4A4A49" })
-hl(0, "SLFile", { fg = "#CDD2D7", bg = "#373736" })
-hl(0, "SLInfo", { fg = "#A6ABB0", bg = "#2B2B2A" })
-hl(0, "SLPos", { fg = "#FFFFFF", bg = "#005A37", bold = true })
-
--- Human-readable labels and highlight groups for every editor mode.
-local MODE_NAMES = {
-  n = "NORMAL", i = "INSERT", v = "VISUAL", V = "V-LINE", ["\22"] = "V-BLOCK",
-  c = "COMMAND", R = "REPLACE", s = "SELECT", S = "S-LINE", t = "TERMINAL",
-}
-local MODE_GROUPS = {
-  n = "SLModeNormal", i = "SLModeInsert", v = "SLModeVisual",
-  V = "SLModeVisual", ["\22"] = "SLModeVisual", c = "SLModeCommand",
-  R = "SLModeReplace", t = "SLModeInsert",
-}
-
--- Return the colored mode badge. The optional argument keeps the function
--- easy to exercise from :lua and from the runtime test suite.
-function _G.superlemon_sl_mode(mode)
-  mode = mode or vim.fn.mode()
-  local key = mode:sub(1, 1)
-  local group = MODE_GROUPS[key] or "SLModeNormal"
-  local name = MODE_NAMES[key] or mode:upper()
-  return "%#" .. group .. "# " .. name .. " "
-end
-
--- Return a branch segment when the working directory belongs to a Git repo.
--- The bundled provider caches this lookup, so statusline evaluation is cheap.
-function _G.superlemon_sl_git()
-  local ok, status = pcall(require, "superlemon.status")
-  local branch = ok and status.branch_for(vim.fn.getcwd()) or ""
-  if branch == "" then
-    return ""
-  end
-  return "%#SLGit# ⎇ " .. branch .. " "
-end
-
--- Reorder, add, or remove entries here like any normal Vim statusline.
--- `%=` separates the left side from the right-aligned informational segments.
-vim.o.statusline = table.concat({
-  "%{%v:lua.superlemon_sl_mode()%}",
-  "%{%v:lua.superlemon_sl_git()%}",
-  "%#SLFile# %f %m%r ",
-  "%=",
-  "%#SLInfo# %{&filetype == '' ? 'text' : &filetype} ",
-  "%#SLInfo# %{&fileencoding == '' ? &encoding : &fileencoding}[%{&fileformat}] ",
-  "%#SLInfo# %p%% ",
-  "%#SLPos# ln:%l/%L ≡ :%c ",
-})
-LUA
+" The native bar renders the normal Neovim 'statusline'. Superlemon ships two
+" built-in themes, applied at bridge startup only when your configuration has
+" not set a 'statusline' of its own:
+"
+"   powerline   colored mode/git/file/position segments (the default; its
+"               fixed palette is independent of the Appearance setting and
+"               survives colorscheme reloads)
+"   default     no managed statusline; the bar shows its plain built-in chips
+"
+" Any ordinary statusline configuration (lualine, airline, or a hand-written
+" 'statusline') simply wins: Superlemon harvests the evaluated result and its
+" highlight groups rather than drawing a second bar. The theme definitions
+" live in the runtime's lua/superlemon/sltheme.lua.
+let g:superlemon_statusline_theme = get(g:, 'superlemon_statusline_theme', 'powerline')

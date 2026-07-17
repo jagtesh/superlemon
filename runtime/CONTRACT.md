@@ -462,6 +462,16 @@ global value. If neither is configured, `segments` is `vim.NIL` and the GUI
 shows its built-in status chips. The fallback also covers evaluation failure or
 empty output.
 
+`require("superlemon.sltheme").apply()` runs during bridge setup and installs
+the built-in theme selected by `g:superlemon_statusline_theme`: `powerline`
+(the default) sets the colored segmented statusline, `default` installs
+nothing (plain built-in chips). The theme only applies when the user's
+configuration did not set a `'statusline'` of its own, and it reinstalls its
+highlight groups on `ColorScheme` — a colorscheme reload (including the one
+an Appearance-driven `'background'` change triggers) clears user-defined
+groups and must not strip the theme. The powerline palette is fixed and
+independent of the Appearance setting.
+
 Configured content is evaluated with:
 
 ```lua
