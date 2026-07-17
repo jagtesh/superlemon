@@ -461,6 +461,14 @@ Displacement is measured in screen rows, not document lines: wrapped
 carries `grid_scroll` damage, the summed wire rows are the animated
 displacement (and the far-jump classification); the semantic delta remains
 provenance and the fallback for scrolls that redraw without rotation damage.
+
+While a wheel step's authoritative response is still in flight, the input
+host reports it (`noteScrollInputPending`) and the grid's active envelope is
+C2-consolidated to keep at least one adaptive duration of motion remaining —
+the camera is still moving when a high-latency response lands rather than
+resting inside the round trip. Residuals always end at zero displacement, so
+an unanswered step (a wheel event Neovim ignores at the buffer edge) glides
+out at the authoritative viewport with nothing to unwind.
 That position exactly cancels the discrete row rotation for the current frame,
 while the zero derivatives leave the existing envelope's velocity and
 acceleration unchanged. Each residual reaches zero position, velocity, and

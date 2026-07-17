@@ -142,6 +142,23 @@ struct ContinuousScrollEnvelope: Equatable {
             duration: duration))
     }
 
+    /// Longest time before every residual reaches rest.
+    var remainingDuration: CFTimeInterval {
+        segments.reduce(0) { max($0, $1.duration - $1.elapsed) }
+    }
+
+    /// C2-consolidate the envelope so it keeps moving for at least
+    /// `duration`. The summed sample continues as one residual with the same
+    /// position, velocity, and acceleration, still ending at rest —
+    /// displacement invariants are unchanged, only the decay horizon moves.
+    /// Consolidation nets mixed-sign residuals into one signed budget; the
+    /// retained-history availability check on the next rotation remains the
+    /// backstop when that netting was optimistic.
+    mutating func ensureRemaining(atLeast duration: CFTimeInterval) {
+        guard isActive, remainingDuration < duration else { return }
+        segments = [MinimumJerkScrollSegment(initial: sample, duration: duration)]
+    }
+
     mutating func advance(by elapsed: CFTimeInterval) {
         guard elapsed > 0 else { return }
         for index in segments.indices {
@@ -635,6 +652,18 @@ final class SmoothViewportState {
             cursorAuthoritativeY: cursorAuthoritativeY,
             cursorVisualY: cursorVisualY,
             envelopeDuration: adaptiveEnvelopeDuration)
+    }
+
+    /// Gesture-aware velocity hold. The host reports a wheel step it just
+    /// sent whose authoritative response has not arrived; stretch the active
+    /// envelope so the camera is still moving when that response lands
+    /// instead of decaying to rest inside the round trip. Every residual
+    /// still ends at zero displacement, so an unanswered step — a wheel
+    /// event at the buffer edge that Neovim ignores — simply glides out at
+    /// the authoritative viewport with no correction to unwind.
+    func noteScrollInputPending() {
+        guard isActive, motion.isActive else { return }
+        motion.ensureRemaining(atLeast: adaptiveEnvelopeDuration)
     }
 
     /// Fold one movement-carrying arrival into the cadence estimate. The

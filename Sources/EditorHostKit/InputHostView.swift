@@ -503,6 +503,12 @@ public final class InputHostView: NSView, @preconcurrency NSTextInputClient, NSM
             modifier: arguments.modifier,
             grid: arguments.grid, row: arguments.row, col: arguments.col,
             repeatCount: count)
+        if direction == .up || direction == .down {
+            // Gesture-aware velocity hold: the response to this step is now
+            // in flight; keep that grid's active envelope moving across the
+            // transport round trip.
+            surface.noteScrollInputPending(gridID: cell.grid)
+        }
     }
 
     private func cellUnderPointer(_ event: NSEvent) -> (grid: Int, row: Int, col: Int)? {

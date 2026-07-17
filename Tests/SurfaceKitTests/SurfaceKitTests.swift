@@ -816,6 +816,70 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
             == SmoothViewportState.motionEnvelopeDuration)
     }
 
+    @Test func envelopeConsolidationIsC2ContinuousAndStillEndsAtRest() {
+        var motion = ContinuousScrollEnvelope()
+        motion.add(positionOffset: -1, duration: 0.180)
+        motion.advance(by: 0.100)
+        motion.add(positionOffset: -1, duration: 0.180)
+        motion.advance(by: 0.050)
+
+        let before = motion.sample
+        motion.ensureRemaining(atLeast: 0.480)
+        let after = motion.sample
+        #expect(abs(before.position - after.position) < 0.000_001)
+        #expect(abs(before.velocity - after.velocity) < 0.000_001)
+        #expect(abs(before.acceleration - after.acceleration) < 0.000_001)
+        #expect(abs(motion.remainingDuration - 0.480) < 0.000_001)
+
+        // A hold horizon at or below the current remaining time is a no-op.
+        let segments = motion.segments
+        motion.ensureRemaining(atLeast: 0.200)
+        #expect(motion.segments == segments)
+
+        for _ in 0..<120 { motion.advance(by: 1.0 / 120.0) }
+        #expect(!motion.isActive, "a consolidated residual still reaches rest")
+    }
+
+    @Test func pendingInputHoldsVelocityAcrossAResponseGap() {
+        let host = CALayer()
+        let image = solidImage(width: 80, height: 96)
+        let state = SmoothViewportState(gridID: 23)
+        _ = state.present(
+            image: image, rows: 6, cols: 10, margins: nil, scrolls: [],
+            semanticDelta: nil, cellSize: cellSize, scale: 1, host: host,
+            animate: true, arrivalTimestamp: 10.0)
+
+        // Learn a 250 ms remote cadence.
+        _ = presentOneRowStep(state, image: image, host: host, at: 10.0)
+        for _ in 0..<30 { _ = state.advance(by: 1.0 / 120.0) }
+        _ = presentOneRowStep(state, image: image, host: host, at: 10.25)
+
+        // Age the stretched envelope down to its tail, then report a wheel
+        // step whose response is still crossing the transport.
+        for _ in 0..<48 { _ = state.advance(by: 1.0 / 120.0) }  // 0.40 s
+        let positionBefore = state.position
+        let velocityBefore = state.velocity
+        state.noteScrollInputPending()
+        #expect(abs(state.position - positionBefore) < 0.000_001)
+        #expect(abs(state.velocity - velocityBefore) < 0.000_001)
+
+        // Without the hold the envelope had 80 ms left; with it the camera
+        // is still carrying motion when the response lands 250 ms later.
+        for _ in 0..<30 { _ = state.advance(by: 1.0 / 120.0) }  // 0.25 s
+        #expect(state.isActive)
+        #expect(presentOneRowStep(state, image: image, host: host, at: 10.90))
+        #expect(state.isActive)
+
+        // An unanswered step (buffer edge) still glides out at the
+        // authoritative viewport: residuals end at rest, nothing to unwind.
+        state.noteScrollInputPending()
+        for _ in 0..<240 where state.isActive {
+            _ = state.advance(by: 1.0 / 120.0)
+        }
+        #expect(!state.isActive)
+        #expect(state.position == 0)
+    }
+
     @Test func idleGapsAndUntimestampedPresentsLeaveTheCadenceUntouched() {
         let host = CALayer()
         let image = solidImage(width: 80, height: 96)

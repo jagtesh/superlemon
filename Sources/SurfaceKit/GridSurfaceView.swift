@@ -448,6 +448,17 @@ public final class GridSurfaceView: NSView {
         return true
     }
 
+    /// Input-side hint: a vertical wheel step was just sent to Neovim for
+    /// this grid and its authoritative response is still in flight. While
+    /// that grid's motion is active, the envelope is held moving for at
+    /// least one adaptive duration so a high-latency transport's round trip
+    /// does not land on a camera that already came to rest. No-op when the
+    /// grid is idle, when motion is disabled, or under Reduce Motion.
+    public func noteScrollInputPending(gridID: Int) {
+        guard scrollMotionStyle == .tightNative, !reducedMotion else { return }
+        smoothViewports[gridID]?.noteScrollInputPending()
+    }
+
     /// Bounded, allocation-stable diagnostic history. Unlike the former
     /// stderr trace this performs no synchronous I/O during a gesture.
     package var recordedScrollDiagnostics: [ScrollDiagnosticSample] {
