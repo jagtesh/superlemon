@@ -544,7 +544,12 @@ struct FileTreeSidebarTests {
             sidebar.outlineView,
             viewFor: sidebar.outlineView.tableColumns[0],
             item: parentItem))
-        #expect(allStrings(in: cell).contains(".."))
+        // The row names its destination: ".." plus the parent folder name.
+        let parentName = root.standardizedFileURL
+            .deletingLastPathComponent().lastPathComponent
+        #expect(allStrings(in: cell).contains {
+            $0.hasPrefix("..") && $0.contains(parentName)
+        })
 
         var changedTo: [String] = []
         var focusRequests = 0

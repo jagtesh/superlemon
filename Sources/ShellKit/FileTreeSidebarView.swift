@@ -1453,15 +1453,30 @@ final class FileTreeCellView: NSView {
     }
 
     /// The synthetic ".." row: secondary-colored, no type dot, no badge.
+    /// The parent folder's name rides along further dimmed so "up" has a
+    /// visible destination; the full path stays in the tooltip.
     func configureAsParentDirectory(parentPath: String, dark: Bool) {
-        nameLabel.stringValue = ".."
-        nameLabel.textColor = ShellPalette.secondaryText(dark: dark)
+        let parentName = (parentPath as NSString).lastPathComponent
+        let font = nameLabel.font ?? .systemFont(ofSize: 13)
+        let secondary = ShellPalette.secondaryText(dark: dark)
+        let text = NSMutableAttributedString(
+            string: "..",
+            attributes: [.font: font, .foregroundColor: secondary])
+        if !parentName.isEmpty {
+            text.append(NSAttributedString(
+                string: "  \(parentName)",
+                attributes: [
+                    .font: font,
+                    .foregroundColor: secondary.withAlphaComponent(0.65),
+                ]))
+        }
+        nameLabel.attributedStringValue = text
         dotLabel.stringValue = ""
         gitBadgeLabel.stringValue = ""
         toolTip = "Go to parent folder: \(parentPath)"
         setAccessibilityElement(true)
         setAccessibilityRole(.staticText)
-        setAccessibilityLabel("Parent folder")
+        setAccessibilityLabel("Parent folder \(parentName)")
         endEditing(commit: false)
     }
 
