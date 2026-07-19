@@ -174,6 +174,13 @@ public final class GridSurfaceView: NSView {
         super.init(frame: frameRect)
         wantsLayer = true
         layerContentsRedrawPolicy = .never
+        // Opaque from the very first frame. The flush path owns the real
+        // background (commit sets it from the highlight table), but before
+        // any flush arrives the layer would otherwise stay clear and let
+        // stale window pixels show through — visible for seconds while a
+        // slow remote transport starts up. Paint the pre-colorscheme
+        // default immediately.
+        layer?.backgroundColor = HighlightTable().defaultBackground.cgColor
         layer?.addSublayer(cursorLayer)
         cellSize = fonts.cellSize
         reducedMotion = Self.systemReduceMotion
@@ -222,6 +229,11 @@ public final class GridSurfaceView: NSView {
         )
     }
 
+    /// One-shot: fires after the first flush is presented. EditorHostKit
+    /// uses it to drop its pre-session "connecting" affordance the moment
+    /// real grid content exists.
+    package var onFirstPresent: (() -> Void)?
+
     /// Present one atomic frame: rotate/repaint row tiles, update layers and
     /// cursor, and commit them in one disabled-actions CATransaction.
     public func present(_ flush: FlushResult) {
@@ -229,6 +241,10 @@ public final class GridSurfaceView: NSView {
         scheduledDisplayPresentation = nil
         lastFlush = flush
         commit(flush, redrawAll: false)
+        if let onFirstPresent {
+            self.onFirstPresent = nil
+            onFirstPresent()
+        }
     }
 
     /// Change font/linespace (guifont path). Recomputes metrics and fully

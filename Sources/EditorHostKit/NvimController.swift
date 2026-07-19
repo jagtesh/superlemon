@@ -476,6 +476,17 @@ public final class NvimController {
                 throw StartupError.unsupportedNvimVersion(info.version)
             }
             channelID = info.channelID
+            if hasRemoteFilesystem {
+                // The session's own cwd is authoritative for the tree the
+                // sidebar shows. Kick the probe off right after the
+                // handshake — off the startup path (requests multiplex by
+                // msgid) — so a high-latency transport's sidebar re-roots
+                // while the attach/bootstrap round trips are still in
+                // flight instead of seconds later when startup completes.
+                Task { [weak self] in
+                    await self?.adoptSessionWorkingDirectory(context)
+                }
+            }
 
             let grid = surface?.gridSize ?? headlessGridSize
             lastSentGridSize = grid
@@ -519,13 +530,6 @@ public final class NvimController {
             runtimeReady = true
             phase = .running
             deliverFirstFlushIfReady()
-            if hasRemoteFilesystem {
-                // Off the startup path: a slow/failed cwd probe must not
-                // delay first-flush consumers or a queued quit.
-                Task { [weak self] in
-                    await self?.adoptSessionWorkingDirectory(context)
-                }
-            }
             beginQueuedStartupQuitIfNeeded(context)
         } catch {
             guard sessionGeneration == generation else { return }
@@ -678,9 +682,10 @@ public final class NvimController {
 
     /// Remote transports start with a host-guessed project root, but the
     /// session's own cwd is authoritative for the filesystem it sees.
-    /// Re-root the native workspace chrome once startup completes; failure
-    /// keeps the host-provided root (the sidebar surfaces its own listing
-    /// error and Quick Open stays empty until the next successful refresh).
+    /// Re-root the native workspace chrome as soon as the handshake lands
+    /// (concurrently with the rest of startup); failure keeps the
+    /// host-provided root (the sidebar surfaces its own listing error and
+    /// Quick Open stays empty until the next successful refresh).
     private func adoptSessionWorkingDirectory(_ context: SessionContext) async {
         guard
             let reply = try? await context.session.request(

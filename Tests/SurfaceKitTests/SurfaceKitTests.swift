@@ -2580,3 +2580,36 @@ extension CursorRenderTests {
         render(text)
     }
 }
+
+// MARK: - Pre-session surface background
+
+@MainActor
+@Suite struct PreSessionBackgroundTests {
+    /// Before any flush arrives the surface must already paint an opaque
+    /// background (the pre-colorscheme default); a clear layer lets stale
+    /// window pixels show through while a slow remote transport starts up.
+    @Test func surfaceIsOpaqueBeforeTheFirstFlush() {
+        let surface = GridSurfaceView(
+            frame: NSRect(x: 0, y: 0, width: 320, height: 200), font: menlo)
+        let background = surface.layer?.backgroundColor
+        #expect(background != nil)
+        #expect(background?.alpha == 1)
+        #expect(background == HighlightTable().defaultBackground.cgColor)
+    }
+
+    @Test func firstPresentFiresTheOneShotHook() {
+        let surface = GridSurfaceView(
+            frame: NSRect(x: 0, y: 0, width: 320, height: 200), font: menlo)
+        var fired = 0
+        surface.onFirstPresent = { fired += 1 }
+        let store = GridStore()
+        let result = flush(store, [
+            .gridResize(grid: 1, width: 20, height: 5),
+            line(0, "hello", hl: 0),
+        ])
+        surface.present(result)
+        #expect(fired == 1)
+        surface.present(result)
+        #expect(fired == 1, "the hook is one-shot")
+    }
+}

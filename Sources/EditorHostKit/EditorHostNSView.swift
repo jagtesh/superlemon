@@ -11,6 +11,32 @@ import GridKit
 import ShellKit
 import SurfaceKit
 
+/// Visibility state machine for the pre-session "Connecting to Neovim…"
+/// label: visible only when the startup grace period elapses before the
+/// first grid content is presented. Pure state so tests can drive it
+/// without a timer or a Neovim session.
+struct ConnectingIndicatorState {
+    private(set) var graceElapsed = false
+    private(set) var contentPresented = false
+
+    var isVisible: Bool { graceElapsed && !contentPresented }
+
+    /// The grace timer fired. Returns true when the label should appear
+    /// (no content has arrived yet).
+    mutating func noteGraceElapsed() -> Bool {
+        graceElapsed = true
+        return isVisible
+    }
+
+    /// First real grid content was presented. Returns true when a visible
+    /// label must hide; the label never appears again afterwards.
+    mutating func noteContentPresented() -> Bool {
+        let wasVisible = isVisible
+        contentPresented = true
+        return wasVisible
+    }
+}
+
 @MainActor
 public final class EditorHostNSView: NSView {
     /// Below this host width at bridge bootstrap, the runtime defaults the
@@ -31,6 +57,13 @@ public final class EditorHostNSView: NSView {
     /// split view — direct setSidebarVisible calls from embedding hosts
     /// survive unrelated chrome pushes.
     private var lastAppliedNativeSidebar: Bool?
+    /// Pre-session affordance over the (opaque) editor surface while a slow
+    /// transport starts up. Grace-gated so fast local launches never — or
+    /// only fleetingly — show it; hidden permanently on the first flush.
+    private let connectingLabel = NSTextField(
+        labelWithString: "Connecting to Neovim…")
+    private var connectingState = ConnectingIndicatorState()
+    private var connectingGraceTask: Task<Void, Never>?
 
     public init(
         controller: NvimController = NvimController(),
@@ -126,6 +159,27 @@ public final class EditorHostNSView: NSView {
             (self?.bounds.width ?? frameRect.width)
                 < Self.compactStartupWidthThreshold
         }
+
+        // The surface now paints an opaque background from its very first
+        // frame; this label tells the user why the editor area is empty
+        // while a slow transport (e.g. an ssh bridge) starts up.
+        connectingLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        connectingLabel.textColor = .secondaryLabelColor
+        // Its backdrop is the surface's fixed pre-colorscheme background
+        // (dark), not the window's chrome, so resolve the dynamic color
+        // against the dark appearance regardless of the host's theme.
+        // (Per-view only; window-appearance ownership is untouched.)
+        connectingLabel.appearance = NSAppearance(named: .darkAqua)
+        connectingLabel.isHidden = true
+        connectingLabel.translatesAutoresizingMaskIntoConstraints = false
+        inputHost.addSubview(connectingLabel)
+        NSLayoutConstraint.activate([
+            connectingLabel.centerXAnchor.constraint(equalTo: inputHost.centerXAnchor),
+            connectingLabel.centerYAnchor.constraint(equalTo: inputHost.centerYAnchor),
+        ])
+        surface.onFirstPresent = { [weak self] in
+            self?.noteFirstGridContent()
+        }
     }
 
     @available(*, unavailable)
@@ -140,6 +194,30 @@ public final class EditorHostNSView: NSView {
         guard let window, window !== attachedWindow else { return }
         attachedWindow = window
         attach(to: window)
+        startConnectingGraceIfNeeded()
+    }
+
+    /// One grace period per view, clocked from the first window attachment
+    /// (when the editor actually becomes visible).
+    private func startConnectingGraceIfNeeded() {
+        guard connectingGraceTask == nil, !connectingState.graceElapsed,
+            !connectingState.contentPresented
+        else { return }
+        connectingGraceTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(250))
+            guard let self, !Task.isCancelled else { return }
+            self.connectingGraceTask = nil
+            if self.connectingState.noteGraceElapsed() {
+                self.connectingLabel.isHidden = false
+            }
+        }
+    }
+
+    private func noteFirstGridContent() {
+        connectingGraceTask?.cancel()
+        connectingGraceTask = nil
+        _ = connectingState.noteContentPresented()
+        connectingLabel.isHidden = true
     }
 
     private func attach(to window: NSWindow) {
