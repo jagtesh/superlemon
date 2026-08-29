@@ -197,35 +197,29 @@ public enum MsgpackEncoder {
 public struct MsgpackDecoder: Sendable {
     private var buffer: [UInt8] = []
     private var readIndex = 0
-    private var deferredError: MsgpackError?
     private let limits: MsgpackDecodingLimits
 
     public init(limits: MsgpackDecodingLimits = .init()) {
         self.limits = limits
     }
 
-    /// Bytes buffered but not yet consumed by a completed decode.
+    /// Bytes buffered but not yet consumed by a completed decode. This can
+    /// legitimately include one or more complete messages that simply
+    /// haven't been drained by `decodeNext()` yet (e.g. several redraw
+    /// notifications arriving in one pipe read) as well as the leading bytes
+    /// of a still-incomplete one, so it must never be compared directly
+    /// against `maximumMessageBytes` — that comparison belongs to
+    /// `decodeValue`, which measures each message's own size relative to
+    /// where *that* message starts (`messageStart`), not the whole buffer.
     public var bytesPending: Int { buffer.count - readIndex }
 
     public mutating func append(_ bytes: some Sequence<UInt8>) {
-        guard deferredError == nil else { return }
-
-        // Do not append a giant chunk and discover the limit only after the
-        // allocation. Keep at most `maximumMessageBytes` pending bytes; the
-        // next byte records a sticky decoder error surfaced by decodeNext().
-        for byte in bytes {
-            guard bytesPending < limits.maximumMessageBytes else {
-                deferredError = .messageTooLarge(limit: limits.maximumMessageBytes)
-                return
-            }
-            buffer.append(byte)
-        }
+        buffer.append(contentsOf: bytes)
     }
 
     /// Decode the next complete value, or `nil` if more bytes are needed.
     /// Throws only on genuinely malformed input.
     public mutating func decodeNext() throws -> Value? {
-        if let deferredError { throw deferredError }
         var cursor = readIndex
         do {
             let value = try Self.decodeValue(

@@ -1017,6 +1017,15 @@ public actor NvimSession {
             break
         }
 
+        if processExitObserved {
+            // The process is already gone — `handleProcessExit` is mid-drain
+            // and will call `finish` once it completes. A `shutdown()` /
+            // `terminate()` call racing that drain must not relabel the real
+            // exit (e.g. as `.requestedShutdown`), and there is no live
+            // process left to signal, so there is nothing more to do here.
+            return
+        }
+
         if primaryTerminationCause == nil { primaryTerminationCause = cause }
         if primaryFailure == nil { primaryFailure = failure }
 
@@ -1071,11 +1080,29 @@ public actor NvimSession {
 
     private func handleWriterFailure(_ message: String) {
         guard case .running = state else { return }
+        guard !processExitObserved else {
+            // The process already exited and `handleProcessExit` is mid-drain
+            // (waiting on the stdout/stderr pumps). A queued write hitting
+            // EPIPE here is just the pipe closing behind an already-dead
+            // process, not a genuine transport failure — relabeling a clean
+            // exit as `.ioFailure` and short-circuiting the drain via
+            // `beginFailure`/`finishDataStreams()` would both misreport the
+            // cause and risk dropping the final redraw batch. Stop accepting
+            // further writes and let the drain finish on its own.
+            writer?.close()
+            return
+        }
         beginFailure(.ioFailure(message))
     }
 
     private func handleReaderFailure(_ message: String) {
         guard case .running = state else { return }
+        guard !processExitObserved else {
+            // Same rationale as `handleWriterFailure`: the process already
+            // exited, so a reader failure here is expected pipe teardown
+            // during the drain, not a genuine I/O error worth reporting.
+            return
+        }
         beginFailure(.ioFailure(message))
     }
 
@@ -1087,13 +1114,32 @@ public actor NvimSession {
         guard case .running = state, !processExitObserved else { return }
         stdoutEOFProbeTask?.cancel()
         stdoutEOFProbeTask = Task { [weak self] in
+            await self?.probeStdoutClosedWhileLive()
+        }
+    }
+
+    /// `Process.terminationHandler` can lag stdout EOF by more than the
+    /// original fixed 50ms wait on a loaded machine (250ms of scheduling
+    /// delay has been observed in CI) — closing stdout is the first thing
+    /// that happens on exit, and the kernel reaping the child and Foundation
+    /// invoking the callback both come after. Polling in short steps for up
+    /// to ~1s gives that reap time to land, while still bailing out the
+    /// moment `processExitObserved` flips so a normal exit isn't held up
+    /// waiting out the whole window.
+    private func probeStdoutClosedWhileLive() async {
+        for _ in 0..<20 {
+            guard case .running = state, !processExitObserved else {
+                stdoutEOFProbeTask = nil
+                return
+            }
             do {
                 try await Task.sleep(for: .milliseconds(50))
             } catch {
+                stdoutEOFProbeTask = nil
                 return
             }
-            await self?.failIfStdoutClosedWhileLive()
         }
+        failIfStdoutClosedWhileLive()
     }
 
     private func failIfStdoutClosedWhileLive() {

@@ -195,18 +195,37 @@ private let boundaryValues: [Value] = [
         #expect(try decoder.decodeNext() == .array([.nil, .bool(true)]))
     }
 
-    @Test func rejectsBufferedMessageBeyondWireLimitWithoutGrowingPastLimit() {
+    @Test func rejectsBufferedMessageBeyondWireLimit() {
         let limits = MsgpackDecodingLimits(
             maximumMessageBytes: 8,
             maximumContainerElements: 100,
             maximumNestingDepth: 10)
         var decoder = MsgpackDecoder(limits: limits)
+        // str8 declaring a 20-byte payload, all of it buffered up front.
         decoder.append([0xd9, 20] + Array(repeating: 0x61, count: 20))
 
-        #expect(decoder.bytesPending == 8)
         #expect(throws: MsgpackError.messageTooLarge(limit: 8)) {
             try decoder.decodeNext()
         }
+    }
+
+    @Test func messageExactlyAtWireLimitDoesNotPoisonTheNextMessage() throws {
+        let limits = MsgpackDecodingLimits(
+            maximumMessageBytes: 8,
+            maximumContainerElements: 100,
+            maximumNestingDepth: 10)
+        var decoder = MsgpackDecoder(limits: limits)
+        // fixstr(7): 1-byte header + 7-byte payload == 8 bytes, exactly at
+        // the limit. The next message's leading byte (0xc0 == nil) arrives
+        // in the very same append call, which used to make `append` count
+        // both messages' bytes against the single-message limit and fail
+        // the whole buffer with `.messageTooLarge` even though neither
+        // message individually exceeds it.
+        let sevenByteString: [UInt8] = [0xa7] + Array("abcdefg".utf8)
+        decoder.append(sevenByteString + [0xc0])
+
+        #expect(try decoder.decodeNext() == .string("abcdefg"))
+        #expect(try decoder.decodeNext() == .nil)
     }
 
     @Test func rejectsOversizedDeclaredStringBeforePayloadArrives() {

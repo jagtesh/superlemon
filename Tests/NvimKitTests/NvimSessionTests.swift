@@ -373,6 +373,56 @@ private func lineText(_ event: UIEvent) -> String? {
         #expect(await lifecycleEvents.value.count == 1)
     }
 
+    @Test func writeFailureDuringExitDrainDoesNotRelabelCleanExit() async throws {
+        // The shell exits immediately (closing its own copy of stdin), but a
+        // backgrounded grandchild that has already closed its own copy of
+        // stdin keeps stdout open for a while longer. That stretches the
+        // window, inside `handleProcessExit`, where `processExitObserved` is
+        // already true but `state` is still `.running` while it waits for
+        // the stdout pump to drain. A write issued in that window hits EPIPE
+        // against the already-closed stdin; it must surface as the plain
+        // `.processExit` outcome, not `.ioFailure`.
+        let session = NvimSession(
+            configuration: NvimLaunchConfiguration(
+                binaryURL: URL(fileURLWithPath: "/bin/sh"),
+                arguments: ["-c", "( exec 0<&-; sleep 0.3 ) & exit 0"]))
+        let terminationOutcomes = Task {
+            var outcomes: [NvimTermination] = []
+            for await outcome in session.terminationEvents { outcomes.append(outcome) }
+            return outcomes
+        }
+        try await session.start()
+
+        // Give the shell time to exit (and close stdin) while the
+        // backgrounded grandchild is still holding stdout open.
+        try await Task.sleep(for: .milliseconds(100))
+        await session.notify("will-hit-epipe-after-exit", [])
+
+        let outcomes = await terminationOutcomes.value
+        #expect(outcomes.count == 1)
+        #expect(outcomes.first?.cause == .processExit)
+        #expect(outcomes.first?.exitCode == 0)
+    }
+
+    @Test func shutdownRacingExitDrainDoesNotRelabelCleanExit() async throws {
+        // Same stretched exit-drain window as above, but this time a caller
+        // races it with an explicit `shutdown()` rather than a write. That
+        // must not relabel the already-observed clean exit as
+        // `.requestedShutdown`.
+        let session = NvimSession(
+            configuration: NvimLaunchConfiguration(
+                binaryURL: URL(fileURLWithPath: "/bin/sh"),
+                arguments: ["-c", "( sleep 0.3 ) & exit 7"]))
+        try await session.start()
+
+        try await Task.sleep(for: .milliseconds(100))
+        let outcome = await session.shutdown(
+            termGrace: .milliseconds(50), killGrace: .milliseconds(50))
+
+        #expect(outcome.cause == .processExit)
+        #expect(outcome.exitCode == 7)
+    }
+
     @Test func missingProcessExitCallbackCannotStrandShutdownWaiters() async throws {
         let session = NvimSession(
             configuration: NvimLaunchConfiguration(
