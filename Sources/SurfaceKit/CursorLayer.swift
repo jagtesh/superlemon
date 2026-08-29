@@ -73,6 +73,9 @@ final class CursorLayer: CALayer {
             guard let cell else { return flush.highlights.resolved(id: 0) }
             return flush.highlights.resolved(id: cell.hlID)
         }()
+        let isWide = flush.grids[flush.cursor.grid]?
+            .isDoubleWidth(row: flush.cursor.row, col: flush.cursor.col) ?? false
+        let blockWidth = isWide ? cw * 2 : cw
         let attrID = mode?.attrID ?? 0
         let modeAttrs = attrID == 0 ? nil : flush.highlights.resolved(id: attrID)
         let fill: NvimKit.RGBColor
@@ -107,11 +110,11 @@ final class CursorLayer: CALayer {
             frame = CGRect(x: cellOrigin.x, y: cellOrigin.y + ch - h,
                            width: cw, height: h)
         case .block:
-            frame = CGRect(x: cellOrigin.x, y: cellOrigin.y, width: cw, height: ch)
+            frame = CGRect(x: cellOrigin.x, y: cellOrigin.y, width: blockWidth, height: ch)
             if styleChanged {
                 renderBlockGlyph(
                     flush: flush, glyphColor: glyphColor, fill: fill,
-                    fonts: fonts, cache: cache, scale: scale)
+                    fonts: fonts, cache: cache, scale: scale, isWide: isWide)
             }
         }
         lastStyleSignature = styleSignature
@@ -141,7 +144,7 @@ final class CursorLayer: CALayer {
     /// Draw the underlying cell's glyph in swapped colors into this layer.
     private func renderBlockGlyph(
         flush: FlushResult, glyphColor: NvimKit.RGBColor, fill: NvimKit.RGBColor,
-        fonts: FontSet, cache: GlyphCache, scale: CGFloat
+        fonts: FontSet, cache: GlyphCache, scale: CGFloat, isWide: Bool
     ) {
         guard let grid = flush.grids[flush.cursor.grid],
             flush.cursor.row < grid.rows, flush.cursor.col < grid.cols
@@ -150,19 +153,25 @@ final class CursorLayer: CALayer {
         guard !cell.text.isEmpty, cell.text != " " else { return }
 
         let cw = fonts.cellSize.width
+        let boxWidth = isWide ? cw * 2 : cw
         let ch = fonts.cellSize.height
         guard let ctx = GridRenderer.makeContext(
-            width: Int(cw * scale), height: Int(ch * scale), scale: scale)
+            width: Int(boxWidth * scale), height: Int(ch * scale), scale: scale)
         else { return }
         ctx.setFillColor(fill.cgColor)
-        ctx.fill(CGRect(x: 0, y: 0, width: cw, height: ch))
+        ctx.fill(CGRect(x: 0, y: 0, width: boxWidth, height: ch))
         // Match the grid's font variant for this cell — an upright glyph
         // drawn over italic/bold text reads as the wrong letter entirely.
         let attrs = flush.highlights.resolved(id: cell.hlID)
         let variant = FontSet.Variant(bold: attrs.bold, italic: attrs.italic)
+        // A cell always holds a single grapheme cluster, so this text's
+        // shaped column is always 0 regardless of `cellWidth` — pass the
+        // single-cell width the row rasterizer uses for the same (text,
+        // variant) cache key, not the widened box, so a cache hit here can
+        // never disagree with a hit from the normal row draw.
         let shaped = cache.shapedRun(
             text: cell.text, variant: variant, font: fonts.font(for: variant),
-            cellWidth: cw, baseAdvance: fonts.baseAdvance)
+            cellWidth: cw, baseAdvance: fonts.baseAdvance, columns: [0])
         ctx.translateBy(x: 0, y: ch - fonts.baselineOffset)
         ctx.setFillColor(glyphColor.cgColor)
         for segment in shaped.segments {

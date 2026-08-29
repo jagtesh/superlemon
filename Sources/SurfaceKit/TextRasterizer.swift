@@ -23,19 +23,41 @@ struct StyleRun: Equatable {
     var cellCount: Int
     var text: String
     var hlID: Int
+    /// The grid column (relative to `startCol`) of each Character in `text`,
+    /// in order — one entry per character, by construction from the cells
+    /// that built this run. This is the source of truth for glyph
+    /// placement: no double-width classification of the text is ever
+    /// needed, because a wide cell's own column and its neighbor's empty
+    /// trailing-half cell (which contributes no character) already encode
+    /// the width.
+    var columns: [Int]
     /// True for runs the rasterizer draws as vector geometry (synthesized
     /// ligatures) instead of shaping through the font.
     var synthetic: Bool
 
-    init(startCol: Int, cellCount: Int, text: String, hlID: Int, synthetic: Bool = false) {
+    init(
+        startCol: Int, cellCount: Int, text: String, hlID: Int, columns: [Int] = [],
+        synthetic: Bool = false
+    ) {
         self.startCol = startCol
         self.cellCount = cellCount
         self.text = text
         self.hlID = hlID
+        self.columns = columns
         self.synthetic = synthetic
     }
 
     var colRange: Range<Int> { startCol..<(startCol + cellCount) }
+
+    /// Append one column entry per Character in `text`, all at `column` — a
+    /// cell holds a single grapheme, so this is normally one entry; a cell
+    /// that somehow holds more than one Character gives every extra
+    /// character the same column defensively rather than desyncing the rest
+    /// of the run.
+    static func appendColumns(_ columns: inout [Int], text: String, column: Int) {
+        guard !text.isEmpty else { return }
+        columns.append(contentsOf: repeatElement(column, count: text.count))
+    }
 }
 
 /// The Core Text pipeline of DESIGN §6: run coalescing → background pass →
@@ -136,19 +158,26 @@ final class TextRasterizer {
                 if let seq = matched {
                     if let p = pending { result.append(p) }
                     pending = nil
+                    // Every ligature-sequence character is one ASCII char in
+                    // one cell (guaranteed by `char(_:)` above), so columns
+                    // are simply sequential.
                     result.append(StyleRun(
                         startCol: col, cellCount: seq.count, text: seq,
-                        hlID: run.hlID, synthetic: true))
+                        hlID: run.hlID, columns: Array(0..<seq.count), synthetic: true))
                     col += seq.count
                 } else {
                     let cellText = cells[base + col].text
                     if var p = pending {
+                        StyleRun.appendColumns(&p.columns, text: cellText, column: col - p.startCol)
                         p.cellCount += 1
                         p.text += cellText
                         pending = p
                     } else {
+                        var columns: [Int] = []
+                        StyleRun.appendColumns(&columns, text: cellText, column: 0)
                         pending = StyleRun(
-                            startCol: col, cellCount: 1, text: cellText, hlID: run.hlID)
+                            startCol: col, cellCount: 1, text: cellText, hlID: run.hlID,
+                            columns: columns)
                     }
                     col += 1
                 }
@@ -187,14 +216,18 @@ final class TextRasterizer {
                     result.append(
                         StyleRun(
                             startCol: col, cellCount: 1, text: cell.text,
-                            hlID: run.hlID, synthetic: true))
+                            hlID: run.hlID, columns: [0], synthetic: true))
                 } else if var p = pending {
+                    StyleRun.appendColumns(&p.columns, text: cell.text, column: col - p.startCol)
                     p.cellCount += 1
                     p.text += cell.text
                     pending = p
                 } else {
+                    var columns: [Int] = []
+                    StyleRun.appendColumns(&columns, text: cell.text, column: 0)
                     pending = StyleRun(
-                        startCol: col, cellCount: 1, text: cell.text, hlID: run.hlID)
+                        startCol: col, cellCount: 1, text: cell.text, hlID: run.hlID,
+                        columns: columns)
                 }
             }
             if let p = pending { result.append(p) }
@@ -209,12 +242,16 @@ final class TextRasterizer {
         var runs: [StyleRun] = []
         for (offset, cell) in cells.enumerated() {
             if var last = runs.last, cell.hlID == last.hlID {
+                StyleRun.appendColumns(&last.columns, text: cell.text, column: offset - last.startCol)
                 last.cellCount += 1
                 last.text += cell.text
                 runs[runs.count - 1] = last
             } else {
+                var columns: [Int] = []
+                StyleRun.appendColumns(&columns, text: cell.text, column: 0)
                 runs.append(StyleRun(
-                    startCol: offset, cellCount: 1, text: cell.text, hlID: cell.hlID))
+                    startCol: offset, cellCount: 1, text: cell.text, hlID: cell.hlID,
+                    columns: columns))
             }
         }
         return runs
@@ -249,7 +286,7 @@ final class TextRasterizer {
             if let symbol = fonts.symbolFont {
                 let shaped = cache.shapedRun(
                     text: run.text, variant: .regular, font: symbol,
-                    cellWidth: cw, baseAdvance: fonts.symbolBaseAdvance)
+                    cellWidth: cw, baseAdvance: fonts.symbolBaseAdvance, columns: run.columns)
                 ctx.saveGState()
                 ctx.translateBy(x: originX, y: baselineY)
                 ctx.setFillColor(attrs.foreground.cgColor)
@@ -268,7 +305,7 @@ final class TextRasterizer {
             // the main font's cell grid via the snapping in GlyphCache.
             let shaped = cache.shapedRun(
                 text: run.text, variant: .regular, font: symbol,
-                cellWidth: cw, baseAdvance: fonts.symbolBaseAdvance)
+                cellWidth: cw, baseAdvance: fonts.symbolBaseAdvance, columns: run.columns)
             ctx.saveGState()
             ctx.translateBy(x: originX, y: baselineY)
             ctx.setFillColor(attrs.foreground.cgColor)
@@ -281,9 +318,12 @@ final class TextRasterizer {
         } else if run.synthetic, let replacement = Self.ligatureSubstitutions[run.text] {
             // Font-drawn substitution, centered across the sequence's cells.
             let variant = FontSet.Variant(bold: attrs.bold, italic: attrs.italic)
+            // `replacement` is a single substituted Unicode character (not
+            // `run.text`, whose columns cover the original multi-cell
+            // ASCII sequence), so it always shapes at column 0.
             let shaped = cache.shapedRun(
                 text: replacement, variant: variant, font: fonts.font(for: variant),
-                cellWidth: cw, baseAdvance: fonts.baseAdvance)
+                cellWidth: cw, baseAdvance: fonts.baseAdvance, columns: [0])
             ctx.saveGState()
             ctx.translateBy(
                 x: originX + (CGFloat(run.cellCount) - 1) * cw / 2, y: baselineY)
@@ -298,7 +338,7 @@ final class TextRasterizer {
             let variant = FontSet.Variant(bold: attrs.bold, italic: attrs.italic)
             let shaped = cache.shapedRun(
                 text: run.text, variant: variant, font: fonts.font(for: variant),
-                cellWidth: cw, baseAdvance: fonts.baseAdvance)
+                cellWidth: cw, baseAdvance: fonts.baseAdvance, columns: run.columns)
             ctx.saveGState()
             ctx.translateBy(x: originX, y: baselineY)
             ctx.setFillColor(attrs.foreground.cgColor)

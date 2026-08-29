@@ -316,7 +316,10 @@ public final class GridSurfaceView: NSView {
     public var cursorRect: NSRect? {
         guard let flush = lastFlush, cellSize != .zero else { return nil }
         let origin = cursorOrigin(flush)
-        return NSRect(origin: origin, size: cellSize)
+        let isWide = flush.grids[flush.cursor.grid]?
+            .isDoubleWidth(row: flush.cursor.row, col: flush.cursor.col) ?? false
+        let width = isWide ? cellSize.width * 2 : cellSize.width
+        return NSRect(origin: origin, size: CGSize(width: width, height: cellSize.height))
     }
 
     // MARK: - Package editor-accessory bridge

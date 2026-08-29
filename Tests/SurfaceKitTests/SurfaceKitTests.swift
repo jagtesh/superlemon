@@ -96,8 +96,8 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
         ]
         let runs = TextRasterizer.coalesce(cells[...])
         #expect(runs == [
-            StyleRun(startCol: 0, cellCount: 2, text: "ab", hlID: 1),
-            StyleRun(startCol: 2, cellCount: 1, text: "c", hlID: 2),
+            StyleRun(startCol: 0, cellCount: 2, text: "ab", hlID: 1, columns: [0, 1]),
+            StyleRun(startCol: 2, cellCount: 1, text: "c", hlID: 2, columns: [0]),
         ])
     }
 
@@ -107,7 +107,10 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
             Cell(text: "x", hlID: 3),
         ]
         let runs = TextRasterizer.coalesce(cells[...])
-        #expect(runs == [StyleRun(startCol: 0, cellCount: 3, text: "世x", hlID: 3)])
+        // The empty trailing-half cell contributes no character and no
+        // column entry, so "x" (the grid's 3rd cell) lands at column 2, not
+        // column 1 — this is exactly what makes GlyphCache place it right.
+        #expect(runs == [StyleRun(startCol: 0, cellCount: 3, text: "世x", hlID: 3, columns: [0, 2])])
     }
 
     @Test func wholeBlankRowIsOneRun() {
@@ -440,9 +443,10 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
     @Test func repeatedShapingHitsCache() {
         let fonts = FontSet(spec: menlo)
         let cache = GlyphCache(capacity: 64)
-        _ = cache.shapedRun(text: "hello", variant: .regular, font: fonts.regular, cellWidth: 8, baseAdvance: 7.8)
-        _ = cache.shapedRun(text: "hello", variant: .regular, font: fonts.regular, cellWidth: 8, baseAdvance: 7.8)
-        _ = cache.shapedRun(text: "hello", variant: .bold, font: fonts.bold, cellWidth: 8, baseAdvance: 7.8)
+        let columns = Array(0..<5)
+        _ = cache.shapedRun(text: "hello", variant: .regular, font: fonts.regular, cellWidth: 8, baseAdvance: 7.8, columns: columns)
+        _ = cache.shapedRun(text: "hello", variant: .regular, font: fonts.regular, cellWidth: 8, baseAdvance: 7.8, columns: columns)
+        _ = cache.shapedRun(text: "hello", variant: .bold, font: fonts.bold, cellWidth: 8, baseAdvance: 7.8, columns: columns)
         #expect(cache.hits == 1)
         #expect(cache.misses == 2)
     }
@@ -451,12 +455,112 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
         let fonts = FontSet(spec: menlo)
         let cache = GlyphCache(capacity: 8)
         for i in 0..<50 {
-            _ = cache.shapedRun(text: "word\(i)", variant: .regular, font: fonts.regular, cellWidth: 8, baseAdvance: 7.8)
+            let text = "word\(i)"
+            _ = cache.shapedRun(text: text, variant: .regular, font: fonts.regular, cellWidth: 8, baseAdvance: 7.8, columns: Array(0..<text.count))
         }
         #expect(cache.misses == 50)
         // Everything distinct: eviction ran; re-shaping an early entry misses.
-        _ = cache.shapedRun(text: "word0", variant: .regular, font: fonts.regular, cellWidth: 8, baseAdvance: 7.8)
+        let text0 = "word0"
+        _ = cache.shapedRun(text: text0, variant: .regular, font: fonts.regular, cellWidth: 8, baseAdvance: 7.8, columns: Array(0..<text0.count))
         #expect(cache.misses == 51)
+    }
+
+    /// Run `cells` through the real coalescing pipeline (the source of
+    /// `columns` — no text classification anywhere), then flatten every
+    /// glyph's x position across segments, in the run's original (logical)
+    /// order — segments split only on fallback-font boundaries, never
+    /// reorder same-direction text.
+    private func shapedXs(_ cells: [Cell], _ fonts: FontSet, _ cache: GlyphCache) -> [CGFloat] {
+        let runs = TextRasterizer.coalesce(cells[...])
+        precondition(runs.count == 1, "expected one same-highlight run, got \(runs.count)")
+        let run = runs[0]
+        let shaped = cache.shapedRun(
+            text: run.text, variant: .regular, font: fonts.regular,
+            cellWidth: fonts.cellSize.width, baseAdvance: fonts.baseAdvance, columns: run.columns)
+        return shaped.segments.flatMap { $0.positions.map(\.x) }
+    }
+
+    @Test func pureASCIIRunSnapsToSequentialColumns() {
+        let fonts = FontSet(spec: menlo)
+        let cache = GlyphCache(capacity: 64)
+        let cw = fonts.cellSize.width
+        let cells = "hello".map { Cell(text: String($0), hlID: 0) }
+        let xs = shapedXs(cells, fonts, cache)
+        let expected = (0..<5).map { CGFloat($0) * cw }
+        #expect(xs.count == expected.count)
+        for (x, e) in zip(xs, expected) {
+            #expect(abs(x - e) < 0.01)
+        }
+    }
+
+    /// Bug: each double-width (CJK) glyph's column used to be derived by
+    /// classifying the glyph's TEXT (an East-Asian-Width table, or before
+    /// that Core Text's cumulative advance) instead of from the grid, which
+    /// already knows each wide cell's exact column — nvim always follows a
+    /// wide cell with an empty-text trailing-half cell.
+    @Test func wideGlyphsDoNotDriftAfterTheSecondOne() {
+        let fonts = FontSet(spec: menlo)
+        let cache = GlyphCache(capacity: 64)
+        let cw = fonts.cellSize.width
+        let cells: [Cell] = [
+            Cell(text: "漢", hlID: 0), Cell(text: "", hlID: 0),
+            Cell(text: "漢", hlID: 0), Cell(text: "", hlID: 0),
+            Cell(text: "漢", hlID: 0), Cell(text: "", hlID: 0),
+            Cell(text: "漢", hlID: 0), Cell(text: "", hlID: 0),
+            Cell(text: "a", hlID: 0),
+        ]
+        let xs = shapedXs(cells, fonts, cache)
+        let expected: [CGFloat] = [0, 2, 4, 6, 8].map { CGFloat($0) * cw }
+        #expect(xs.count == expected.count)
+        for (x, e) in zip(xs, expected) {
+            #expect(abs(x - e) < 0.01)
+        }
+    }
+
+    @Test func blankHoleMidRunLeavesNextGlyphAtItsOwnColumn() {
+        let fonts = FontSet(spec: menlo)
+        let cache = GlyphCache(capacity: 64)
+        let cw = fonts.cellSize.width
+        let cells: [Cell] = [
+            Cell(text: "a", hlID: 0), Cell(text: "", hlID: 0), Cell(text: "b", hlID: 0),
+        ]
+        let xs = shapedXs(cells, fonts, cache)
+        #expect(xs.count == 2)
+        #expect(abs(xs[0] - 0) < 0.01, "'a' stays at column 0")
+        #expect(abs(xs[1] - 2 * cw) < 0.01, "'b' lands at column 2, past the blank hole")
+    }
+
+    /// Emoji (U+1F300+) are outside every classic East-Asian-Width wide
+    /// range, so a text-classification fix would still drift here; the
+    /// grid-derived column is correct regardless of what the character is.
+    @Test func emojiGlyphColumnComesFromTheGridNotTextClassification() {
+        let fonts = FontSet(spec: menlo)
+        let cache = GlyphCache(capacity: 64)
+        let cw = fonts.cellSize.width
+        let cells: [Cell] = [
+            Cell(text: "😀", hlID: 0), Cell(text: "", hlID: 0), Cell(text: "x", hlID: 0),
+        ]
+        let xs = shapedXs(cells, fonts, cache)
+        #expect(xs.count == 2)
+        #expect(abs(xs[0] - 0) < 0.01, "emoji stays at column 0")
+        #expect(abs(xs[1] - 2 * cw) < 0.01, "'x' lands at column 2, past the emoji's trailing half")
+    }
+
+    @Test func mixedKanjiKanaRunColumnsMatchCellWidths() {
+        let fonts = FontSet(spec: menlo)
+        let cache = GlyphCache(capacity: 64)
+        let cw = fonts.cellSize.width
+        var cells: [Cell] = []
+        for ch in ["日", "本", "語", "の", "テ", "キ", "ス", "ト"] {
+            cells.append(Cell(text: ch, hlID: 0))
+            cells.append(Cell(text: "", hlID: 0))
+        }
+        let xs = shapedXs(cells, fonts, cache)
+        let expected: [CGFloat] = [0, 2, 4, 6, 8, 10, 12, 14].map { CGFloat($0) * cw }
+        #expect(xs.count == expected.count)
+        for (x, e) in zip(xs, expected) {
+            #expect(abs(x - e) < 0.01)
+        }
     }
 }
 
@@ -1973,7 +2077,7 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
         let cache = GlyphCache(capacity: 8)
         let shaped = cache.shapedRun(
             text: letter, variant: .regular, font: fonts.regular,
-            cellWidth: fonts.cellSize.width, baseAdvance: fonts.baseAdvance)
+            cellWidth: fonts.cellSize.width, baseAdvance: fonts.baseAdvance, columns: [0])
         ctx.translateBy(x: 0, y: ch - fonts.baselineOffset)
         ctx.setFillColor(NvimKit.RGBColor(rgb: 0x000000).cgColor)
         for segment in shaped.segments {
@@ -2002,6 +2106,75 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
         let matchesC = identical(image, reference("c", fonts: fonts))
         #expect(matchesB, "cursor must render the letter under it ('b')")
         #expect(!matchesA && !matchesC, "cursor must not render a neighbor's letter")
+    }
+
+    /// Bug: a block cursor over a double-width (CJK) cell was one cell wide,
+    /// clipping the glyph's right half and leaving it visible in normal
+    /// (non-inverted) colors from the row tile underneath.
+    @Test func blockCursorOverDoubleWidthCellSpansTwoCells() {
+        let view = GridSurfaceView(
+            frame: NSRect(x: 0, y: 0, width: 600, height: 400), font: menlo)
+        let fonts = FontSet(spec: menlo)
+        let store = GridStore()
+        var mode = ModeInfo()
+        mode.cursorShape = .block
+        // "a", then a wide "漢" occupying columns 1-2 (nvim emits the
+        // trailing half as an empty-text cell), then "b" at column 3.
+        let result = flush(store, [
+            .gridResize(grid: 1, width: 10, height: 4),
+            .defaultColorsSet(fg: rgb(0xFFFFFF), bg: rgb(0x000000), special: rgb(0xFF0000)),
+            .modeInfoSet(cursorStyleEnabled: true, modes: [mode]),
+            .modeChange(mode: "normal", modeIndex: 0),
+            .gridLine(
+                grid: 1, row: 0, colStart: 0,
+                cells: [
+                    CellRun(text: "a", hlID: 0),
+                    CellRun(text: "漢", hlID: 0),
+                    CellRun(text: "", hlID: 0),
+                    CellRun(text: "b", hlID: 0),
+                ], wrap: false),
+            .gridCursorGoto(grid: 1, row: 0, col: 1),
+        ])
+        view.present(result)
+        guard let layer = cursorLayer(of: view) else {
+            Issue.record("cursor layer missing")
+            return
+        }
+        #expect(layer.frame.origin.x == fonts.cellSize.width, "block sits over column 1")
+        #expect(
+            layer.frame.width == fonts.cellSize.width * 2,
+            "block cursor over a wide cell must span 2 cells, got \(layer.frame.width)")
+    }
+
+    /// Same double-width case for the IME candidate-window anchor.
+    @Test func cursorRectOverDoubleWidthCellIsTwoCellsWide() {
+        let view = GridSurfaceView(
+            frame: NSRect(x: 0, y: 0, width: 600, height: 400), font: menlo)
+        let fonts = FontSet(spec: menlo)
+        let store = GridStore()
+        var mode = ModeInfo()
+        mode.cursorShape = .block
+        let result = flush(store, [
+            .gridResize(grid: 1, width: 10, height: 4),
+            .defaultColorsSet(fg: rgb(0xFFFFFF), bg: rgb(0x000000), special: rgb(0xFF0000)),
+            .modeInfoSet(cursorStyleEnabled: true, modes: [mode]),
+            .modeChange(mode: "normal", modeIndex: 0),
+            .gridLine(
+                grid: 1, row: 0, colStart: 0,
+                cells: [
+                    CellRun(text: "a", hlID: 0),
+                    CellRun(text: "漢", hlID: 0),
+                    CellRun(text: "", hlID: 0),
+                    CellRun(text: "b", hlID: 0),
+                ], wrap: false),
+            .gridCursorGoto(grid: 1, row: 0, col: 1),
+        ])
+        view.present(result)
+        guard let rect = view.cursorRect else {
+            Issue.record("cursorRect missing")
+            return
+        }
+        #expect(rect.width == fonts.cellSize.width * 2)
     }
 }
 
@@ -2045,7 +2218,7 @@ extension CursorRenderTests {
             let cache = GlyphCache(capacity: 8)
             let shaped = cache.shapedRun(
                 text: "b", variant: variant, font: fonts.font(for: variant),
-                cellWidth: fonts.cellSize.width, baseAdvance: fonts.baseAdvance)
+                cellWidth: fonts.cellSize.width, baseAdvance: fonts.baseAdvance, columns: [0])
             ctx.translateBy(x: 0, y: ch - fonts.baselineOffset)
             ctx.setFillColor(NvimKit.RGBColor(rgb: 0x000000).cgColor)
             for s in shaped.segments {
@@ -2548,9 +2721,9 @@ extension CursorRenderTests {
         let runs = TextRasterizer.splitLigatureRuns(
             TextRasterizer.coalesce(cells[...]), cells: cells[...])
         #expect(runs == [
-            StyleRun(startCol: 0, cellCount: 1, text: "x", hlID: 1),
-            StyleRun(startCol: 1, cellCount: 3, text: "!==", hlID: 1, synthetic: true),
-            StyleRun(startCol: 4, cellCount: 1, text: "y", hlID: 1),
+            StyleRun(startCol: 0, cellCount: 1, text: "x", hlID: 1, columns: [0]),
+            StyleRun(startCol: 1, cellCount: 3, text: "!==", hlID: 1, columns: [0, 1, 2], synthetic: true),
+            StyleRun(startCol: 4, cellCount: 1, text: "y", hlID: 1, columns: [0]),
         ])
     }
 
