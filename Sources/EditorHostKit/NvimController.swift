@@ -1345,17 +1345,7 @@ public final class NvimController {
                 phase = .stopping
                 // Intentionally no bang: an edit or refusing autocommand that
                 // occurs after inspection must still keep the application open.
-                do {
-                    _ = try await context.session.request(
-                        "nvim_command", [.string("qa")], timeout: .seconds(2))
-                } catch {
-                    guard isCurrent(context) else { return }
-                    phase = .running
-                    cancelQuit(context)
-                    presentInfoAlert(
-                        "Neovim refused to quit",
-                        detail: error.localizedDescription)
-                }
+                await sendQuitCommand("qa", context: context)
                 return
             }
             phase = .awaitingQuitChoice
@@ -1388,6 +1378,59 @@ public final class NvimController {
             presentInfoAlert(
                 "Couldn’t inspect unsaved buffers",
                 detail: error.localizedDescription)
+        }
+    }
+
+    /// Sends `qa` / `qa!` and resolves the quit through whichever of two
+    /// paths actually happens.
+    ///
+    /// `:qa` runs `os_exit()` from inside the RPC request handler that ran
+    /// it, so nvim tears the channel down without ever answering that
+    /// request — awaiting a `request` reply here raced the channel close
+    /// against the timeout on every clean quit. Sending it as a `notify`
+    /// (fire-and-forget) sidesteps that: nvim's normal exit is then driven
+    /// entirely by the session lifecycle stream (`handleSessionTermination`,
+    /// which resolves the pending AppKit termination reply and any queued
+    /// relaunch intent).
+    ///
+    /// A *refusal* (E37/E162 "No write since last change", or an
+    /// autocommand aborting the quit) leaves nvim running with nothing to
+    /// report it — so it is detected with a cheap follow-up probe. Nvim's
+    /// event loop keeps answering RPC calls throughout an ordinary slow
+    /// exit (a shada write, a VimLeave hook, an ssh bridge teardown) right
+    /// up until the process actually tears down, so a reply alone can't
+    /// tell "still exiting" from "refused, and back to idle for good" —
+    /// probing `nvim_eval("1")` would call a refusal on a merely slow quit.
+    /// `v:exiting` is the one value that actually distinguishes them:
+    /// nvim sets it (to the pending exit code, never nil) the moment it
+    /// commits to quitting — before any VimLeave autocommand runs — and it
+    /// stays nil for the lifetime of a session `:qa` never left. So a reply
+    /// with `v:exiting` still nil means the command already ran and nvim is
+    /// back to normal: a genuine refusal, reported here (`v:errmsg` for
+    /// detail, e.g. "No write since last change"). A reply with `v:exiting`
+    /// set means nvim is committed to leaving — nothing to do here; the
+    /// lifecycle path finishes the quit once the process actually exits.
+    /// Any failure of the probe itself (timeout, channel already closed) is
+    /// likewise treated as "on its way out, or already gone".
+    private func sendQuitCommand(_ command: String, context: SessionContext) async {
+        await context.session.notify("nvim_command", [.string(command)])
+        do {
+            let probe = try await context.session.request(
+                "nvim_exec_lua",
+                [.string("return { exiting = vim.v.exiting, errmsg = vim.v.errmsg }"), .array([])],
+                timeout: .seconds(2))
+            guard probe["exiting"] == nil || probe["exiting"] == .nil else { return }
+            guard isCurrent(context) else { return }
+            phase = .running
+            cancelQuit(context)
+            presentInfoAlert(
+                "Neovim refused to quit",
+                detail: probe["errmsg"]?.stringValue ?? "")
+        } catch {
+            // No answer at all: the channel is already gone (a fast clean
+            // exit can beat the probe there) or nvim is otherwise
+            // incommunicado. Either way, handleSessionTermination completes
+            // the quit once the lifecycle stream delivers its outcome.
         }
     }
 
@@ -1435,17 +1478,7 @@ public final class NvimController {
             case .alertThirdButtonReturn:  // Discard All & Quit
                 self.phase = .stopping
                 Task {
-                    do {
-                        _ = try await context.session.request(
-                            "nvim_command", [.string("qa!")], timeout: .seconds(2))
-                    } catch {
-                        guard self.isCurrent(context) else { return }
-                        self.phase = .running
-                        self.cancelQuit(context)
-                        self.presentInfoAlert(
-                            "Neovim refused to quit",
-                            detail: error.localizedDescription)
-                    }
+                    await self.sendQuitCommand("qa!", context: context)
                 }
             default:  // Cancel
                 self.cancelQuit(context)
@@ -1476,8 +1509,7 @@ public final class NvimController {
             guard isCurrent(context) else { return }
             if stillModified.isEmpty {
                 phase = .stopping
-                _ = try await context.session.request(
-                    "nvim_command", [.string("qa")], timeout: .seconds(2))
+                await sendQuitCommand("qa", context: context)
             } else {
                 phase = .awaitingQuitChoice
                 presentUnsavedAlert(stillModified, context: context)

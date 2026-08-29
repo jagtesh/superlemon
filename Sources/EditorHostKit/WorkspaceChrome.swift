@@ -82,7 +82,7 @@ public final class WorkspaceChrome {
     private(set) var nativeScrollbars = false
     public private(set) var nativeSidebar = true
 
-    private unowned let controller: NvimController
+    private weak var controller: NvimController?
     private weak var window: NSWindow?
     private weak var surface: GridSurfaceView?
     public private(set) var projectRoot: URL
@@ -199,15 +199,15 @@ public final class WorkspaceChrome {
         case "superlemon.status":
             guard let payload = params.first, payload.mapValue != nil else { return }
             statusBar.render(statusModel(from: payload), dark: isDark)
-            controller.updateEditorCommandState(payload)
+            controller?.updateEditorCommandState(payload)
         case "superlemon.font":
             let delta = params.first?["delta"]?.intValue ?? 0
-            controller.bumpFont(delta: delta)
+            controller?.bumpFont(delta: delta)
         case "superlemon.save_as":
             onSaveAsRequested?()
         case "superlemon.settings":
             guard let payload = params.first, payload.mapValue != nil else { return }
-            controller.applyRuntimeSettings(payload)
+            controller?.applyRuntimeSettings(payload)
         case "superlemon.chrome":
             guard let payload = params.first else { return }
             nativeTabs = payload["native_tabs"]?.boolValue ?? false
@@ -375,7 +375,10 @@ public final class WorkspaceChrome {
     /// GridKit-backed resolver (ChromeKit/WIRING.md “Highlight resolution”):
     /// id 0 = the default pair.
     private var highlightResolver: HighlightResolver {
-        let highlights = controller.store.highlights
+        guard let highlights = controller?.store.highlights else {
+            // Torn-down host: no live grid store to resolve against.
+            return { _ in (.labelColor, .windowBackgroundColor) }
+        }
         return { hlID in
             let resolved = highlights.resolved(id: hlID)
             return (nsColor(resolved.foreground), nsColor(resolved.background))
@@ -437,9 +440,9 @@ public final class WorkspaceChrome {
             self.confirmAlertShowing = false
             let index = response.rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue
             if index >= 0, index < choices.count {
-                self.controller.sendInput(choices[index].key)
+                self.controller?.sendInput(choices[index].key)
             } else {
-                self.controller.sendInput("<Esc>")
+                self.controller?.sendInput("<Esc>")
             }
         }
     }
@@ -477,34 +480,34 @@ public final class WorkspaceChrome {
         }
 
         tabStrip.onSelect = { [weak self] bufnr in
-            self?.controller.switchToBuffer(bufnr)
+            self?.controller?.switchToBuffer(bufnr)
             self?.restoreFocus?()
         }
         tabStrip.onClose = { [weak self] bufnr in
-            self?.controller.closeBuffer(bufnr)
+            self?.controller?.closeBuffer(bufnr)
             self?.restoreFocus?()
         }
         tabStrip.onPromote = { [weak self] bufnr in
-            self?.controller.promoteBuffer(bufnr)
+            self?.controller?.promoteBuffer(bufnr)
             self?.restoreFocus?()
         }
         // Sidebar/minimap visibility round-trips through nvim (the source of
         // truth); the resulting superlemon.chrome push updates the layout
         // and the buttons' state.
         tabStrip.onToggleSidebar = { [weak self] in
-            self?.controller.toggleNativeChrome("sidebar")
+            self?.controller?.toggleNativeChrome("sidebar")
         }
         tabStrip.onToggleMinimap = { [weak self] in
-            self?.controller.toggleNativeChrome("minimap")
+            self?.controller?.toggleNativeChrome("minimap")
         }
 
         // VS Code/Sublime semantics: single-click previews (italic tab,
         // replaced by the next preview); double-click opens permanently.
         sidebar.onOpenFile = { [weak self] absolutePath in
-            self?.controller.previewFile(absolutePath)
+            self?.controller?.previewFile(absolutePath)
         }
         sidebar.onOpenFilePermanently = { [weak self] absolutePath in
-            self?.controller.openFilePermanently(absolutePath)
+            self?.controller?.openFilePermanently(absolutePath)
         }
         sidebar.onRequestEditorFocus = { [weak self] in
             self?.restoreFocus?()
@@ -515,7 +518,7 @@ public final class WorkspaceChrome {
         // ".." row and the folder context menu: cd inside nvim; the tree
         // re-roots via getcwd readback (and superlemon.cwd for external cds).
         sidebar.onChangeWorkingDirectory = { [weak self] absolutePath in
-            self?.controller.openFolder(absolutePath)
+            self?.controller?.openFolder(absolutePath)
         }
         sidebar.onFileOperation = { [weak self] op in
             guard let self else { return }
@@ -696,7 +699,7 @@ public final class WorkspaceChrome {
             do {
                 let url = try Self.containedQuickOpenURL(
                     relativePath: relativePath, projectRoot: projectRoot)
-                controller.openFile(url.path)
+                controller?.openFile(url.path)
             } catch let error as QuickOpenSelectionError {
                 presentQuickOpenSelectionError(error)
             } catch {}
@@ -723,7 +726,10 @@ public final class WorkspaceChrome {
 
             switch result {
             case .success(let url):
-                self.controller.openFile(url.path)
+                // Re-checked post-suspension: the embedding host may have
+                // torn the controller down while the stat hopped off-actor.
+                guard let controller = self.controller else { return }
+                controller.openFile(url.path)
             case .failure(let error):
                 await index.refresh()
                 guard generation == self.fileIndexGeneration else { return }
@@ -860,7 +866,10 @@ public final class WorkspaceChrome {
                             path: resultingPath, focus: kind == .folder)
                     }
                     if kind == .file {
-                        self.controller.openFilePermanently(resultingPath)
+                        // Re-checked: `revealCreatedItem` above may have
+                        // suspended long enough for the host to tear the
+                        // controller down.
+                        self.controller?.openFilePermanently(resultingPath)
                         self.restoreFocus?()
                     }
                 },

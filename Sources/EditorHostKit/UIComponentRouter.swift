@@ -19,8 +19,8 @@ import os
 @MainActor
 final class UIComponentRouter {
 
-    private unowned let chrome: WorkspaceChrome
-    private unowned let controller: NvimController
+    private weak var chrome: WorkspaceChrome?
+    private weak var controller: NvimController?
     private var projectRoot: URL
     private let logger = Logger(subsystem: "com.superlemon.app", category: "ui")
 
@@ -28,7 +28,7 @@ final class UIComponentRouter {
     /// namespace name, later wins per path) lives in the store.
     private var sidebarDecorations = SidebarDecorationStore()
 
-    init(chrome: WorkspaceChrome, controller: NvimController, projectRoot: URL) {
+    init(chrome: WorkspaceChrome, controller: NvimController?, projectRoot: URL) {
         self.chrome = chrome
         self.controller = controller
         self.projectRoot = projectRoot.standardizedFileURL
@@ -97,17 +97,17 @@ final class UIComponentRouter {
                 return logMalformed(component, method)
             }
             let kind = args["kind"]?.stringValue.flatMap(ToastKind.init(rawValue:)) ?? .info
-            chrome.toasts.showAdHoc(text: text, kind: kind)
+            chrome?.toasts.showAdHoc(text: text, kind: kind)
 
         case ("statusbar", "set_segment"):
             guard let text = args["text"]?.stringValue else {
                 return logMalformed(component, method)
             }
-            chrome.statusBar.setPluginSegment(
+            chrome?.statusBar.setPluginSegment(
                 namespace: namespace, text: text, color: parseColor(args["color"]))
 
         case ("statusbar", "clear"):
-            chrome.statusBar.clearPluginSegment(namespace: namespace)
+            chrome?.statusBar.clearPluginSegment(namespace: namespace)
 
         case ("input", "open"):
             openInput(args)
@@ -121,7 +121,7 @@ final class UIComponentRouter {
     // MARK: - Sidebar
 
     private func pushSidebarDecorations() {
-        chrome.sidebar.setUIDecorations(sidebarDecorations.composed)
+        chrome?.sidebar.setUIDecorations(sidebarDecorations.composed)
     }
 
     /// Wire paths are cwd-relative (the sidebar keys by absolute path, same
@@ -174,6 +174,7 @@ final class UIComponentRouter {
         guard let queryCb = args["query_cb"]?.intValue,
             let selectCb = args["select_cb"]?.intValue
         else { return logMalformed("palette", "open") }
+        guard let chrome else { return }
 
         // A second `open` replaces any live session (closing it fires its
         // close_cb, per the contract's close semantics).
@@ -204,7 +205,7 @@ final class UIComponentRouter {
     /// `onClose` → `paletteSessionClosed()` which frees the session.
     func closePaletteSession() {
         guard paletteSession != nil else { return }
-        chrome.quickOpen.close()
+        chrome?.quickOpen.close()
         // close() fires onClose synchronously; if the panel was somehow
         // never active, fall back to explicit teardown.
         if paletteSession != nil { paletteSessionClosed() }
@@ -216,7 +217,11 @@ final class UIComponentRouter {
         let token = session.latestQuery
         Task { [weak self] in
             guard let self else { return }
-            let reply = await self.controller.dispatchUICallback(
+            // Captured before the suspension: the embedding host may tear
+            // the controller down while the callback round-trip is in
+            // flight, and a stale reference must not be dereferenced below.
+            guard let controller = self.controller else { return }
+            let reply = await controller.dispatchUICallback(
                 session.queryCb, payload: [(.string("query"), .string(query))])
             // Drop the reply if the session ended or a newer query landed.
             guard self.paletteSession === session, session.latestQuery == token else { return }
@@ -227,7 +232,9 @@ final class UIComponentRouter {
                 return
             }
             session.rowIDs = rows.map(\.id)
-            self.chrome.quickOpen.display(
+            // Re-checked post-suspension too: chrome may be gone by now.
+            guard let chrome = self.chrome else { return }
+            chrome.quickOpen.display(
                 results: rows.map {
                     QuickOpenResult(path: $0.title, subtitle: $0.subtitle, positions: $0.positions)
                 },
@@ -241,7 +248,7 @@ final class UIComponentRouter {
         else { return }
         // Fire-and-forget: select_cb's return value is irrelevant. The
         // panel closes right after (openSelection → close → close_cb).
-        controller.dispatchUICallbackDetached(
+        controller?.dispatchUICallbackDetached(
             session.selectCb, payload: [(.string("id"), session.rowIDs[row])])
     }
 
@@ -249,9 +256,11 @@ final class UIComponentRouter {
         guard let session = paletteSession else { return }
         paletteSession = nil
         if let closeCb = session.closeCb {
-            controller.dispatchUICallbackDetached(closeCb, payload: [])
+            controller?.dispatchUICallbackDetached(closeCb, payload: [])
         }
-        // Restore the built-in ⌘P wiring exactly as it was.
+        // Restore the built-in ⌘P wiring exactly as it was (nothing to
+        // restore if the host has already torn the chrome down).
+        guard let chrome else { return }
         let quickOpen = chrome.quickOpen
         quickOpen.onQueryChange = session.savedOnQueryChange
         quickOpen.onOpen = session.savedOnOpen
@@ -291,10 +300,10 @@ final class UIComponentRouter {
         guard let submitCb = args["submit_cb"]?.intValue else {
             return logMalformed("input", "open")
         }
-        guard let window = chrome.attachedWindow else {
-            // Headless / no window: resolve the callback as cancelled so the
-            // Lua side never leaks a registered callback.
-            controller.dispatchUICallbackDetached(submitCb, payload: [])
+        guard let window = chrome?.attachedWindow else {
+            // Headless / no window / torn-down host: resolve the callback as
+            // cancelled so the Lua side never leaks a registered callback.
+            controller?.dispatchUICallbackDetached(submitCb, payload: [])
             return
         }
         let alert = NSAlert()
@@ -308,12 +317,12 @@ final class UIComponentRouter {
         alert.beginSheetModal(for: window) { [weak self] response in
             guard let self else { return }
             if response == .alertFirstButtonReturn {
-                self.controller.dispatchUICallbackDetached(
+                self.controller?.dispatchUICallbackDetached(
                     submitCb, payload: [(.string("text"), .string(field.stringValue))])
             } else {
-                self.controller.dispatchUICallbackDetached(submitCb, payload: [])
+                self.controller?.dispatchUICallbackDetached(submitCb, payload: [])
             }
-            self.chrome.restoreFocus?()
+            self.chrome?.restoreFocus?()
         }
     }
 

@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import NvimKit
 import Testing
@@ -295,5 +296,115 @@ struct QuitSafetyTests {
 
         await session.notify("nvim_command", [.string("qa!")])
         _ = await session.shutdown(termGrace: .seconds(1), killGrace: .seconds(1))
+    }
+
+    /// `NvimController.requestQuit()`'s clean-quit path (no modified buffers)
+    /// used to `request` `qa` and treat a >2s reply gap as "Neovim refused
+    /// to quit": `:qa` calls `os_exit()` from inside the RPC request
+    /// handler that ran it, so nvim never answers that request, and a slow
+    /// exit (a shada write, a VimLeave hook, an ssh bridge) raced the
+    /// timeout against the channel actually closing. Sending `qa` as a
+    /// notify — and using a cheap follow-up probe to tell "still alive" from
+    /// "on its way out" — must let a slow-but-clean exit finish through
+    /// `handleSessionTermination` instead of surfacing a false refusal.
+    @Test(
+        "a clean quit whose Neovim exit is delayed past the old 2s guard still completes without a false refusal",
+        .enabled(if: quitTestNvimAvailable, "nvim not found at \(quitTestNvimPath)"),
+        .timeLimit(.minutes(1)))
+    @MainActor
+    func delayedCleanExitCompletesWithoutFalseRefusal() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("superlemon-quit-delay-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let customInit = root.appendingPathComponent("init.lua")
+        try """
+            vim.o.shadafile = 'NONE'
+            vim.o.swapfile = false
+            -- A slow VimLeave hook (shada write, ssh bridge teardown, …):
+            -- nvim is still alive and mid-exit well past a 2s guard window.
+            vim.cmd([[autocmd VimLeave * sleep 3]])
+            """.write(to: customInit, atomically: true, encoding: .utf8)
+
+        let controller = NvimController(
+            nvimBinaryResolver: { URL(fileURLWithPath: quitTestNvimPath) },
+            configSelectionProvider: {
+                NvimConfigSelection(mode: .custom, customInitPath: customInit.path)
+            })
+        // Never actually terminate the test runner; only observe the reply.
+        controller.requestApplicationTermination = {}
+        defer { controller.stop() }
+
+        await controller.start()
+        #expect(controller.editorCommandsAvailable)
+
+        var didReply = false
+        let reply = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            controller.replyToApplicationTermination = { result in
+                guard !didReply else { return }
+                didReply = true
+                continuation.resume(returning: result)
+            }
+            #expect(controller.handleTerminationRequest() == .terminateLater)
+        }
+
+        // The old bug replied `false` (a synthesized "refused") ~2s in,
+        // well before nvim's 3s VimLeave hook actually finished exiting.
+        #expect(reply == true)
+    }
+
+    /// A refusal must still surface: an autocommand that dirties a buffer
+    /// during `:qa`'s own processing (after the up-front modified-buffer
+    /// probe already reported none) makes the no-bang `qa` fail exactly
+    /// like a genuinely modified buffer would — nvim stays up, and the
+    /// controller must detect that with its post-notify probe and hand
+    /// editor control back instead of leaving termination hanging.
+    @Test(
+        "an autocommand that refuses a clean qa is detected and restores control",
+        .enabled(if: quitTestNvimAvailable, "nvim not found at \(quitTestNvimPath)"),
+        .timeLimit(.minutes(1)))
+    @MainActor
+    func refusedCleanQuitRestoresControl() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("superlemon-quit-refuse-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let customInit = root.appendingPathComponent("init.lua")
+        try """
+            vim.o.shadafile = 'NONE'
+            vim.o.swapfile = false
+            -- Dirties the buffer as part of qa's own QuitPre processing, so
+            -- the up-front "any modified buffers?" probe sees none, but the
+            -- no-bang `qa` itself then refuses (E37) and nvim stays alive.
+            vim.cmd([[autocmd QuitPre * set modified]])
+            """.write(to: customInit, atomically: true, encoding: .utf8)
+
+        let controller = NvimController(
+            nvimBinaryResolver: { URL(fileURLWithPath: quitTestNvimPath) },
+            configSelectionProvider: {
+                NvimConfigSelection(mode: .custom, customInitPath: customInit.path)
+            })
+        controller.requestApplicationTermination = {}
+        defer { controller.stop() }
+
+        await controller.start()
+        #expect(controller.editorCommandsAvailable)
+
+        var didReply = false
+        let reply = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            controller.replyToApplicationTermination = { result in
+                guard !didReply else { return }
+                didReply = true
+                continuation.resume(returning: result)
+            }
+            #expect(controller.handleTerminationRequest() == .terminateLater)
+        }
+
+        // cancelQuit() answers the pending AppKit termination with `false`
+        // and the quit-in-flight application-termination intent is dropped.
+        #expect(reply == false)
+        // nvim is still running and the phase unwound back to `.running`.
+        #expect(!controller.sessionExited)
+        #expect(controller.editorCommandsAvailable)
     }
 }
