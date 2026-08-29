@@ -1,4 +1,5 @@
 import CoreServices
+import Darwin
 import Foundation
 
 public enum WorkspaceFileWatcherError: Error, LocalizedError {
@@ -40,6 +41,15 @@ public final class WorkspaceFileWatcher {
     private var debounceTask: Task<Void, Never>?
     private var pendingPaths: Set<String> = []
     private var pendingFullRescan = false
+    /// The root as the caller named it (may be a symlink) and its
+    /// symlink-resolved form actually passed to FSEvents. FSEvents always
+    /// reports canonical (resolved) paths, so a symlinked workspace root
+    /// (e.g. `~/code` → `/Volumes/Data/code`) would otherwise never match
+    /// the caller-facing root the sidebar's `isPath(inside:)` checks expect.
+    /// Delivered paths are mapped back from `resolvedRootPath` to
+    /// `callerRootPath` in `remapToCallerRoot`.
+    private var callerRootPath = ""
+    private var resolvedRootPath = ""
 
     public init(
         debounce: Duration = .milliseconds(250),
@@ -52,6 +62,18 @@ public final class WorkspaceFileWatcher {
     public func start(watching root: URL) throws {
         stop()
         let root = root.standardizedFileURL
+        // FSEvents reports canonical, symlink-resolved paths regardless of
+        // what path was handed to FSEventStreamCreate — and it reports the
+        // TRUE canonical form including "/private", which URL's own
+        // resolvingSymlinksInPath()/standardizedFileURL deliberately hide
+        // for compatibility (e.g. /var/folders/... instead of /private/var/
+        // folders/...). Use realpath(3) instead so the resolved form here
+        // matches what the callback actually receives, byte for byte.
+        // Remember both forms so delivered paths can be translated back to
+        // the caller's root (Bug C: a symlinked workspace root).
+        let resolved = Self.canonicalPath(of: root) ?? root
+        callerRootPath = root.path
+        resolvedRootPath = resolved.path
         var context = FSEventStreamContext(
             version: 0,
             info: Unmanaged.passUnretained(self).toOpaque(),
@@ -64,7 +86,7 @@ public final class WorkspaceFileWatcher {
             kCFAllocatorDefault,
             workspaceFileWatcherCallback,
             &context,
-            [root.path] as CFArray,
+            [resolved.path] as CFArray,
             FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
             eventLatency,
             flags)
@@ -86,11 +108,42 @@ public final class WorkspaceFileWatcher {
         debounceTask = nil
         pendingPaths.removeAll()
         pendingFullRescan = false
+        callerRootPath = ""
+        resolvedRootPath = ""
         guard let stream else { return }
         FSEventStreamStop(stream)
         FSEventStreamInvalidate(stream)
         FSEventStreamRelease(stream)
         self.stream = nil
+    }
+
+    /// realpath(3)-based canonicalization: the true resolved path FSEvents
+    /// uses internally, including "/private" — unlike
+    /// `URL.resolvingSymlinksInPath()`, which strips it for
+    /// compatibility with `/tmp`, `/var`, `/etc` and would otherwise never
+    /// match what the FSEvents callback delivers for a symlinked root.
+    private static func canonicalPath(of url: URL) -> URL? {
+        var buffer = [Int8](repeating: 0, count: Int(PATH_MAX))
+        guard realpath(url.path, &buffer) != nil else { return nil }
+        let path = buffer.withUnsafeBufferPointer { String(cString: $0.baseAddress!) }
+        return URL(fileURLWithPath: path, isDirectory: true)
+    }
+
+    /// Maps a path FSEvents delivered (in resolved/canonical form) back to
+    /// the form the caller's root was given in, so the sidebar's
+    /// `isPath(_:inside:)` prefix check — which compares against the
+    /// caller-facing root path — keeps working unchanged. A no-op when the
+    /// root wasn't a symlink (the two paths are identical) or when the
+    /// incoming path isn't under the resolved root at all.
+    private func remapToCallerRoot(_ path: String) -> String {
+        guard !resolvedRootPath.isEmpty, resolvedRootPath != callerRootPath else { return path }
+        if path == resolvedRootPath { return callerRootPath }
+        let resolvedPrefix = resolvedRootPath.hasSuffix("/")
+            ? resolvedRootPath : resolvedRootPath + "/"
+        guard path.hasPrefix(resolvedPrefix) else { return path }
+        let suffix = path.dropFirst(resolvedPrefix.count)
+        let callerPrefix = callerRootPath.hasSuffix("/") ? callerRootPath : callerRootPath + "/"
+        return callerPrefix + suffix
     }
 
     /// Internal seam for deterministic debounce tests; production changes
@@ -99,7 +152,7 @@ public final class WorkspaceFileWatcher {
         _ paths: [String],
         flags: [FSEventStreamEventFlags] = []
     ) {
-        pendingPaths.formUnion(paths)
+        pendingPaths.formUnion(paths.map(remapToCallerRoot))
         let rescanMask = FSEventStreamEventFlags(
             kFSEventStreamEventFlagMustScanSubDirs
                 | kFSEventStreamEventFlagUserDropped

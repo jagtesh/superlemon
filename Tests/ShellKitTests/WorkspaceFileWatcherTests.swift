@@ -52,4 +52,38 @@ struct WorkspaceFileWatcherTests {
         try watcher.start(watching: root)
         watcher.stop()
     }
+
+    @Test func symlinkedRootDeliversPathsInCallerForm() async throws {
+        // FSEvents reports canonical (symlink-resolved) paths. Watching a
+        // symlinked workspace root (e.g. `~/code` → `/Volumes/Data/code`)
+        // must still deliver paths the caller recognizes as "inside" the
+        // root it asked to watch, not the resolved target.
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ShellKitWatcherSymlink-\(UUID().uuidString)")
+        let real = base.appendingPathComponent("real")
+        let link = base.appendingPathComponent("link")
+        try FileManager.default.createDirectory(at: real, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: real)
+        defer { try? FileManager.default.removeItem(at: base) }
+
+        let watcher = WorkspaceFileWatcher(debounce: .milliseconds(50))
+        var batches: [WorkspaceFileChangeBatch] = []
+        watcher.onChange = { batches.append($0) }
+        try watcher.start(watching: link)
+        defer { watcher.stop() }
+
+        let touched = real.appendingPathComponent("touched.txt")
+        FileManager.default.createFile(atPath: touched.path, contents: Data())
+
+        // Real FSEvents delivery is asynchronous and outside the debounce
+        // task's own control; poll rather than guess a fixed sleep.
+        for _ in 0..<100 where batches.isEmpty {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+
+        let delivered = try #require(batches.first)
+        let linkPath = link.standardizedFileURL.path
+        #expect(delivered.paths.contains { $0.hasPrefix(linkPath) })
+        #expect(!delivered.paths.contains { $0.hasPrefix(real.standardizedFileURL.path) })
+    }
 }

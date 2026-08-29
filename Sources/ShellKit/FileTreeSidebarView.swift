@@ -11,18 +11,40 @@
 // WorkspaceChrome refreshes this lazy model from a debounced FSEvents watcher.
 
 import AppKit
+import Darwin
 
 // MARK: - Directory listing abstraction (injectable for laziness tests)
+
+/// Identifies a directory across relistings independent of its path, so
+/// reconciliation can tell a REUSED path from a REPLACED one (a terminal
+/// `mv a a.old && mv b a` swap keeps the path "a" but changes what's on
+/// disk there). nil when a lister cannot supply it — see
+/// `DirectoryEntry.identity`.
+public struct FileNodeIdentity: Equatable, Sendable {
+    public let inode: UInt64
+    public init(inode: UInt64) { self.inode = inode }
+}
 
 public struct DirectoryEntry: Equatable, Sendable {
     public let name: String
     public let isDirectory: Bool
     public let isHidden: Bool
+    /// On-disk identity (inode) for directories, used to detect that a
+    /// reused tree node's path now refers to a DIFFERENT directory so its
+    /// stale cached subtree can be dropped instead of silently kept. nil for
+    /// files and for listers that cannot supply it (e.g. a session-backed
+    /// remote lister) — those trees stay correct via `refreshesOnExpand`
+    /// instead, which re-lists on every expansion regardless of staleness.
+    public let identity: FileNodeIdentity?
 
-    public init(name: String, isDirectory: Bool, isHidden: Bool? = nil) {
+    public init(
+        name: String, isDirectory: Bool, isHidden: Bool? = nil,
+        identity: FileNodeIdentity? = nil
+    ) {
         self.name = name
         self.isDirectory = isDirectory
         self.isHidden = isHidden ?? name.hasPrefix(".")
+        self.identity = identity
     }
 }
 
@@ -44,12 +66,23 @@ public struct FileSystemLister: DirectoryLister {
             at: url, includingPropertiesForKeys: keys, options: [])
         return urls.map { child in
             let values = try? child.resourceValues(forKeys: Set(keys))
+            let isDirectory = values?.isDirectory ?? false
             return DirectoryEntry(
                 name: child.lastPathComponent,
-                isDirectory: values?.isDirectory ?? false,
-                isHidden: values?.isHidden ?? child.lastPathComponent.hasPrefix(".")
+                isDirectory: isDirectory,
+                isHidden: values?.isHidden ?? child.lastPathComponent.hasPrefix("."),
+                identity: isDirectory ? Self.directoryIdentity(at: child) : nil
             )
         }
+    }
+
+    /// Inode-based identity for a directory listing entry; see
+    /// `DirectoryEntry.identity`. Best-effort — a stat() failure just means
+    /// no swap detection for that entry, not a listing failure.
+    private static func directoryIdentity(at url: URL) -> FileNodeIdentity? {
+        var info = stat()
+        guard stat(url.path, &info) == 0 else { return nil }
+        return FileNodeIdentity(inode: UInt64(info.st_ino))
     }
 }
 
@@ -81,17 +114,24 @@ public final class FileTreeNode {
     public let name: String
     public let isDirectory: Bool
     public let isHidden: Bool
+    /// Captured from the listing entry that produced this node; compared on
+    /// reconciliation to detect a directory swap at a reused path (Bug A).
+    private(set) var directoryIdentity: FileNodeIdentity?
 
     private var cachedChildren: [FileTreeNode] = []
     public private(set) var loadState: FileTreeLoadState = .unloaded
     public var childrenLoaded: Bool { loadState == .loaded }
     fileprivate lazy var placeholder = FileTreePlaceholder(parent: self)
 
-    public init(url: URL, isDirectory: Bool, isHidden: Bool? = nil) {
+    public init(
+        url: URL, isDirectory: Bool, isHidden: Bool? = nil,
+        identity: FileNodeIdentity? = nil
+    ) {
         self.url = url.standardizedFileURL
         self.name = url.lastPathComponent
         self.isDirectory = isDirectory
         self.isHidden = isHidden ?? url.lastPathComponent.hasPrefix(".")
+        self.directoryIdentity = identity
     }
 
     /// Lazily lists children. `showHidden` filters dotfiles; `.git` is
@@ -153,11 +193,31 @@ public final class FileTreeNode {
                 let childURL = url.appendingPathComponent(entry.name).standardizedFileURL
                 let identity = ChildIdentity(
                     path: childURL.path, isDirectory: entry.isDirectory)
-                return existing[identity] ?? FileTreeNode(
-                    url: childURL,
-                    isDirectory: entry.isDirectory,
-                    isHidden: entry.isHidden
-                )
+                guard let reused = existing[identity] else {
+                    return FileTreeNode(
+                        url: childURL,
+                        isDirectory: entry.isDirectory,
+                        isHidden: entry.isHidden,
+                        identity: entry.identity
+                    )
+                }
+                // Same path, same isDirectory — but a terminal can swap what
+                // occupies a path between two refreshes. Node reuse is what
+                // preserves expansion/selection across an ordinary refresh,
+                // so a swap can't be told apart from an unchanged directory
+                // by path alone: compare the captured on-disk identity
+                // instead, and drop the stale cached subtree only when it
+                // demonstrably changed. Both listers that omit identity
+                // (nil) and files (which have no subtree) are inert here.
+                if entry.isDirectory,
+                    let oldIdentity = reused.directoryIdentity,
+                    let newIdentity = entry.identity,
+                    oldIdentity != newIdentity
+                {
+                    reused.invalidateChildren()
+                }
+                reused.directoryIdentity = entry.identity
+                return reused
             }
     }
 
@@ -189,7 +249,10 @@ public final class FileTreeNode {
     fileprivate func loadedNodeChain(path: String) -> [FileTreeNode]? {
         let standardized = URL(fileURLWithPath: path).standardizedFileURL.path
         if url.path == standardized { return [self] }
-        guard standardized.hasPrefix(url.path + "/") else { return nil }
+        // At the filesystem root url.path == "/", so the naive prefix
+        // "/" + "/" == "//" never matches any real descendant path.
+        let prefix = url.path == "/" ? "/" : url.path + "/"
+        guard standardized.hasPrefix(prefix) else { return nil }
         for child in cachedChildren {
             if let chain = child.loadedNodeChain(path: standardized) {
                 return [self] + chain
@@ -399,6 +462,7 @@ public final class FileTreeSidebarView: NSView {
 
     private func setUp() {
         wantsLayer = true
+        Self.sweepStalePromisedStagingDirectories()
 
         let column = NSTableColumn(identifier: .init("file"))
         column.resizingMask = .autoresizingMask
@@ -1260,9 +1324,23 @@ extension FileTreeSidebarView: NSOutlineViewDataSource, NSOutlineViewDelegate {
     /// Promise-based drags (Photos, Mail, another Superlemon's remote tree)
     /// materialize in a private staging directory first, then enter the
     /// normal dropped-URL flow.
-    private func receivePromisedFiles(
+    ///
+    /// Cleanup: when nothing was actually received (the early-return case),
+    /// the staging directory is removed immediately below. When files WERE
+    /// received, `onDropFiles` is fire-and-forget from here — WorkspaceChrome
+    /// wires it to an async import (`WorkspaceFileTransfer.importItems`) that
+    /// reads out of `staging` on its own schedule, and this callback's
+    /// signature (owned by EditorHostKit callers this fix must not touch)
+    /// carries no completion. Deleting `staging` here could race an
+    /// in-flight import, so instead it's left for the age-based sweep in
+    /// `sweepStalePromisedStagingDirectories`, which runs on sidebar init and
+    /// before every subsequent promise-drop.
+    ///
+    /// Internal for tests.
+    func receivePromisedFiles(
         _ receivers: [NSFilePromiseReceiver], into directory: String
     ) {
+        Self.sweepStalePromisedStagingDirectories()
         let staging = FileManager.default.temporaryDirectory
             .appendingPathComponent("superlemon-promised-\(UUID().uuidString)")
         try? FileManager.default.createDirectory(
@@ -1279,9 +1357,34 @@ extension FileTreeSidebarView: NSOutlineViewDataSource, NSOutlineViewDelegate {
         }
         promiseReceiveQueue.addBarrierBlock { [weak self] in
             let urls = lock.withLock { received }
-            guard !urls.isEmpty else { return }
+            guard !urls.isEmpty else {
+                try? FileManager.default.removeItem(at: staging)
+                return
+            }
             Task { @MainActor [weak self] in
                 self?.onDropFiles?(urls, directory)
+            }
+        }
+    }
+
+    /// Removes `superlemon-promised-*` staging directories left behind by
+    /// promise-drop imports whose completion this view has no way to observe
+    /// (see `receivePromisedFiles`). A generous 1-hour default age floor
+    /// keeps a same-session import that's still reading from its own
+    /// directory safe from deletion.
+    ///
+    /// Internal for tests.
+    static func sweepStalePromisedStagingDirectories(olderThan maxAge: TimeInterval = 3600) {
+        let fm = FileManager.default
+        let tmp = fm.temporaryDirectory
+        guard let entries = try? fm.contentsOfDirectory(
+            at: tmp, includingPropertiesForKeys: [.creationDateKey], options: [])
+        else { return }
+        let cutoff = Date().addingTimeInterval(-maxAge)
+        for entry in entries where entry.lastPathComponent.hasPrefix("superlemon-promised-") {
+            let created = (try? entry.resourceValues(forKeys: [.creationDateKey]))?.creationDate
+            if let created, created < cutoff {
+                try? fm.removeItem(at: entry)
             }
         }
     }

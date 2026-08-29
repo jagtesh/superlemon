@@ -1014,6 +1014,47 @@ struct FileTreeSidebarTests {
         _ = window
     }
 
+    private func promisedStagingDirectoryNames() -> Set<String> {
+        let fm = FileManager.default
+        let entries = (try? fm.contentsOfDirectory(atPath: fm.temporaryDirectory.path)) ?? []
+        return Set(entries.filter { $0.hasPrefix("superlemon-promised-") })
+    }
+
+    @Test func emptyPromiseDropDoesNotLeakItsStagingDirectory() async throws {
+        let sidebar = FileTreeSidebarView(frame: .zero)
+        let before = promisedStagingDirectoryNames()
+
+        // No file promise receivers: `receivePromisedFiles`'s barrier block
+        // takes the early-return path, which must remove the staging
+        // directory it created rather than leaving an empty one behind.
+        sidebar.receivePromisedFiles([], into: NSTemporaryDirectory())
+
+        var after = before
+        for _ in 0..<50 {
+            after = promisedStagingDirectoryNames()
+            if after == before { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        #expect(after == before, "an empty promise drop must not leak its staging directory")
+    }
+
+    @Test func sweepRemovesStalePromiseStagingDirectoriesButKeepsFreshOnes() throws {
+        let fm = FileManager.default
+        let tmp = fm.temporaryDirectory
+        let stale = tmp.appendingPathComponent("superlemon-promised-\(UUID().uuidString)")
+        let fresh = tmp.appendingPathComponent("superlemon-promised-\(UUID().uuidString)")
+        try fm.createDirectory(at: stale, withIntermediateDirectories: true)
+        try fm.createDirectory(at: fresh, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: fresh) }
+        try fm.setAttributes(
+            [.creationDate: Date().addingTimeInterval(-7200)], ofItemAtPath: stale.path)
+
+        FileTreeSidebarView.sweepStalePromisedStagingDirectories(olderThan: 3600)
+
+        #expect(!fm.fileExists(atPath: stale.path))
+        #expect(fm.fileExists(atPath: fresh.path))
+    }
+
     @Test func openFileCallbackAndReloadAfterOperation() async throws {
         let root = try makeFixtureRoot()
         defer { try? FileManager.default.removeItem(at: root) }

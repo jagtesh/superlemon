@@ -149,6 +149,61 @@ struct FileTreeModelTests {
         #expect(root.findLoadedNode(path: "/project/LICENSE") != nil)
     }
 
+    @Test func directorySwapMarksReusedNodeStaleForRelist() async throws {
+        let root = try makeFixtureTree()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let lister = FileSystemLister()
+
+        let rootNode = FileTreeNode(url: root, isDirectory: true)
+        _ = await rootNode.children(using: lister, showHidden: false)
+        let src = try #require(
+            rootNode.findLoadedNode(path: root.appendingPathComponent("src").path))
+        _ = await src.children(using: lister, showHidden: false)
+        #expect(src.loadState == .loaded)
+        let oldChildNames = (src.loadedChildren(showHidden: false) ?? []).map(\.name)
+        #expect(oldChildNames.contains("app.js"))
+
+        // Simulate `mv src src.old && mv docs src` in a terminal: the path
+        // "src" now refers to a directory with a completely different
+        // inode, but FSEvents (and thus the sidebar's refresh) only ever
+        // sees the top-level path names, never the swap itself.
+        let srcPath = root.appendingPathComponent("src")
+        let srcOldPath = root.appendingPathComponent("src.old")
+        let docsPath = root.appendingPathComponent("docs")
+        try FileManager.default.moveItem(at: srcPath, to: srcOldPath)
+        try FileManager.default.moveItem(at: docsPath, to: srcPath)
+
+        let entries = try await lister.list(root)
+        rootNode.reconcileChildren(entries)
+
+        // Node identity for the path is retained — that's the whole point
+        // of reconciliation (keeps NSOutlineView's expansion/selection) —
+        // but since the on-disk identity changed, the stale cached subtree
+        // must not still read as the OLD src's contents.
+        let reusedSrc = try #require(rootNode.findLoadedNode(path: srcPath.path))
+        #expect(reusedSrc === src)
+        #expect(reusedSrc.loadState == .unloaded)
+
+        let freshChildren = await reusedSrc.children(using: lister, showHidden: false)
+        #expect(freshChildren.map(\.name) == ["readme.md"])
+    }
+
+    @Test func loadedNodeChainFindsChildrenUnderFilesystemRoot() throws {
+        // The naive prefix check `url.path + "/"` becomes "//" for the
+        // filesystem root, which never matches any real descendant path.
+        // Construct the root node directly (never touching the real "/")
+        // with fake cached children the way other model tests do.
+        let root = FileTreeNode(url: URL(fileURLWithPath: "/"), isDirectory: true)
+        root.installChildren([
+            DirectoryEntry(name: "usr", isDirectory: true),
+            DirectoryEntry(name: "etc", isDirectory: false),
+        ])
+        let usr = try #require(root.findLoadedNode(path: "/usr"))
+        #expect(usr.name == "usr")
+        #expect(root.findLoadedNode(path: "/etc") != nil)
+        #expect(root.findLoadedNode(path: "/nonexistent") == nil)
+    }
+
     @Test func findLoadedNodeNeverTriggersIO() async throws {
         let root = try makeFixtureTree()
         defer { try? FileManager.default.removeItem(at: root) }
