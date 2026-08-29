@@ -136,6 +136,21 @@ public final class NvimController {
     /// When set, `launchSession` uses this configuration verbatim instead of
     /// resolving a local binary and building a launch plan.
     private let customLaunchConfiguration: NvimLaunchConfiguration?
+    /// The `NvimConfigMode` a host-supplied transport reports and validates
+    /// under. Defaults to `.custom` (the historical, if imprecise, behavior)
+    /// so existing callers keep compiling; a host bridging into the remote
+    /// user's own init should pass `.user` so startup validation — which
+    /// runs only for `.custom` (see `validateCustomConfiguration`) — is
+    /// skipped exactly as it is for a locally planned `.user` launch. A
+    /// remote host's own `v:errmsg` chatter (a missing plugin, say) is then
+    /// no longer mistaken for Superlemon's own custom-config failure.
+    private let customConfigMode: NvimConfigMode
+    /// Substituted for `customLaunchConfiguration` when Safe Start is chosen
+    /// against a host-supplied transport (nil: Safe Start has nothing to
+    /// launch and falls back to relaunching the same configuration). Once
+    /// substituted, the session is reported/validated as `.managed` — Safe
+    /// Start's whole point is bypassing whatever configuration was failing.
+    private let customSafeStartConfiguration: NvimLaunchConfiguration?
     /// True when the connected session's filesystem is not this machine's
     /// (host-supplied transports such as an ssh bridge). Native workspace
     /// chrome then sources the sidebar tree and quick-open index through the
@@ -317,13 +332,25 @@ public final class NvimController {
     /// actually-remote nvim shows the wrong tree. A host bridging to an nvim
     /// on THIS machine may pass false to keep FSEvents watching and native
     /// file operations.
+    ///
+    /// `configMode` reports/validates the far side's configuration: pass
+    /// `.user` when the transport leaves the remote user's own init in
+    /// charge (validation is skipped, matching local `.user` mode), `.custom`
+    /// (the default) when the far side loaded a Superlemon-selected file the
+    /// runtime can diagnose, or `.managed` when it already ran Superlemon's
+    /// managed baseline itself. `safeStartConfiguration`, when provided, is
+    /// what "Start Safely" launches instead of `launchConfiguration`.
     public convenience init(
         launchConfiguration: NvimLaunchConfiguration,
-        remoteFilesystem: Bool = true
+        remoteFilesystem: Bool = true,
+        configMode: NvimConfigMode = .custom,
+        safeStartConfiguration: NvimLaunchConfiguration? = nil
     ) {
         self.init(
             customLaunchConfiguration: launchConfiguration,
-            remoteFilesystem: remoteFilesystem)
+            remoteFilesystem: remoteFilesystem,
+            customConfigMode: configMode,
+            customSafeStartConfiguration: safeStartConfiguration)
     }
 
     init(
@@ -334,12 +361,16 @@ public final class NvimController {
             NvimConfigPreferences.loadAndMigrate()
         },
         customLaunchConfiguration: NvimLaunchConfiguration? = nil,
-        remoteFilesystem: Bool = false
+        remoteFilesystem: Bool = false,
+        customConfigMode: NvimConfigMode = .custom,
+        customSafeStartConfiguration: NvimLaunchConfiguration? = nil
     ) {
         self.nvimBinaryResolver = nvimBinaryResolver
         self.configSelectionProvider = configSelectionProvider
         self.customLaunchConfiguration = customLaunchConfiguration
         self.hasRemoteFilesystem = remoteFilesystem
+        self.customConfigMode = customConfigMode
+        self.customSafeStartConfiguration = customSafeStartConfiguration
         // App-level appearance follows the system even while the window's
         // own appearance is pinned to the colorscheme, so this fires on
         // every system light/dark switch.
@@ -369,6 +400,24 @@ public final class NvimController {
     var workspaceFileSession: NvimSession? {
         guard let session, !sessionExited else { return nil }
         return session
+    }
+
+    /// The live session's current working directory (`getcwd()`). Nil
+    /// before startup, after exit, or if the request fails. Lets an
+    /// embedding host root a `WorkspaceFilePanelController` at the session's
+    /// own project directory for a controller with no local filesystem
+    /// (`hasRemoteFilesystem`), the same value `adoptSessionWorkingDirectory`
+    /// re-roots the sidebar to.
+    public func currentWorkingDirectory() async -> String? {
+        guard let session, !sessionExited else { return nil }
+        guard
+            let reply = try? await session.request(
+                "nvim_exec_lua",
+                [.string("return vim.fn.getcwd()"), .array([])],
+                timeout: .seconds(5)),
+            let path = reply.stringValue, !path.isEmpty
+        else { return nil }
+        return path
     }
 
     private func isCurrent(_ context: SessionContext) -> Bool {
@@ -405,7 +454,10 @@ public final class NvimController {
         await launchSession()
     }
 
-    private func launchSession(safeStart: Bool = false) async {
+    /// Internal (not private) so `@testable import EditorHostKit` can drive
+    /// a Safe Start relaunch directly — the normal trigger is a click on the
+    /// "Start Safely" alert button, which tests can't drive.
+    func launchSession(safeStart: Bool = false) async {
         guard session == nil, !stopRequested else { return }
         phase = .starting
         safeStartRequested = safeStart
@@ -416,9 +468,18 @@ public final class NvimController {
             if let custom = customLaunchConfiguration {
                 // Host-supplied transport: no local plan; the far side owns
                 // nvim's runtimepath and config.
-                activeConfigMode = .custom
                 activeConfigPath = nil
-                configuration = custom
+                if safeStart, let safeConfiguration = customSafeStartConfiguration {
+                    // Safe Start's whole point is bypassing whatever
+                    // configuration was failing — report/validate it like a
+                    // managed launch (no custom-config validation) regardless
+                    // of customConfigMode.
+                    activeConfigMode = .managed
+                    configuration = safeConfiguration
+                } else {
+                    activeConfigMode = customConfigMode
+                    configuration = custom
+                }
             } else {
                 guard let runtime = Self.runtimeDirectory() else {
                     throw StartupError.runtimeMissing

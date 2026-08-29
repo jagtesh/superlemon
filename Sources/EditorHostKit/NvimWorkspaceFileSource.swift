@@ -25,18 +25,18 @@ enum NvimWorkspaceFileError: LocalizedError {
     }
 }
 
-struct NvimWorkspaceFileSource: DirectoryLister, WorkspaceIndexSource, WorkspaceFileTransport {
+public struct NvimWorkspaceFileSource: DirectoryLister, WorkspaceIndexSource, WorkspaceFileTransport {
     /// Resolves the live session at call time so one source instance
     /// survives session relaunches. The controller is captured weakly: the
     /// chrome that owns this source is itself owned by the same host view.
     private let sessionProvider: @MainActor @Sendable () -> NvimSession?
 
     @MainActor
-    init(controller: NvimController) {
+    public init(controller: NvimController) {
         sessionProvider = { [weak controller] in controller?.workspaceFileSession }
     }
 
-    func list(_ url: URL) async throws -> [DirectoryEntry] {
+    public func list(_ url: URL) async throws -> [DirectoryEntry] {
         let reply = try await execLua(
             "return require('superlemon.workspace').list_dir(...)",
             args: [.string(url.path)],
@@ -53,7 +53,7 @@ struct NvimWorkspaceFileSource: DirectoryLister, WorkspaceIndexSource, Workspace
         }
     }
 
-    func listFiles(root: URL, maxFiles: Int) async throws -> WorkspaceIndexListing {
+    public func listFiles(root: URL, maxFiles: Int) async throws -> WorkspaceIndexListing {
         // The far side walks natively; only one request crosses the
         // transport. Generous timeout: a cold cache on a large remote tree
         // is still one bounded (maxFiles-capped) walk.
@@ -83,7 +83,7 @@ struct NvimWorkspaceFileSource: DirectoryLister, WorkspaceIndexSource, Workspace
     /// event loop responsive and progress ticks flowing.
     private static let transferChunkBytes = 512 * 1024
 
-    func stat(_ path: String) async throws -> WorkspaceTransferStat? {
+    public func stat(_ path: String) async throws -> WorkspaceTransferStat? {
         let reply = try await execLua(
             "return require('superlemon.workspace').stat(...)",
             args: [.string(path)],
@@ -94,21 +94,21 @@ struct NvimWorkspaceFileSource: DirectoryLister, WorkspaceIndexSource, Workspace
             size: Int64(reply["size"]?.intValue ?? 0))
     }
 
-    func createDirectory(_ path: String) async throws {
+    public func createDirectory(_ path: String) async throws {
         _ = try await execLua(
             "return require('superlemon.workspace').mkdir(...)",
             args: [.string(path)],
             timeout: .seconds(15))
     }
 
-    func move(_ source: String, to destination: String) async throws {
+    public func move(_ source: String, to destination: String) async throws {
         _ = try await execLua(
             "return require('superlemon.workspace').rename(...)",
             args: [.string(source), .string(destination)],
             timeout: .seconds(15))
     }
 
-    func writeFile(
+    public func writeFile(
         from local: URL, to path: String,
         progress: @escaping WorkspaceTransferProgressHandler
     ) async throws {
@@ -164,7 +164,7 @@ struct NvimWorkspaceFileSource: DirectoryLister, WorkspaceIndexSource, Workspace
         progress(max(sent, total), total)
     }
 
-    func readFile(
+    public func readFile(
         _ path: String, to local: URL,
         progress: @escaping WorkspaceTransferProgressHandler
     ) async throws {

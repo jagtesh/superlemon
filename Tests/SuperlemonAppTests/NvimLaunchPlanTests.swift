@@ -66,6 +66,40 @@ struct NvimLaunchPlanTests {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
+    /// Isolated HOME/XDG_* for a real-Neovim host-supplied-transport test:
+    /// `NvimLaunchConfiguration.environment` (unlike the local launch plan)
+    /// replaces the child's whole environment, so this is the complete
+    /// environment passed rather than an overlay on the developer's own.
+    private func makeIsolatedEnvironment(in directory: URL) throws -> [String: String] {
+        let state = directory.appendingPathComponent("xdg", isDirectory: true)
+        for component in ["home", "config", "data", "state", "cache"] {
+            try FileManager.default.createDirectory(
+                at: state.appendingPathComponent(component, isDirectory: true),
+                withIntermediateDirectories: true)
+        }
+        return [
+            "HOME": state.appendingPathComponent("home").path,
+            "XDG_CONFIG_HOME": state.appendingPathComponent("config").path,
+            "XDG_DATA_HOME": state.appendingPathComponent("data").path,
+            "XDG_STATE_HOME": state.appendingPathComponent("state").path,
+            "XDG_CACHE_HOME": state.appendingPathComponent("cache").path,
+        ]
+    }
+
+    /// A host-supplied transport owns its own runtimepath — unlike the local
+    /// launch plan, nothing prepends the Superlemon runtime automatically.
+    /// Real remote sessions do this themselves once the runtime is deployed
+    /// (SSHCommandBuilder.embeddedNvim); tests reach for the same checkout
+    /// `NvimController.runtimeDirectory()` resolves locally.
+    private func remoteTransportArguments(initPath: String) throws -> [String] {
+        let runtime = try #require(NvimController.runtimeDirectory())
+        return [
+            "--embed",
+            "--cmd", "lua vim.opt.runtimepath:prepend([[\(runtime.path)]])",
+            "-u", initPath,
+        ]
+    }
+
     /// Keeps the real-Neovim lifecycle test out of the developer's HOME and
     /// disables shada persistence while preserving NvimController's exact
     /// launch arguments and embedded startup behavior.
@@ -464,6 +498,137 @@ struct NvimLaunchPlanTests {
         #expect(state["modified"]?.boolValue == true)
         #expect(state["line"]?.stringValue == "startup edit must survive")
         #expect(!FileManager.default.fileExists(atPath: document.path))
+    }
+
+    @Test(
+        "a host-supplied transport reporting .user skips custom-config validation",
+        .enabled(if: startupSafetyNvimAvailable, "nvim not found at \(startupSafetyNvimPath)"),
+        .timeLimit(.minutes(1)))
+    @MainActor
+    func remoteUserModeSkipsCustomValidation() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("superlemon-remote-user-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let environment = try makeIsolatedEnvironment(in: root)
+        let customInit = root.appendingPathComponent("init.lua")
+        try """
+            vim.o.shada = ''
+            vim.o.loadplugins = false
+            -- Simulates a remote host's own init leaving stray startup
+            -- chatter behind (a missing plugin, say) without Superlemon's
+            -- own superlemon_custom_config marker -- exactly what a bare
+            -- ".user" remote session looks like.
+            vim.v.errmsg = 'E5108: simulated missing plugin on the remote host'
+            """.write(to: customInit, atomically: true, encoding: .utf8)
+
+        let configuration = NvimLaunchConfiguration(
+            binaryURL: URL(fileURLWithPath: startupSafetyNvimPath),
+            arguments: try remoteTransportArguments(initPath: customInit.path),
+            environment: environment)
+        let controller = NvimController(launchConfiguration: configuration, configMode: .user)
+        var startupFailure: String?
+        controller.startupFailureHandler = { startupFailure = $0 }
+        defer { controller.stop() }
+
+        await controller.start()
+        #expect(await waitUntil { controller.session != nil || startupFailure != nil })
+        #expect(startupFailure == nil)
+        #expect(controller.session != nil)
+    }
+
+    @Test(
+        "the same remote startup chatter still fails a .custom-reported transport",
+        .enabled(if: startupSafetyNvimAvailable, "nvim not found at \(startupSafetyNvimPath)"),
+        .timeLimit(.minutes(1)))
+    @MainActor
+    func remoteCustomModeStillValidates() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("superlemon-remote-custom-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let environment = try makeIsolatedEnvironment(in: root)
+        let customInit = root.appendingPathComponent("init.lua")
+        try """
+            vim.o.shada = ''
+            vim.o.loadplugins = false
+            vim.v.errmsg = 'E5108: simulated missing plugin on the remote host'
+            """.write(to: customInit, atomically: true, encoding: .utf8)
+
+        // Default configMode (.custom) is the pre-fix behavior: preserved
+        // for a transport that really did load a Superlemon-selected file.
+        let configuration = NvimLaunchConfiguration(
+            binaryURL: URL(fileURLWithPath: startupSafetyNvimPath),
+            arguments: try remoteTransportArguments(initPath: customInit.path),
+            environment: environment)
+        let controller = NvimController(launchConfiguration: configuration)
+        var startupFailure: String?
+        controller.startupFailureHandler = { startupFailure = $0 }
+        defer { controller.stop() }
+
+        await controller.start()
+        #expect(await waitUntil { controller.session == nil && startupFailure != nil })
+        #expect(startupFailure?.contains("simulated missing plugin") == true)
+    }
+
+    @Test(
+        "Safe Start on a host-supplied transport launches the safe configuration",
+        .enabled(if: startupSafetyNvimAvailable, "nvim not found at \(startupSafetyNvimPath)"),
+        .timeLimit(.minutes(1)))
+    @MainActor
+    func remoteSafeStartLaunchesSafeConfiguration() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("superlemon-remote-safe-start-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let environment = try makeIsolatedEnvironment(in: root)
+
+        // The "custom" configuration reports a hard configuration failure —
+        // proof, if it were launched instead of the safe one, that Safe
+        // Start did nothing (the bug: safeStart was ignored for a
+        // host-supplied transport).
+        let failingInit = root.appendingPathComponent("failing-init.lua")
+        try """
+            vim.o.shada = ''
+            vim.g.superlemon_custom_config = {
+              state = 'error',
+              path = 'failing-init.lua',
+              error = { message = 'must not be launched by Safe Start' },
+            }
+            """.write(to: failingInit, atomically: true, encoding: .utf8)
+
+        // The safe configuration just proves it, and only it, ran.
+        let marker = root.appendingPathComponent("safe-started")
+        let safeInit = root.appendingPathComponent("safe-init.lua")
+        try """
+            vim.o.shada = ''
+            vim.fn.writefile({ 'safe' }, [=[\(marker.path)]=])
+            """.write(to: safeInit, atomically: true, encoding: .utf8)
+
+        let failingConfiguration = NvimLaunchConfiguration(
+            binaryURL: URL(fileURLWithPath: startupSafetyNvimPath),
+            arguments: try remoteTransportArguments(initPath: failingInit.path),
+            environment: environment)
+        let safeConfiguration = NvimLaunchConfiguration(
+            binaryURL: URL(fileURLWithPath: startupSafetyNvimPath),
+            arguments: try remoteTransportArguments(initPath: safeInit.path),
+            environment: environment)
+
+        let controller = NvimController(
+            launchConfiguration: failingConfiguration,
+            configMode: .custom,
+            safeStartConfiguration: safeConfiguration)
+        var startupFailure: String?
+        controller.startupFailureHandler = { startupFailure = $0 }
+        defer { controller.stop() }
+
+        await controller.launchSession(safeStart: true)
+        #expect(await waitUntil { controller.session != nil || startupFailure != nil })
+        #expect(startupFailure == nil)
+        #expect(controller.session != nil)
+        #expect(FileManager.default.fileExists(atPath: marker.path))
     }
 
     @Test("relaunch during startup reaps Neovim and resolves AppKit once")
