@@ -19,6 +19,7 @@ H.eq(vim.g.superlemon_native_sidebar, nil,
 H.eq(vim.g.superlemon_native_scrollbars, 0, "native scrollbars documented and disabled")
 H.eq(vim.g.superlemon_native_ui, 1, "native picker setting explicit")
 H.eq(vim.g.superlemon_default_keymaps, 1, "default keymap setting explicit")
+H.eq(vim.g.superlemon_scroll_homes_cursor, 1, "scroll-homing setting explicit")
 H.eq(vim.g.superlemon_powerline_glyphs, 0, "Powerline synthesis setting explicit")
 H.eq(vim.g.superlemon_ligatures, 1, "ligature setting explicit")
 H.eq(vim.g.superlemon_use_symbol_font, 0, "symbol companion setting explicit")
@@ -44,7 +45,15 @@ H.ok(ok_again, "superlemon.vim can be re-sourced" ..
 vim.g.superlemon_default_keymaps = 0
 H.stub_gui()
 require("superlemon").setup(1)
-H.eq(require("superlemon.keymaps").installed, 0, "default keymaps can be disabled")
 H.eq(vim.fn.maparg("<D-s>", "n"), "", "keymap opt-out installs no Command-S map")
+
+-- Wheel-scroll cursor homing has its own independent opt-out
+-- (g:superlemon_scroll_homes_cursor) — it is a scroll behavior, not a
+-- Command-key shortcut, so it stays enabled here even though the shortcut
+-- master switch above is off.
+H.ok(vim.fn.maparg("<ScrollWheelDown>", "n") ~= "",
+  "scroll-homing default keymaps are independent of g:superlemon_default_keymaps")
+H.eq(require("superlemon.keymaps").installed, 6,
+  "keymaps.installed reflects only the still-enabled scroll-homing defaults")
 
 H.finish()

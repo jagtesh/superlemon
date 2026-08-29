@@ -22,6 +22,7 @@ H.eq(vim.g.superlemon_native_sidebar, nil,
 H.eq(vim.g.superlemon_native_scrollbars, 0, "native scrollbars off by default")
 H.eq(vim.g.superlemon_native_ui, 1, "native vim.ui pickers on by default")
 H.eq(vim.g.superlemon_default_keymaps, 1, "macOS keymap defaults on by default")
+H.eq(vim.g.superlemon_scroll_homes_cursor, 1, "wheel-scroll cursor homing on by default")
 H.eq(vim.g.superlemon_ligatures, 1, "renderer ligatures on by default")
 H.eq(vim.g.superlemon_powerline_glyphs, 0, "Powerline synthesis opt-in by default")
 H.eq(vim.g.superlemon_minimap_width, 88, "managed minimap width is stable")

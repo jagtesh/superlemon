@@ -23,6 +23,15 @@
 " Increase either number if you prefer faster, coarser wheel scrolling.
 set mousescroll=ver:1,hor:1
 
+" Neovim keeps the cursor's remembered column (curswant) while scrolling, so
+" it hops left/right as it lands on lines of different lengths. The runtime
+" installs default <ScrollWheelUp>/<ScrollWheelDown> mappings (normal, insert,
+" visual) that scroll and then home the cursor to column 0, so it stays put
+" during a wheel scroll. Keyboard scrolling (Command-D, `j`, `zz`, ...) is
+" unaffected, and a mapping you define for these keys before the Superlemon
+" bridge starts always wins. Set to 0 to disable.
+let g:superlemon_scroll_homes_cursor = 1
+
 " ---------------------------------------------------------------------------
 " Native window chrome
 " ---------------------------------------------------------------------------
