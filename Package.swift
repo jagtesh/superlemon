@@ -14,6 +14,7 @@ let package = Package(
         .library(name: "ShellKit", targets: ["ShellKit"]),
         .library(name: "EditorHostKit", targets: ["EditorHostKit"]),
         .library(name: "EditorEmbed", targets: ["EditorEmbed"]),
+        .library(name: "SSHKit", targets: ["SSHKit"]),
     ],
     dependencies: [
         .package(url: "https://github.com/stackotter/swift-cross-ui", exact: "0.8.0")
@@ -48,10 +49,14 @@ let package = Package(
                 .product(name: "AppKitBackend", package: "swift-cross-ui"),
             ]
         ),
+        // ssh connection agent (ported from lemon-tmux): ~/.ssh/config host
+        // picker source, pty-wrapped interactive auth, persisted ControlMaster
+        // with command channels that reuse it without re-auth
+        .target(name: "SSHKit"),
         // app shell: windows, menus, session
         .executableTarget(
             name: "SuperlemonApp",
-            dependencies: ["EditorHostKit", "NvimKit"],
+            dependencies: ["EditorHostKit", "NvimKit", "SSHKit"],
             resources: [.process("Resources")]
         ),
         .testTarget(name: "NvimKitTests", dependencies: ["NvimKit"]),
@@ -60,6 +65,7 @@ let package = Package(
         .testTarget(name: "SurfaceKitTests", dependencies: ["SurfaceKit"]),
         .testTarget(name: "ChromeKitTests", dependencies: ["ChromeKit"]),
         .testTarget(name: "ShellKitTests", dependencies: ["ShellKit"]),
+        .testTarget(name: "SSHKitTests", dependencies: ["SSHKit"]),
         .testTarget(
             name: "SuperlemonAppTests",
             dependencies: ["EditorHostKit", "NvimKit", "SurfaceKit"]),

@@ -5,6 +5,7 @@
 import AppKit
 import EditorHostKit
 import GridKit
+import SSHKit
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
@@ -17,8 +18,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private var settings: SettingsWindowController?
     private var savePanelIsOpen = false
     private var smokeDeadlineTask: Task<Void, Never>?
+    private var remoteSessions: [RemoteHostSession] = []
+    private var connectSheet: ConnectSheetController?
+    private var connector: RemoteConnector?
 
-    private var chrome: WorkspaceChrome? { editorHost?.chrome }
+    // Menu actions target the key window's editor, so a remote window's ⌘S
+    // saves the remote buffer, not the local one's.
+    private var keyEditorHost: EditorHostNSView? {
+        NSApp.keyWindow?.contentView as? EditorHostNSView
+    }
+    private var activeController: NvimController? { keyEditorHost?.controller ?? controller }
+    private var activeEditorWindow: NSWindow? {
+        keyEditorHost?.window ?? window
+    }
+
+    private var chrome: WorkspaceChrome? { keyEditorHost?.chrome ?? editorHost?.chrome }
 
     @objc private func showSettings(_ sender: Any?) {
         guard let controller else { return }
@@ -71,6 +85,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
     func applicationWillTerminate(_ notification: Notification) {
         controller?.stop()
+        for session in remoteSessions { session.teardown() }
     }
 
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool {
@@ -172,9 +187,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
 
     @objc private func openFile(_ sender: Any?) {
-        guard let controller else { return }
+        guard let controller = activeController else { return }
         Task { [weak self, weak controller] in
-            guard let self, let controller, let window = self.window else { return }
+            guard let self, let controller, let window = self.activeEditorWindow else { return }
             let panel = NSOpenPanel()
             panel.title = "Open File"
             panel.prompt = "Open"
@@ -190,9 +205,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
 
     @objc private func openFolder(_ sender: Any?) {
-        guard let controller else { return }
+        guard let controller = activeController else { return }
         Task { [weak self, weak controller] in
-            guard let self, let controller, let window = self.window else { return }
+            guard let self, let controller, let window = self.activeEditorWindow else { return }
             let panel = NSOpenPanel()
             panel.title = "Open Folder"
             panel.prompt = "Open"
@@ -210,7 +225,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
     /// File ▸ Save is semantic even when a user remaps <D-s> in Neovim.
     @objc private func saveFile(_ sender: Any?) {
-        controller?.saveCurrentBuffer()
+        activeController?.saveCurrentBuffer()
     }
 
     @objc private func saveFileAs(_ sender: Any?) {
@@ -218,7 +233,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
 
     private func presentSaveAs() {
-        guard !savePanelIsOpen, let controller, let window else { return }
+        guard !savePanelIsOpen, let controller = activeController,
+            let window = activeEditorWindow
+        else { return }
         savePanelIsOpen = true
         Task { [weak self, controller, window] in
             guard let self else { return }
@@ -248,7 +265,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
 
     @objc private func toggleSidebar(_ sender: Any?) {
-        controller?.toggleNativeChrome("sidebar")
+        activeController?.toggleNativeChrome("sidebar")
     }
 
     /// View ▸ Native Tabs / Native Status Bar — affordances only; the runtime
@@ -258,15 +275,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
 
     @objc private func toggleNativeTabs(_ sender: Any?) {
-        controller?.toggleNativeChrome("tabs")
+        activeController?.toggleNativeChrome("tabs")
     }
 
     @objc private func toggleNativeStatusBar(_ sender: Any?) {
-        controller?.toggleNativeChrome("statusbar")
+        activeController?.toggleNativeChrome("statusbar")
     }
 
     @objc private func toggleMinimap(_ sender: Any?) {
-        controller?.toggleNativeChrome("minimap")
+        activeController?.toggleNativeChrome("minimap")
     }
 
     private func relaunch() {
@@ -288,26 +305,88 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         switch menuItem.action {
         case #selector(openFile(_:)), #selector(openFolder(_:)),
             #selector(presentQuickOpen(_:)):
-            return controller?.editorCommandsAvailable ?? false
+            return activeController?.editorCommandsAvailable ?? false
+        case #selector(openRemoteFolder(_:)):
+            return connectSheet == nil
         case #selector(saveFile(_:)):
-            return controller?.canSaveCurrentBuffer ?? false
+            return activeController?.canSaveCurrentBuffer ?? false
         case #selector(saveFileAs(_:)):
-            return (controller?.editorCommandsAvailable ?? false) && !savePanelIsOpen
+            return (activeController?.editorCommandsAvailable ?? false) && !savePanelIsOpen
         case #selector(toggleNativeTabs(_:)):
             menuItem.state = (chrome?.nativeTabs ?? false) ? .on : .off
-            return controller?.editorCommandsAvailable ?? false
+            return activeController?.editorCommandsAvailable ?? false
         case #selector(toggleNativeStatusBar(_:)):
             menuItem.state = (chrome?.nativeStatusbar ?? false) ? .on : .off
-            return controller?.editorCommandsAvailable ?? false
+            return activeController?.editorCommandsAvailable ?? false
         case #selector(toggleMinimap(_:)):
             menuItem.state = (chrome?.nativeMinimap ?? true) ? .on : .off
-            return controller?.editorCommandsAvailable ?? false
+            return activeController?.editorCommandsAvailable ?? false
         case #selector(toggleSidebar(_:)):
             menuItem.state = (chrome?.nativeSidebar ?? true) ? .on : .off
-            return controller?.editorCommandsAvailable ?? false
+            return activeController?.editorCommandsAvailable ?? false
         default:
             return true
         }
+    }
+
+    // MARK: - Remote host (File ▸ Open Remote Folder…)
+
+    /// Sheet on the frontmost editor window: pick/type a destination, watch
+    /// the ssh transcript, answer auth prompts. Success opens the remote
+    /// filesystem in a new editor window; the local window stays untouched.
+    @objc private func openRemoteFolder(_ sender: Any?) {
+        guard connectSheet == nil, let hostWindow = activeEditorWindow else { return }
+        let sheet = ConnectSheetController(hosts: SSHConfigHosts.listAliases())
+        connectSheet = sheet
+
+        sheet.onCancel = { [weak self] in
+            self?.connector?.cancel()
+            self?.dismissConnectSheet(on: hostWindow)
+        }
+        sheet.onSendAuth = { [weak self] response in
+            self?.connector?.sendAuth(response)
+        }
+        sheet.onConnect = { [weak self] destination in
+            guard let self else { return }
+            let connector = RemoteConnector()
+            self.connector = connector
+            connector.onTranscript = { [weak sheet] text in sheet?.appendTranscript(text) }
+            connector.onStatus = { [weak sheet] status in sheet?.showStatus(status) }
+            connector.onOutcome = { [weak self] outcome in
+                guard let self else { return }
+                switch outcome {
+                case .failed(let message):
+                    self.connector = nil
+                    self.connectSheet?.showFailed(message)
+                case .connected(let master, let controller):
+                    self.connector = nil
+                    self.dismissConnectSheet(on: hostWindow)
+                    let session = RemoteHostSession(
+                        destination: destination, master: master, controller: controller)
+                    session.onClosed = { [weak self] closed in
+                        self?.remoteSessions.removeAll { $0 === closed }
+                    }
+                    self.remoteSessions.append(session)
+                    session.openWindow()
+                }
+            }
+            sheet.showConnecting(to: destination)
+            connector.connect(to: destination)
+        }
+
+        if let sheetWindow = sheet.window {
+            hostWindow.beginSheet(sheetWindow)
+            sheet.focusHostField()
+        }
+    }
+
+    private func dismissConnectSheet(on hostWindow: NSWindow) {
+        if let sheetWindow = connectSheet?.window {
+            hostWindow.endSheet(sheetWindow)
+            sheetWindow.orderOut(nil)
+        }
+        connectSheet = nil
+        connector = nil
     }
 
     // MARK: - Smoke mode (--smoke)
@@ -422,6 +501,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         openFolderItem.keyEquivalentModifierMask = [.command, .shift]
         openFolderItem.target = self
         fileMenu.addItem(openFolderItem)
+
+        let openRemoteItem = NSMenuItem(
+            title: "Open Remote Folder…",
+            action: #selector(openRemoteFolder(_:)),
+            keyEquivalent: "o")
+        openRemoteItem.keyEquivalentModifierMask = [.command, .option]
+        openRemoteItem.target = self
+        fileMenu.addItem(openRemoteItem)
 
         fileMenu.addItem(.separator())
 
