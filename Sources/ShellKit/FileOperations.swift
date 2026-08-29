@@ -64,19 +64,61 @@ public enum FileOperations {
     }
 
     /// Renames the item at `url` to `newName` within the same directory.
+    ///
+    /// Existence is checked with `lstat` (never following the final symlink
+    /// component): `fileExists(atPath:)` reports a dangling symlink as
+    /// absent, which would otherwise make a broken symlink row un-renameable.
+    ///
+    /// A destination that already exists is only a real collision if it
+    /// names a *different* file. On a case-insensitive volume, `README.md`
+    /// → `readme.md` resolves to the same inode — `fileExists` sees that as
+    /// a pre-existing destination and would refuse the rename outright, so
+    /// case-only renames are impossible without this check. When source and
+    /// destination are the same file, hop through a temporary name in the
+    /// same directory so `moveItem` sees two genuinely distinct paths at
+    /// each step (its direct-rename behavior when source and destination
+    /// differ only by case is filesystem-dependent).
     @discardableResult
     public static func rename(at url: URL, to newName: String) throws -> URL {
         let destination = url.deletingLastPathComponent()
             .appendingPathComponent(try validateName(newName))
         let fm = FileManager.default
-        guard fm.fileExists(atPath: url.path) else {
+        guard itemExists(at: url) else {
             throw FileOperationError.notFound(url.path)
         }
-        guard !fm.fileExists(atPath: destination.path) else {
+        guard itemExists(at: destination) else {
+            try fm.moveItem(at: url, to: destination)
+            return destination
+        }
+        guard isSameFile(url, destination) else {
             throw FileOperationError.alreadyExists(destination.path)
         }
-        try fm.moveItem(at: url, to: destination)
+        let temp = url.deletingLastPathComponent()
+            .appendingPathComponent(".superlemon-rename-\(UUID().uuidString)")
+        try fm.moveItem(at: url, to: temp)
+        do {
+            try fm.moveItem(at: temp, to: destination)
+        } catch {
+            _ = try? fm.moveItem(at: temp, to: url)
+            throw error
+        }
         return destination
+    }
+
+    /// True when something exists at `url`, without following a final
+    /// symlink component — so a dangling symlink still counts as present.
+    static func itemExists(at url: URL) -> Bool {
+        var info = stat()
+        return lstat(url.path, &info) == 0
+    }
+
+    /// True when `a` and `b` are the same filesystem object (same device and
+    /// inode) — the case-insensitive-volume case-only-rename check.
+    private static func isSameFile(_ a: URL, _ b: URL) -> Bool {
+        var infoA = stat()
+        var infoB = stat()
+        guard lstat(a.path, &infoA) == 0, lstat(b.path, &infoB) == 0 else { return false }
+        return infoA.st_dev == infoB.st_dev && infoA.st_ino == infoB.st_ino
     }
 
     /// Moves the item to the Trash. A Trash failure is deliberately surfaced
@@ -91,8 +133,7 @@ public enum FileOperations {
     /// Injection seam used to prove that a failed Trash move leaves the
     /// original item untouched. Deliberately internal; callers use `trash(_:)`.
     static func trash(_ url: URL, moveToTrash: (URL) throws -> Void) throws {
-        let fm = FileManager.default
-        guard fm.fileExists(atPath: url.path) else {
+        guard itemExists(at: url) else {
             throw FileOperationError.notFound(url.path)
         }
         try moveToTrash(url)

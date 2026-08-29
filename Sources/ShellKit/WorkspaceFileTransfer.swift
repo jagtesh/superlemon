@@ -241,7 +241,10 @@ public final class WorkspaceFileTransferCoordinator {
                 let name = url.lastPathComponent
                 let exists = try await coordinator.transport.stat(
                     Self.join(directory, name)) != nil
-                if exists { conflicted.append(name) }
+                // Only names that collide with something already on disk go
+                // to the conflict prompt; two dropped items sharing a
+                // basename (no pre-existing file) are uniqued silently below.
+                if exists, !conflicted.contains(name) { conflicted.append(name) }
                 topLevel.append((url, name, exists))
             }
 
@@ -251,12 +254,24 @@ public final class WorkspaceFileTransferCoordinator {
                 if case .cancel = resolution { return }
             }
 
+            // Names claimed so far in this batch — guards against two
+            // dropped items resolving to the same destination and one
+            // silently clobbering the other, regardless of the chosen
+            // conflict resolution for pre-existing files.
+            var claimedNames: Set<String> = []
             for item in topLevel {
                 var name = item.name
-                if item.exists, case .keepBoth = resolution {
-                    name = try await coordinator.availableName(
-                        for: name, in: directory)
+                let mustUnique: Bool
+                if case .keepBoth = resolution {
+                    mustUnique = item.exists
+                } else {
+                    mustUnique = false
                 }
+                if mustUnique || claimedNames.contains(name) {
+                    name = try await coordinator.availableName(
+                        for: name, in: directory, reserved: claimedNames)
+                }
+                claimedNames.insert(name)
                 try Self.appendImportPlan(
                     for: item.url,
                     workspacePath: Self.join(directory, name),
@@ -316,12 +331,17 @@ public final class WorkspaceFileTransferCoordinator {
         }
     }
 
-    /// Finder-style "name 2.ext", "name 3.ext", … first free name.
-    private func availableName(for name: String, in directory: String) async throws -> String {
+    /// Finder-style "name 2.ext", "name 3.ext", … first name that is free
+    /// both on disk and among `reserved` names already claimed earlier in
+    /// this batch (so two dropped items sharing a basename never collide).
+    private func availableName(
+        for name: String, in directory: String, reserved: Set<String> = []
+    ) async throws -> String {
         let base = (name as NSString).deletingPathExtension
         let ext = (name as NSString).pathExtension
         for counter in 2...9999 {
             let candidate = ext.isEmpty ? "\(base) \(counter)" : "\(base) \(counter).\(ext)"
+            if reserved.contains(candidate) { continue }
             if try await transport.stat(Self.join(directory, candidate)) == nil {
                 return candidate
             }

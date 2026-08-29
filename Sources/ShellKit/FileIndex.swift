@@ -299,8 +299,14 @@ struct GitIgnoreRules {
     }
 
     init(_ text: String) {
-        for rawLine in text.split(separator: "\n", omittingEmptySubsequences: false) {
-            var line = String(rawLine).trimmingCharacters(in: .whitespaces)
+        // `split(separator: "\n")` looks for the lone Character "\n", but
+        // Swift's grapheme-cluster rules fuse a "\r\n" pair into a single
+        // Character distinct from "\n" — so a CRLF-saved .gitignore (common
+        // from Windows tooling, or editors that preserve line endings)
+        // would never split into lines at all. `\.isNewline` matches CR,
+        // LF, and the fused CRLF cluster alike.
+        for rawLine in text.split(whereSeparator: \.isNewline) {
+            var line = String(rawLine).trimmingCharacters(in: .whitespacesAndNewlines)
             if line.isEmpty || line.hasPrefix("#") { continue }
 
             var negated = false

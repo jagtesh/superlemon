@@ -246,6 +246,41 @@ struct WorkspaceFileTransferCoordinatorTests {
         }
     }
 
+    @Test func intraBatchNameCollisionsAreUniquedNotClobbered() async throws {
+        // Two different source directories dropped in one batch that each
+        // contain a file named "notes.txt" must not let the second import
+        // silently overwrite the first at the shared destination name.
+        let dirA = try makeTempDir("dupA")
+        let dirB = try makeTempDir("dupB")
+        defer {
+            try? FileManager.default.removeItem(at: dirA)
+            try? FileManager.default.removeItem(at: dirB)
+        }
+        let notesA = dirA.appendingPathComponent("notes.txt")
+        let notesB = dirB.appendingPathComponent("notes.txt")
+        try Data("from A".utf8).write(to: notesA)
+        try Data("from B".utf8).write(to: notesB)
+
+        let transport = ScriptedTransport(root: "/ws")
+        let coordinator = makeCoordinator(transport: transport)
+        var askedConflicts: [String]?
+        coordinator.resolveConflicts = { names in
+            askedConflicts = names
+            return .keepBoth
+        }
+
+        coordinator.importItems([notesA, notesB], into: "/ws")
+        await coordinator.waitForIdle()
+
+        // Neither dropped file previously existed at the destination, so
+        // there is nothing to prompt about — the collision is purely
+        // between the two dropped items themselves.
+        #expect(askedConflicts == nil)
+        #expect(transport.contents("/ws/notes.txt") == Data("from A".utf8))
+        #expect(transport.contents("/ws/notes 2.txt") == Data("from B".utf8))
+        #expect(transport.allFiles().count == 2)
+    }
+
     @Test func movesSkipSameParentAndRefuseOwnSubtree() async throws {
         let transport = ScriptedTransport(root: "/ws")
         transport.seed(directory: "/ws/dir")

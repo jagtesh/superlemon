@@ -73,6 +73,25 @@ struct FileIndexTests {
         #expect(files == [".gitignore", "main.swift", "sub/secret.txt", "keep.log"])
     }
 
+    @Test func honorsCRLFGitignore() async throws {
+        let root = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        // A CRLF-saved .gitignore: each pattern line trails a literal "\r".
+        try FileManager.default.createFile(
+            atPath: root.appendingPathComponent(".gitignore").path,
+            contents: Data("node_modules/\r\n*.log\r\n".utf8))
+        try write("main.swift", in: root)
+        try write("a.log", in: root)
+        try write("node_modules/x.js", in: root)
+
+        let index = FileIndex(root: root)
+        await index.refresh()
+        let files = Set(await index.allFiles())
+
+        #expect(files == [".gitignore", "main.swift"])
+    }
+
     @Test func emptyQueryReturnsMostRecentlyModifiedFirst() async throws {
         let root = try makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -217,6 +236,16 @@ struct GitIgnoreRulesTests {
     func matching(pattern: String, path: String, isDirectory: Bool, expected: Bool) {
         let rules = GitIgnoreRules(pattern)
         #expect(rules.matches(path, isDirectory: isDirectory) == expected)
+    }
+
+    @Test func crlfLineEndingsDoNotDefeatRules() {
+        // .whitespaces alone doesn't strip \r, so a CRLF-saved .gitignore
+        // (e.g. authored on Windows, or by an editor that preserves line
+        // endings) would leave every pattern trailing a literal "\r" and
+        // never match anything.
+        let rules = GitIgnoreRules("node_modules/\r\n*.log\r\n")
+        #expect(rules.matches("node_modules", isDirectory: true))
+        #expect(rules.matches("a.log", isDirectory: false))
     }
 
     @Test func lastMatchingRuleWinsForNegation() {

@@ -74,6 +74,43 @@ struct FileOperationsTests {
         }
     }
 
+    @Test func renameAllowsCaseOnlyChangeOnCaseInsensitiveVolume() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        // Detect volume case-sensitivity before asserting anything: create
+        // "a", then check whether "A" is seen as the same file.
+        let lower = dir.appendingPathComponent("a")
+        try Data().write(to: lower)
+        let caseInsensitive = FileManager.default.fileExists(
+            atPath: dir.appendingPathComponent("A").path)
+        guard caseInsensitive else { return }  // case-sensitive volume: nothing to prove
+
+        let original = try FileOperations.createFile(in: dir, name: "README.md")
+        let renamed = try FileOperations.rename(at: original, to: "readme.md")
+
+        #expect(renamed == dir.appendingPathComponent("readme.md"))
+        let listing = try FileManager.default.contentsOfDirectory(atPath: dir.path)
+        #expect(listing.contains("readme.md"))
+        #expect(!listing.contains("README.md"))
+    }
+
+    @Test func renameSucceedsOnDanglingSymlink() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let link = dir.appendingPathComponent("broken-link")
+        try FileManager.default.createSymbolicLink(
+            at: link, withDestinationURL: dir.appendingPathComponent("does-not-exist"))
+
+        let renamed = try FileOperations.rename(at: link, to: "still-broken-link")
+        #expect(renamed == dir.appendingPathComponent("still-broken-link"))
+        var oldInfo = stat()
+        #expect(lstat(link.path, &oldInfo) != 0, "old symlink path is gone")
+        var newInfo = stat()
+        #expect(lstat(renamed.path, &newInfo) == 0, "symlink itself moved, even though its target is missing")
+    }
+
     @Test(arguments: ["", "   ", "a/b", "a\0b", ".", ".."])
     func invalidNamesAreRejected(name: String) throws {
         let dir = try makeTempDir()
@@ -115,6 +152,21 @@ struct FileOperationsTests {
         try FileOperations.createFile(in: folder, name: "egg.txt")
         try FileOperations.trash(folder)
         #expect(!FileManager.default.fileExists(atPath: folder.path))
+    }
+
+    @Test func trashSucceedsOnDanglingSymlink() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let link = dir.appendingPathComponent("broken-link")
+        try FileManager.default.createSymbolicLink(
+            at: link, withDestinationURL: dir.appendingPathComponent("does-not-exist"))
+
+        var trashed: URL?
+        try FileOperations.trash(link) { candidate in
+            trashed = candidate
+        }
+        #expect(trashed == link)
     }
 
     @Test func trashMissingItemThrows() throws {
