@@ -93,6 +93,64 @@ struct InputHostViewTests {
         #expect(view.selectedRange().location == NSNotFound)
     }
 
+    @Test func resigningFirstResponderCommitsMarkedTextOnceAndDiscardsIMEComposition() {
+        let view = makeView()
+        var sentInputs: [String] = []
+        var discardCount = 0
+        view.commitComposedInput = { sentInputs.append($0) }
+        view.discardComposition = { discardCount += 1 }
+
+        view.setMarkedText(
+            "にほ", selectedRange: NSRange(location: 2, length: 0),
+            replacementRange: NSRange(location: NSNotFound, length: 0))
+        #expect(view.hasMarkedText())
+
+        _ = view.resignFirstResponder()
+
+        // Exactly one copy travels to Neovim; the IME is told to drop its
+        // own buffer so it does not later replay "にほ" on top of whatever
+        // it composes next (the duplication bug this guards against).
+        #expect(sentInputs == ["にほ"])
+        #expect(discardCount == 1)
+        #expect(!view.hasMarkedText())
+    }
+
+    @Test func acquiringFocusViaMouseDownCommitsMarkedTextOnceAndDiscardsIMEComposition() throws {
+        let view = makeView()
+        var sentInputs: [String] = []
+        var discardCount = 0
+        view.commitComposedInput = { sentInputs.append($0) }
+        view.discardComposition = { discardCount += 1 }
+
+        view.setMarkedText(
+            "かな", selectedRange: NSRange(location: 2, length: 0),
+            replacementRange: NSRange(location: NSNotFound, length: 0))
+
+        let event = try #require(NSEvent.mouseEvent(
+            with: .leftMouseDown, location: NSPoint(x: 10, y: 10),
+            modifierFlags: [], timestamp: 0, windowNumber: 0,
+            context: nil, eventNumber: 0, clickCount: 1, pressure: 1))
+        view.mouseDown(with: event)
+
+        #expect(sentInputs == ["かな"])
+        #expect(discardCount == 1)
+        #expect(!view.hasMarkedText())
+    }
+
+    @Test func acquiringFocusWithNoMarkedTextDoesNotTouchTheInputContext() throws {
+        let view = makeView()
+        var discardCount = 0
+        view.discardComposition = { discardCount += 1 }
+
+        let event = try #require(NSEvent.mouseEvent(
+            with: .leftMouseDown, location: NSPoint(x: 10, y: 10),
+            modifierFlags: [], timestamp: 0, windowNumber: 0,
+            context: nil, eventNumber: 0, clickCount: 1, pressure: 1))
+        view.mouseDown(with: event)
+
+        #expect(discardCount == 0)
+    }
+
     @Test func firstRectReportsCompositionRange() {
         let view = makeView()
         view.setMarkedText(

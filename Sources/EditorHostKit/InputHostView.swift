@@ -61,7 +61,7 @@ public final class InputHostView: NSView, @preconcurrency NSTextInputClient, NSM
     public override func resignFirstResponder() -> Bool {
         // A focus change should not silently throw away an in-progress word.
         // Session teardown uses discardMarkedTextForSessionChange() instead.
-        if hasMarkedText() { unmarkText() }
+        commitMarkedTextLocallyAndDiscardComposition()
         return super.resignFirstResponder()
     }
 
@@ -279,9 +279,50 @@ public final class InputHostView: NSView, @preconcurrency NSTextInputClient, NSM
     /// session is being replaced or torn down; ordinary focus loss commits.
     func discardMarkedTextForSessionChange() {
         suppressUnmarkCommit = true
-        inputContext?.discardMarkedText()
+        discardComposition()
         clearMarkedText()
         suppressUnmarkCommit = false
+    }
+
+    /// Ends composition because *this view* decided the session is over
+    /// (focus is being acquired or given up) — distinct from the IME
+    /// committing on its own, which arrives through the `unmarkText()`
+    /// NSTextInputClient callback and needs no further discard, since the
+    /// input method already knows its own session ended.
+    ///
+    /// Committing `markedText` into the buffer without telling the input
+    /// context leaves the IME believing it still owns an active
+    /// composition: the next keystroke it receives gets folded into that
+    /// stale buffer and replayed whole via setMarkedText/insertText,
+    /// duplicating the text already sent to Neovim here. Discarding through
+    /// `discardComposition()` (== `inputContext?.discardMarkedText()` in
+    /// production) tells the IME to drop its buffer too.
+    ///
+    /// `discardComposition()` can itself trigger a reentrant call back into
+    /// `unmarkText()`; `suppressUnmarkCommit` keeps that reentrant call from
+    /// sending a second copy of the same committed text (same pattern as
+    /// `discardMarkedTextForSessionChange`).
+    private func commitMarkedTextLocallyAndDiscardComposition() {
+        guard hasMarkedText() else { return }
+        let committed = markedText.string
+        suppressUnmarkCommit = true
+        discardComposition()
+        clearMarkedText()
+        suppressUnmarkCommit = false
+        guard !committed.isEmpty else { return }
+        commitComposedInput(KeyTranslator.escapeForInput(committed))
+    }
+
+    /// Test seams for the app-initiated composition-commit path above.
+    /// Production leaves both at their defaults, routing through the live
+    /// responder chain; tests substitute counters since neither a real
+    /// `NSTextInputContext` session nor a live Neovim connection exists in a
+    /// headless suite.
+    lazy var discardComposition: () -> Void = { [weak self] in
+        self?.inputContext?.discardMarkedText()
+    }
+    lazy var commitComposedInput: (String) -> Void = { [weak self] keys in
+        self?.controller?.sendInput(keys)
     }
 
     private func updatePreeditLayer() {
@@ -517,7 +558,7 @@ public final class InputHostView: NSView, @preconcurrency NSTextInputClient, NSM
 
     private func acquireEditorFocus() {
         window?.makeFirstResponder(self)
-        if hasMarkedText() { unmarkText() }
+        commitMarkedTextLocallyAndDiscardComposition()
     }
 
     // MARK: - Menu actions
