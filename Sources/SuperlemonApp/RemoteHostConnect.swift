@@ -185,16 +185,28 @@ final class ConnectSheetController: NSWindowController {
 final class RemoteHostSession: NSObject, NSWindowDelegate {
     let destination: String
     private let master: SSHMaster
+    private let masterRegistry: RemoteMasterRegistry
     let controller: NvimController
     private var editorHost: EditorHostNSView?
     private(set) var window: NSWindow?
     var onClosed: ((RemoteHostSession) -> Void)?
 
-    init(destination: String, master: SSHMaster, controller: NvimController) {
+    /// Set only while an app-wide termination is inspecting this session
+    /// (see `resolveTermination()`); resolved `true` by the exit that
+    /// follows a confirmed quit (`exitHandler`) or `false` by a decline
+    /// (`controller.replyToApplicationTermination`, redirected below).
+    private var terminationWaiter: ((Bool) -> Void)?
+
+    init(
+        destination: String, master: SSHMaster, controller: NvimController,
+        masterRegistry: RemoteMasterRegistry
+    ) {
         self.destination = destination
         self.master = master
         self.controller = controller
+        self.masterRegistry = masterRegistry
         super.init()
+        masterRegistry.retain(destination, master: master)
     }
 
     var sessionController: NvimController { controller }
@@ -234,12 +246,54 @@ final class RemoteHostSession: NSObject, NSWindowDelegate {
 
         self.window = window
 
-        // Remote nvim exiting (`:q`, connection drop) closes the window.
+        // Remote nvim exiting (`:q`, connection drop, a confirmed app-wide
+        // quit) closes the window. `terminationWaiter` is how
+        // `resolveTermination()` learns a pending app-quit's inspection of
+        // this session actually finished.
         controller.exitHandler = { [weak self] _, _ in
-            Task { @MainActor in self?.finishAndClose() }
+            Task { @MainActor in
+                self?.terminationWaiter?(true)
+                self?.terminationWaiter = nil
+                self?.finishAndClose()
+            }
+        }
+        // A startup failure's "Quit" button must close only this window,
+        // never the whole app (Bug 4: it otherwise falls back to the
+        // NvimController default of NSApp.terminate(nil)).
+        controller.requestApplicationTermination = { [weak self] in
+            self?.finishAndClose()
+        }
+        // A decline on this session's own quit-inspection dialog
+        // (`cancelQuit()` inside NvimController) resolves a pending
+        // `.terminateLater` by calling this closure with `false` — redirect
+        // it here so `resolveTermination()`'s `await` actually resumes
+        // instead of the app-wide termination's `false` reaching
+        // `NSApp` on its own, invisibly to AppDelegate's coordinator.
+        controller.replyToApplicationTermination = { [weak self] approved in
+            self?.terminationWaiter?(approved)
+            self?.terminationWaiter = nil
         }
 
         Task { await controller.start() }
+    }
+
+    /// Called by AppDelegate's termination coordinator while ⌘Q/⌘Q-equivalent
+    /// is deciding whether the app may quit: runs this session's own
+    /// modified-buffer quit inspection (a native dialog on this window, same
+    /// machinery `windowShouldClose` uses) and reports whether it cleared.
+    /// A confirmed quit resolves `true` through `exitHandler`; a decline
+    /// resolves `false` through the redirected `replyToApplicationTermination`
+    /// set in `openWindow()`.
+    func resolveTermination() async -> Bool {
+        switch controller.handleTerminationRequest() {
+        case .terminateNow: return true
+        case .terminateCancel: return false
+        case .terminateLater:
+            return await withCheckedContinuation { continuation in
+                terminationWaiter = { resolved in continuation.resume(returning: resolved) }
+            }
+        @unknown default: return true
+        }
     }
 
     /// Close routes through nvim's modified-buffer quit flow, mirroring the
@@ -259,11 +313,15 @@ final class RemoteHostSession: NSObject, NSWindowDelegate {
         window?.close()
     }
 
+    /// Releases this session's hold on the shared ControlMaster rather than
+    /// exiting it directly — another window on the same destination may
+    /// still be riding it (see `RemoteMasterRegistry`, Bug 3).
     func teardown() {
         controller.stop()
         onClosed?(self)
-        let master = master
-        Task.detached { await master.disconnect() }
+        let destination = destination
+        let masterRegistry = masterRegistry
+        Task { await masterRegistry.release(destination) }
     }
 }
 
@@ -308,10 +366,17 @@ final class RemoteConnector {
         Task { try? await master.write([UInt8]((response + "\n").utf8)) }
     }
 
+    /// Cancelling a connection attempt must never run `ssh -O exit`: if the
+    /// master already reached the ready marker (persisted), another window
+    /// dialing the same destination concurrently could be relying on it —
+    /// and even if not, `RemoteHostSession` never got a chance to register
+    /// it, so this is the only reference to it. Only the local auth pty is
+    /// torn down; a lone abandoned master is left for `ControlPersist`'s
+    /// idle timeout (Bug 3/7).
     func cancel() {
         finished = true
         guard let master else { return }
-        Task.detached { await master.disconnect() }
+        Task { await master.abortAuth() }
     }
 
     private func handleOutput(_ text: String) {
@@ -397,10 +462,25 @@ final class RemoteConnector {
                     remotePath: SSHCommandBuilder.remoteCustomInitPath)
             }
 
+            // The far side's config mode decides startup validation: only a
+            // Superlemon-selected custom init is diagnosed; the remote user's
+            // own init is trusted like a local `.user` launch. "Start Safely"
+            // relaunches on the deployed managed baseline, as it does locally.
+            let configMode: NvimConfigMode
+            switch remoteConfig {
+            case .editorManaged: configMode = .managed
+            case .remoteUser: configMode = .user
+            case .customInit: configMode = .custom
+            }
+            let sshBinary = URL(fileURLWithPath: master.sshExecutablePath)
             let controller = NvimController(
                 launchConfiguration: NvimLaunchConfiguration(
-                    binaryURL: URL(fileURLWithPath: master.sshExecutablePath),
-                    arguments: await master.embeddedNvimArguments(config: remoteConfig)))
+                    binaryURL: sshBinary,
+                    arguments: await master.embeddedNvimArguments(config: remoteConfig)),
+                configMode: configMode,
+                safeStartConfiguration: NvimLaunchConfiguration(
+                    binaryURL: sshBinary,
+                    arguments: await master.embeddedNvimArguments(config: .editorManaged)))
             finish(.connected(master, controller))
         }
     }

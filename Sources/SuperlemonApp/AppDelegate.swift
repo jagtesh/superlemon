@@ -6,6 +6,7 @@ import AppKit
 import EditorHostKit
 import GridKit
 import SSHKit
+import ShellKit
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
@@ -21,6 +22,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private var remoteSessions: [RemoteHostSession] = []
     private var connectSheet: ConnectSheetController?
     private var connector: RemoteConnector?
+    /// Shared across every "Open Remote Folder" session so windows to the
+    /// same destination don't each own an independent exit of the
+    /// ControlMaster they're all riding (Bug 3).
+    private let remoteMasterRegistry = RemoteMasterRegistry()
+    /// Bumped on every `applicationShouldTerminate` call; guards the async
+    /// remote-consensus coordinator below against acting on a stale
+    /// termination attempt the user already cancelled.
+    private var terminationGeneration = 0
 
     // Menu actions target the key window's editor, so a remote window's ⌘S
     // saves the remote buffer, not the local one's.
@@ -81,14 +90,73 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         Task { await controller.start() }
     }
 
+    /// Every remote window may hold unsaved buffers too, and each deserves
+    /// its own native modified-buffer dialog before the app actually quits
+    /// (Bug 2). Remotes are inspected first, one at a time; only once every
+    /// one has cleanly consented does the local controller run its own
+    /// self-contained quit flow — the same one this method always ran for
+    /// the local-only case, untouched below.
+    ///
+    /// Each remote session's `resolveTermination()` resolves `true` (via
+    /// `exitHandler`, on a confirmed quit) or `false` (via a redirected
+    /// `replyToApplicationTermination`, on a decline) — see
+    /// `RemoteHostSession.openWindow()`. A decline means `NSApp` was never
+    /// told anything by the controller itself (that closure is redirected
+    /// here instead of calling the real `NSApp.reply`), so this coordinator
+    /// is the one that must reply `false` on its behalf.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let controller else { return .terminateNow }
-        return controller.handleTerminationRequest()
+        guard !remoteSessions.isEmpty else {
+            return controller.handleTerminationRequest()
+        }
+
+        terminationGeneration += 1
+        let generation = terminationGeneration
+        let sessions = remoteSessions
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            var aggregate = TerminationAggregate(participants: sessions.count)
+            for session in sessions {
+                let reply = await session.resolveTermination()
+                guard self.terminationGeneration == generation else { return }
+                if aggregate.add(reply: reply) == .cancelled {
+                    NSApp.reply(toApplicationShouldTerminate: false)
+                    return
+                }
+            }
+            guard aggregate.status == .approved, self.terminationGeneration == generation
+            else { return }
+            guard let controller = self.controller else {
+                NSApp.reply(toApplicationShouldTerminate: true)
+                return
+            }
+            // Defensive: clear a leftover one-shot handler from a
+            // previously *cancelled* ⌘W-with-remotes-open close (see
+            // windowShouldClose) so this real quit isn't swallowed by it.
+            controller.exitHandler = nil
+            switch controller.handleTerminationRequest() {
+            case .terminateNow:
+                NSApp.reply(toApplicationShouldTerminate: true)
+            case .terminateCancel:
+                NSApp.reply(toApplicationShouldTerminate: false)
+            case .terminateLater:
+                break  // its own default reply closure resolves this.
+            @unknown default:
+                break
+            }
+        }
+        return .terminateLater
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         controller?.stop()
-        for session in remoteSessions { session.teardown() }
+        for session in remoteSessions { session.controller.stop() }
+        // The process is exiting now; there's no time left for the
+        // graceful per-session release dance (Task-based, async). Exit
+        // every still-registered ControlMaster synchronously instead —
+        // the only chance to run `ssh -O exit` before ControlPersist's
+        // idle timeout would otherwise be the sole cleanup (Bug 7).
+        remoteMasterRegistry.exitAllSynchronously()
     }
 
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool {
@@ -99,10 +167,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
     /// Window close routes through the same native modified-buffer quit flow
     /// as ⌘Q; the window actually closes when nvim exits.
+    ///
+    /// With no remote windows open, closing the one local window is
+    /// equivalent to quitting — unchanged from before. With remote windows
+    /// still open (Bug 2), ⌘W must close only the local window: a one-shot
+    /// `exitHandler` takes over from `NvimController`'s default
+    /// app-terminating behavior for this exit alone, so the app survives
+    /// with its remote windows intact.
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         guard let controller, !controller.sessionExited else { return true }
-        // Defer out of the delegate callback before starting app termination.
-        DispatchQueue.main.async { NSApp.terminate(nil) }
+        guard !remoteSessions.isEmpty else {
+            // Defer out of the delegate callback before starting app termination.
+            DispatchQueue.main.async { NSApp.terminate(nil) }
+            return false
+        }
+        controller.exitHandler = { [weak self, weak controller] _, _ in
+            controller?.exitHandler = nil
+            self?.window?.delegate = nil
+            self?.window?.close()
+            self?.window = nil
+            self?.editorHost = nil
+        }
+        controller.requestQuit()
         return false
     }
 
@@ -193,6 +279,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         guard let controller = activeController else { return }
         Task { [weak self, weak controller] in
             guard let self, let controller, let window = self.activeEditorWindow else { return }
+            if controller.hasRemoteFilesystem {
+                guard let path = await self.chooseRemotePath(
+                    controller: controller, window: window, mode: .openFile, title: "Open File")
+                else { return }
+                controller.openFile(path)
+                return
+            }
             let panel = NSOpenPanel()
             panel.title = "Open File"
             panel.prompt = "Open"
@@ -211,6 +304,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         guard let controller = activeController else { return }
         Task { [weak self, weak controller] in
             guard let self, let controller, let window = self.activeEditorWindow else { return }
+            if controller.hasRemoteFilesystem {
+                guard let path = await self.chooseRemotePath(
+                    controller: controller, window: window, mode: .openDirectory,
+                    title: "Open Folder")
+                else { return }
+                controller.openFolder(path)
+                return
+            }
             let panel = NSOpenPanel()
             panel.title = "Open Folder"
             panel.prompt = "Open"
@@ -244,6 +345,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             guard let self else { return }
             defer { self.savePanelIsOpen = false }
             let currentPath = await controller.currentBufferPath()
+            if controller.hasRemoteFilesystem {
+                let defaultName = currentPath.map {
+                    URL(fileURLWithPath: $0).lastPathComponent
+                } ?? "Untitled"
+                guard let path = await self.chooseRemotePath(
+                    controller: controller, window: window,
+                    mode: .saveFile(defaultName: defaultName), title: "Save File As")
+                else { return }
+                controller.saveFile(as: path)
+                return
+            }
             let panel = NSSavePanel()
             panel.title = "Save File As"
             panel.prompt = "Save"
@@ -260,6 +372,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             let response = await panel.beginSheetModal(for: window)
             guard response == .OK, let url = panel.url else { return }
             controller.saveFile(as: url.path)
+        }
+    }
+
+    /// A remote session's filesystem is unreachable for NSOpenPanel and
+    /// NSSavePanel; the same tree the sidebar browses over RPC stands in as
+    /// the dialog, rooted at the session's working directory.
+    private func chooseRemotePath(
+        controller: NvimController, window: NSWindow,
+        mode: WorkspaceFilePanelMode, title: String
+    ) async -> String? {
+        let cwd = await controller.currentWorkingDirectory() ?? "/"
+        let panel = WorkspaceFilePanelController(
+            lister: NvimWorkspaceFileSource(controller: controller),
+            root: URL(fileURLWithPath: cwd, isDirectory: true),
+            mode: mode, title: title)
+        return await withCheckedContinuation { continuation in
+            panel.beginSheet(on: window) { path in
+                withExtendedLifetime(panel) { continuation.resume(returning: path) }
+            }
         }
     }
 
@@ -365,9 +496,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                     self.connector = nil
                     self.dismissConnectSheet(on: hostWindow)
                     let session = RemoteHostSession(
-                        destination: destination, master: master, controller: controller)
+                        destination: destination, master: master, controller: controller,
+                        masterRegistry: self.remoteMasterRegistry)
                     session.onClosed = { [weak self] closed in
-                        self?.remoteSessions.removeAll { $0 === closed }
+                        guard let self else { return }
+                        self.remoteSessions.removeAll { $0 === closed }
+                        // The local window may already be closed (Bug 2's
+                        // ⌘W-with-remotes-open path leaves the app running
+                        // headless-of-local-window until every remote is
+                        // done); once the last remote goes too, the app has
+                        // nothing left to show and should quit.
+                        if self.remoteSessions.isEmpty, self.controller?.sessionExited ?? true {
+                            NSApp.terminate(nil)
+                        }
                     }
                     self.remoteSessions.append(session)
                     session.openWindow()

@@ -39,6 +39,11 @@ public enum SSHCommandBuilder {
     /// The primary connection: authenticates interactively on a forced tty,
     /// prints the ready marker, and exits — `ControlPersist` keeps the
     /// authenticated master alive in the background for every later channel.
+    /// A bounded 10-minute idle persist (not `yes`) is the backstop for
+    /// process-level cleanup missing its chance to run `ssh -O exit` (a
+    /// crash, `kill -9`, or any other exit that skips
+    /// `applicationWillTerminate`) — see `SSHMaster.disconnectSynchronously`
+    /// for the normal-quit path, which still exits promptly.
     public static func masterConnection(
         endpoint: SSHEndpoint, stateDirectory: String
     ) -> [String] {
@@ -46,7 +51,7 @@ public enum SSHCommandBuilder {
             "-tt",
             "-o", "ControlMaster=auto",
             "-o", "ControlPath=\(controlPath(stateDirectory: stateDirectory))",
-            "-o", "ControlPersist=yes",
+            "-o", "ControlPersist=600",
         ]
         if let port = endpoint.port { args += ["-p", String(port)] }
         args += endpoint.extraArguments

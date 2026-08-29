@@ -82,6 +82,45 @@ public actor SSHMaster {
         pty.terminate()
     }
 
+    /// Abort a connection attempt still in the auth pty: kills the local
+    /// `ssh -tt` auth process only, and never sends `-O exit`. If the
+    /// master had already reached the ready marker (so a persisted
+    /// ControlMaster socket exists), that master is left untouched — a
+    /// sibling window on the same destination may still be riding it (see
+    /// `RemoteMasterRegistry`), and if not, `ControlPersist`'s idle timeout
+    /// reclaims it (`SSHEndpoint.masterConnection`).
+    public func abortAuth() {
+        pty.terminate()
+    }
+
+    /// Final process-ownership backstop for app-quit teardown, run from
+    /// `applicationWillTerminate` where no `await` is possible: sends
+    /// `ssh -O exit` and blocks (bounded by `timeout`) for it to finish,
+    /// forcing it down if it hasn't replied in time. Bypasses actor
+    /// isolation (`endpoint`/`sshPath`/`stateDirectory` are all immutable
+    /// Sendable `let`s) so it can run synchronously on the caller's thread.
+    public nonisolated func disconnectSynchronously(timeout: TimeInterval = 2) {
+        let args = SSHCommandBuilder.controlOperation(
+            "exit", endpoint: endpoint, stateDirectory: stateDirectory)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: sshPath)
+        process.arguments = args
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+        } catch {
+            return
+        }
+        let deadline = Date().addingTimeInterval(timeout)
+        while process.isRunning, Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        if process.isRunning {
+            process.terminate()
+        }
+    }
+
     // MARK: - Remote execution over the master (no re-auth)
 
     /// Run a remote command, optionally feeding stdin; returns exit status.

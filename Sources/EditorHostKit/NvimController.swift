@@ -197,7 +197,13 @@ public final class NvimController {
     /// app; embedding hosts (lemon-tmux) override this to close their editor
     /// surface instead — an embedded editor must never quit its host.
     public var requestApplicationTermination: @MainActor () -> Void = { NSApp.terminate(nil) }
-    var replyToApplicationTermination: @MainActor (Bool) -> Void = {
+    /// How a pending `.terminateLater` (from `handleTerminationRequest()`)
+    /// is finally resolved. Standalone superlemon leaves this at the
+    /// default (`NSApp.reply(toApplicationShouldTerminate:)`); an embedding
+    /// coordinator managing several sessions at once (e.g. AppDelegate's
+    /// remote-session quit coordinator) can redirect it to learn a
+    /// session's own quit-flow outcome instead.
+    public var replyToApplicationTermination: @MainActor (Bool) -> Void = {
         NSApp.reply(toApplicationShouldTerminate: $0)
     }
 

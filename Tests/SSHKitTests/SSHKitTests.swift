@@ -119,7 +119,10 @@ struct SSHCommandBuilderTests {
         #expect(args.first == "-tt")
         #expect(args.contains("ControlMaster=auto"))
         #expect(args.contains("ControlPath=/s/cm-%C"))
-        #expect(args.contains("ControlPersist=yes"))
+        // A bounded idle persist (not `yes`): the app-quit path
+        // (SSHMaster.disconnectSynchronously via RemoteMasterRegistry)
+        // still exits promptly; this is only the crash/kill-9 backstop.
+        #expect(args.contains("ControlPersist=600"))
         #expect(args.contains("-p") && args.contains("2222"))
         #expect(args.contains("-J") && args.contains("jump"))
         #expect(args.last == "echo \(SSHCommandBuilder.readyMarker)")
