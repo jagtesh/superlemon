@@ -48,8 +48,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                 }
             }
             settings.onRelaunch = { [weak self] in self?.relaunch() }
-            settings.onAppearanceModeChanged = { [weak controller] in
-                controller?.applyAppearancePreference()
+            settings.onAppearanceModeChanged = { [weak self] in
+                self?.controller?.applyAppearancePreference()
+                for session in self?.remoteSessions ?? [] {
+                    session.controller.applyAppearancePreference()
+                }
             }
             self.settings = settings
         }

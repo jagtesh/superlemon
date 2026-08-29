@@ -185,7 +185,7 @@ final class ConnectSheetController: NSWindowController {
 final class RemoteHostSession: NSObject, NSWindowDelegate {
     let destination: String
     private let master: SSHMaster
-    private let controller: NvimController
+    let controller: NvimController
     private var editorHost: EditorHostNSView?
     private(set) var window: NSWindow?
     var onClosed: ((RemoteHostSession) -> Void)?
