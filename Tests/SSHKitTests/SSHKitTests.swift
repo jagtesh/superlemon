@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 
 @testable import SSHKit
@@ -23,6 +24,88 @@ struct SSHConfigHostsTests {
     @Test("missing config yields no hosts")
     func missingConfig() {
         #expect(SSHConfigHosts.listAliases(configPath: "/nonexistent/ssh_config") == [])
+    }
+
+    @Test("quoted alias with embedded space parses as a single token")
+    func quotedAliasWithSpace() {
+        let config = """
+            Host "my server" other
+            """
+        #expect(SSHConfigHosts.parse(config) == ["my server", "other"])
+    }
+
+    @Test("Include pulls in Host entries from another file, relative to baseDirectory")
+    func includeDirectiveResolvesRelativePath() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("sshkit-include-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let includedPath = tempDir.appendingPathComponent("extra.conf")
+        try "Host from-include\n".write(to: includedPath, atomically: true, encoding: .utf8)
+
+        let mainConfig = """
+            Host main-host
+            Include extra.conf
+            """
+        #expect(
+            SSHConfigHosts.parse(mainConfig, baseDirectory: tempDir.path)
+                == ["main-host", "from-include"])
+    }
+
+    @Test("Include with a glob pattern pulls in multiple files, sorted")
+    func includeDirectiveResolvesGlob() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("sshkit-include-glob-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        try "Host from-a\n".write(
+            to: tempDir.appendingPathComponent("a.conf"), atomically: true, encoding: .utf8)
+        try "Host from-b\n".write(
+            to: tempDir.appendingPathComponent("b.conf"), atomically: true, encoding: .utf8)
+
+        let mainConfig = """
+            Include *.conf
+            """
+        #expect(
+            SSHConfigHosts.parse(mainConfig, baseDirectory: tempDir.path)
+                == ["from-a", "from-b"])
+    }
+
+    @Test("listAliases follows Include directives relative to the config file's directory")
+    func listAliasesFollowsInclude() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("sshkit-listaliases-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let mainPath = tempDir.appendingPathComponent("config")
+        let includedPath = tempDir.appendingPathComponent("included")
+        try "Host from-include\n".write(to: includedPath, atomically: true, encoding: .utf8)
+        try """
+            Host main
+            Include included
+            """.write(to: mainPath, atomically: true, encoding: .utf8)
+
+        #expect(
+            SSHConfigHosts.listAliases(configPath: mainPath.path) == ["main", "from-include"])
+    }
+
+    @Test("circular Include does not infinite loop")
+    func circularIncludeTerminates() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("sshkit-circular-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let path = tempDir.appendingPathComponent("config")
+        try """
+            Host self
+            Include config
+            """.write(to: path, atomically: true, encoding: .utf8)
+
+        #expect(SSHConfigHosts.listAliases(configPath: path.path) == ["self"])
     }
 }
 
