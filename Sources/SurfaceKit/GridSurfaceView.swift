@@ -112,6 +112,21 @@ public final class GridSurfaceView: NSView {
         }
     }
 
+    /// While a wheel-driven scroll gesture is in motion, hide the cursor and
+    /// suppress its per-flush glyph re-raster and blink restart — off-column-0
+    /// wheel scrolling otherwise hops the cursor in X on every line-length
+    /// change and re-renders it on every landing cell. Keyboard-driven motion
+    /// (`j` at the window edge, `<C-d>`) never notes a wheel timestamp, so it
+    /// is unaffected. Reveals once the cursor's grid settles and stays quiet.
+    public var hidesCursorDuringWheelScroll = true {
+        didSet {
+            guard hidesCursorDuringWheelScroll != oldValue else { return }
+            if !hidesCursorDuringWheelScroll, isCursorHiddenForScroll {
+                revealCursorForScroll()
+            }
+        }
+    }
+
     /// Sublime-style native miniature for each sufficiently large normal
     /// window grid. The app still owns the Neovim resize request; SurfaceKit
     /// waits for the matching grid_resize before exposing the gutter.
@@ -434,6 +449,21 @@ public final class GridSurfaceView: NSView {
     private var cursorCorrection = CriticalDampedSpring(animationLength: 0.040)
     private var cursorCorrectionActive = false
 
+    /// Timestamp of the most recent wheel input noted for any grid, gated by
+    /// the same `tightNative`/`!reducedMotion` policy as the rest of smooth
+    /// motion. Nil means no wheel step is in flight.
+    private var lastWheelInputTimestamp: CFTimeInterval?
+    private var isCursorHiddenForScroll = false
+    private var cursorRevealTask: Task<Void, Never>?
+    /// A display-linked scroll commit for the cursor's grid within this long
+    /// after a wheel step counts as wheel-driven motion. Keyboard-driven
+    /// scroll never notes a wheel timestamp, so it never satisfies this.
+    private static let wheelScrollHideWindow: CFTimeInterval = 0.250
+    /// The cursor's grid must sit idle this long after the last wheel step
+    /// before the cursor reappears, so successive wheel ticks in one gesture
+    /// don't flicker it back on between steps.
+    private static let wheelScrollQuietWindow: CFTimeInterval = 0.120
+
     /// Internal hook used by deterministic tests and opt-in field diagnostics.
     package var scrollDiagnosticHandler: ((ScrollDiagnosticSample) -> Void)?
     private let diagnosticExportURL = ProcessInfo.processInfo.environment[
@@ -474,7 +504,15 @@ public final class GridSurfaceView: NSView {
     /// does not land on a camera that already came to rest. No-op when the
     /// grid is idle, when motion is disabled, or under Reduce Motion.
     public func noteScrollInputPending(gridID: Int) {
+        noteScrollInputPending(gridID: gridID, at: CACurrentMediaTime())
+    }
+
+    /// Timestamp-parameterized entry point used by deterministic tests to
+    /// drive the wheel-recency window without a real wall-clock wait.
+    package func noteScrollInputPending(gridID: Int, at timestamp: CFTimeInterval) {
         guard scrollMotionStyle == .tightNative, !reducedMotion else { return }
+        lastWheelInputTimestamp = timestamp
+        cancelPendingCursorReveal()
         smoothViewports[gridID]?.noteScrollInputPending()
     }
 
@@ -631,9 +669,13 @@ public final class GridSurfaceView: NSView {
         let previousAuthoritativeRow = authoritativeCursorRow
         let previousCursorGrid = authoritativeCursorGrid
         let newCursorOrigin = cursorOrigin(flush)
+        if hidesCursorDuringWheelScroll {
+            updateCursorHiddenForWheelScrollIfNeeded(cursorGrid: flush.cursor.grid)
+        }
         cursorLayer.update(
             flush: flush, cellOrigin: newCursorOrigin,
-            fonts: fonts, cache: rasterizer.cache, scale: scale)
+            fonts: fonts, cache: rasterizer.cache, scale: scale,
+            suppressed: isCursorHiddenForScroll)
         let newAuthoritativeY = cursorLayer.frame.minY
         let cursorState = smoothViewports[flush.cursor.grid]
         let coupledY = newAuthoritativeY - (cursorState?.snappedTranslationY ?? 0)
@@ -681,6 +723,7 @@ public final class GridSurfaceView: NSView {
         cursorCorrectionActive = false
         updateCursorPresentation()
         accessoryCoordinator.settleMotion()
+        evaluateCursorReveal(now: CACurrentMediaTime())
         pauseDisplayLink()
     }
 
@@ -778,6 +821,7 @@ public final class GridSurfaceView: NSView {
         // once, after that final state exists, using the timestamp of the
         // frame this transaction is preparing.
         emitDiagnostics(timestamp: timestamp)
+        evaluateCursorReveal(now: timestamp)
         return wasActive || hasActiveAnimationWork
     }
 
@@ -933,6 +977,73 @@ public final class GridSurfaceView: NSView {
         y = (y * max(1, scale)).rounded() / max(1, scale)
         cursorLayer.setVisualY(y)
         visualCursorY = y
+    }
+
+    /// Enter the wheel-scroll cursor-hide state once a display-linked scroll
+    /// commit lands for the cursor's own grid soon after a wheel step was
+    /// noted. Keyboard-driven commits never note a wheel timestamp, so they
+    /// never satisfy the recency check here.
+    private func updateCursorHiddenForWheelScrollIfNeeded(cursorGrid: Int) {
+        guard !isCursorHiddenForScroll,
+            let lastWheelInputTimestamp,
+            CACurrentMediaTime() - lastWheelInputTimestamp <= Self.wheelScrollHideWindow,
+            smoothViewports[cursorGrid]?.isActive == true
+        else { return }
+        isCursorHiddenForScroll = true
+        cancelPendingCursorReveal()
+    }
+
+    /// Reveal once the cursor's grid is no longer scrolling and the quiet
+    /// window since the last wheel step has elapsed; otherwise schedule a
+    /// one-shot recheck for when it will have elapsed. Called on every
+    /// display-tick (motion end) and whenever motion is force-settled, so a
+    /// display link that pauses before the quiet window elapses still gets
+    /// its cursor back via the scheduled recheck.
+    package func evaluateCursorReveal(now: CFTimeInterval) {
+        guard isCursorHiddenForScroll else { return }
+        guard let authoritativeCursorGrid,
+            smoothViewports[authoritativeCursorGrid]?.isActive != true
+        else { return }
+        guard let lastWheelInputTimestamp else {
+            revealCursorForScroll()
+            return
+        }
+        let elapsed = now - lastWheelInputTimestamp
+        if elapsed >= Self.wheelScrollQuietWindow {
+            revealCursorForScroll()
+        } else {
+            scheduleDelayedCursorReveal(delay: Self.wheelScrollQuietWindow - elapsed)
+        }
+    }
+
+    private func scheduleDelayedCursorReveal(delay: CFTimeInterval) {
+        cursorRevealTask?.cancel()
+        let nanoseconds = UInt64((max(0, delay) * 1_000_000_000).rounded())
+        cursorRevealTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: nanoseconds)
+            guard !Task.isCancelled else { return }
+            self?.evaluateCursorReveal(now: CACurrentMediaTime())
+        }
+    }
+
+    private func cancelPendingCursorReveal() {
+        cursorRevealTask?.cancel()
+        cursorRevealTask = nil
+    }
+
+    /// Fully re-render the cursor (fresh glyph raster, blink restarted at the
+    /// mode's `blinkWait` so it appears solid first) then reposition it —
+    /// mirrors the cursor step of `commit(_:redrawAll:)`.
+    private func revealCursorForScroll() {
+        guard isCursorHiddenForScroll else { return }
+        isCursorHiddenForScroll = false
+        cancelPendingCursorReveal()
+        guard let flush = lastFlush else { return }
+        cursorLayer.invalidate()
+        cursorLayer.update(
+            flush: flush, cellOrigin: cursorOrigin(flush),
+            fonts: fonts, cache: rasterizer.cache, scale: scale)
+        updateCursorPresentation()
     }
 
     private func emitDiagnostics(timestamp: CFTimeInterval) {

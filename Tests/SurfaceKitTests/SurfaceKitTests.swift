@@ -2620,6 +2620,152 @@ extension CursorRenderTests {
     }
 }
 
+// MARK: - Hide the cursor while a wheel scroll gesture is in motion
+
+@MainActor
+private func wheelHideCursorLayer(in view: GridSurfaceView) -> CALayer? {
+    view.layer?.sublayers?.first { $0.zPosition == 10_000 }
+}
+
+/// Standard 10x6 grid with a resting cursor at (row 3, col 2). Shared setup
+/// for the wheel-scroll cursor-hide tests below.
+@MainActor
+private func presentRestingCursor(_ view: GridSurfaceView, _ store: GridStore) {
+    view.present(flush(store, [
+        .gridResize(grid: 1, width: 10, height: 6),
+        line(0, "aaaaaaaaaa", hl: 0), line(1, "bbbbbbbbbb", hl: 0),
+        line(2, "cccccccccc", hl: 0), line(3, "dddddddddd", hl: 0),
+        line(4, "eeeeeeeeee", hl: 0), line(5, "ffffffffff", hl: 0),
+        .gridCursorGoto(grid: 1, row: 3, col: 2),
+        .winViewport(
+            grid: 1, win: 10, topline: 0, botline: 6,
+            curline: 3, curcol: 2, lineCount: 100, scrollDelta: 0),
+    ]))
+}
+
+/// One display-linked one-row scroll, moving the authoritative cursor to
+/// (row 2, col 2). Shared by both the wheel- and keyboard-driven variants —
+/// only whether `noteScrollInputPending` was called beforehand differs.
+@MainActor
+private func presentOneRowScrollStep(_ view: GridSurfaceView, _ store: GridStore) {
+    view.present(flush(store, [
+        .gridScroll(
+            grid: 1, top: 0, bottom: 6, left: 0, right: 10, rows: 1, cols: 0),
+        line(5, "zzzzzzzzzz", hl: 0),
+        .gridCursorGoto(grid: 1, row: 2, col: 2),
+        .winViewport(
+            grid: 1, win: 10, topline: 1, botline: 7,
+            curline: 3, curcol: 2, lineCount: 100, scrollDelta: 1),
+    ]))
+}
+
+@MainActor
+@Suite struct CursorWheelScrollHideTests {
+    @Test func wheelNotedScrollCommitHidesTheCursor() {
+        let view = GridSurfaceView(
+            frame: NSRect(x: 0, y: 0, width: 600, height: 400), font: menlo)
+        let store = GridStore()
+        presentRestingCursor(view, store)
+        guard let cursor = wheelHideCursorLayer(in: view) else {
+            Issue.record("cursor layer missing")
+            return
+        }
+        #expect(!cursor.isHidden, "cursor is visible before any scroll begins")
+
+        view.noteScrollInputPending(gridID: 1)
+        presentOneRowScrollStep(view, store)
+        #expect(cursor.isHidden,
+                "a display-linked scroll commit for the cursor's grid, noted as wheel input, must hide the cursor while it is in motion")
+    }
+
+    @Test func cursorReappearsOnceMotionSettlesAndTheQuietWindowElapses() {
+        let view = GridSurfaceView(
+            frame: NSRect(x: 0, y: 0, width: 600, height: 400), font: menlo)
+        let store = GridStore()
+        presentRestingCursor(view, store)
+
+        // The hide-entry check in `commit(_:redrawAll:)` compares the wheel
+        // timestamp against the real wall clock (`present` has no timestamp
+        // parameter), so anchor this test's synthetic timeline to it — only
+        // the later display-tick timestamps fed to `advanceAnimations` need
+        // to be deterministic relative to that anchor.
+        let t0 = CACurrentMediaTime()
+        view.noteScrollInputPending(gridID: 1, at: t0)
+        presentOneRowScrollStep(view, store)
+
+        guard let cursor = wheelHideCursorLayer(in: view) else {
+            Issue.record("cursor layer missing")
+            return
+        }
+        #expect(cursor.isHidden)
+
+        var t = t0
+        for _ in 0..<240 where !view.animationsAreIdle {
+            t += 1.0 / 120.0
+            _ = view.advanceAnimations(
+                by: 1.0 / 120.0, nominalDisplayPeriod: 1.0 / 120.0, timestamp: t)
+        }
+        #expect(view.animationsAreIdle, "motion must have settled within the test's budget")
+        #expect(!cursor.isHidden,
+                "the cursor must reappear once its grid settles and the post-wheel quiet window has elapsed")
+        let expectedY = 2 * view.cellSize.height
+        #expect(abs(cursor.frame.minY - expectedY) <= 0.5,
+                "the revealed layer's frame must match the authoritative cursor cell")
+    }
+
+    @Test func keyboardDrivenScrollCommitNeverHidesTheCursor() {
+        let view = GridSurfaceView(
+            frame: NSRect(x: 0, y: 0, width: 600, height: 400), font: menlo)
+        let store = GridStore()
+        presentRestingCursor(view, store)
+
+        // No `noteScrollInputPending` call — this models `j` at the window
+        // edge or `<C-d>`, which never notes a wheel timestamp.
+        presentOneRowScrollStep(view, store)
+
+        guard let cursor = wheelHideCursorLayer(in: view) else {
+            Issue.record("cursor layer missing")
+            return
+        }
+        #expect(!view.animationsAreIdle,
+                "sanity: the grid is animating just like a wheel scroll would")
+        #expect(!cursor.isHidden, "keyboard-driven motion must never hide the cursor")
+    }
+
+    @Test func disablingTheFeatureNeverHidesTheCursor() {
+        let view = GridSurfaceView(
+            frame: NSRect(x: 0, y: 0, width: 600, height: 400), font: menlo)
+        view.hidesCursorDuringWheelScroll = false
+        let store = GridStore()
+        presentRestingCursor(view, store)
+
+        view.noteScrollInputPending(gridID: 1)
+        presentOneRowScrollStep(view, store)
+
+        guard let cursor = wheelHideCursorLayer(in: view) else {
+            Issue.record("cursor layer missing")
+            return
+        }
+        #expect(!cursor.isHidden,
+                "hidesCursorDuringWheelScroll == false must preserve today's behaviour")
+    }
+
+    @Test func busyFlushStillHidesTheCursorRegardlessOfWheelState() {
+        let view = GridSurfaceView(
+            frame: NSRect(x: 0, y: 0, width: 600, height: 400), font: menlo)
+        let store = GridStore()
+        presentRestingCursor(view, store)
+        guard let cursor = wheelHideCursorLayer(in: view) else {
+            Issue.record("cursor layer missing")
+            return
+        }
+        #expect(!cursor.isHidden)
+
+        view.present(flush(store, [.busyStart]))
+        #expect(cursor.isHidden, "flush.isBusy must hide the cursor regardless of wheel state")
+    }
+}
+
 // MARK: - Powerline glyph synthesis (any font, no patching)
 
 @MainActor

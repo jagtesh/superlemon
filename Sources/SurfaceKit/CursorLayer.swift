@@ -46,11 +46,20 @@ final class CursorLayer: CALayer {
 
     /// Reposition/restyle for one flush. `cellOrigin` is the cursor cell's
     /// top-left in view coordinates (multigrid frame already applied).
+    ///
+    /// `suppressed` skips the expensive glyph raster and blink restart while
+    /// a wheel-driven scroll gesture is in motion (GridSurfaceView hides the
+    /// layer for the duration) but still recomputes `frame`, so the host's
+    /// authoritative-Y bookkeeping stays correct throughout. It deliberately
+    /// leaves `lastStyleSignature`/`lastBlinkSignature` untouched — the next
+    /// unsuppressed call must not think nothing changed. `invalidate()`
+    /// forces that next call to re-render and restart the blink even when
+    /// the underlying style/position genuinely didn't change while hidden.
     func update(
         flush: FlushResult, cellOrigin: CGPoint,
-        fonts: FontSet, cache: GlyphCache, scale: CGFloat
+        fonts: FontSet, cache: GlyphCache, scale: CGFloat, suppressed: Bool = false
     ) {
-        isHidden = flush.isBusy
+        isHidden = flush.isBusy || suppressed
         guard !flush.isBusy else {
             lastBlinkSignature = nil
             return
@@ -60,6 +69,26 @@ final class CursorLayer: CALayer {
         let ch = fonts.cellSize.height
         let mode = flush.mode
         let pct = CGFloat(max(1, min(100, mode?.cellPercentage ?? 100))) / 100
+        let isWide = flush.grids[flush.cursor.grid]?
+            .isDoubleWidth(row: flush.cursor.row, col: flush.cursor.col) ?? false
+        let blockWidth = isWide ? cw * 2 : cw
+        let shape = mode?.cursorShape ?? .block
+
+        // Position/size always reflect the current cell, suppressed or not,
+        // so the host's authoritative-Y bookkeeping never goes stale.
+        switch shape {
+        case .vertical:
+            frame = CGRect(x: cellOrigin.x, y: cellOrigin.y,
+                           width: max(1, cw * pct), height: ch)
+        case .horizontal:
+            let h = max(1, ch * pct)
+            frame = CGRect(x: cellOrigin.x, y: cellOrigin.y + ch - h,
+                           width: cw, height: h)
+        case .block:
+            frame = CGRect(x: cellOrigin.x, y: cellOrigin.y, width: blockWidth, height: ch)
+        }
+
+        guard !suppressed else { return }
 
         // Colors: mode attr 0 means "reverse the cell underneath"; a concrete
         // attr id supplies its own colors (already reverse-folded by resolve).
@@ -73,9 +102,6 @@ final class CursorLayer: CALayer {
             guard let cell else { return flush.highlights.resolved(id: 0) }
             return flush.highlights.resolved(id: cell.hlID)
         }()
-        let isWide = flush.grids[flush.cursor.grid]?
-            .isDoubleWidth(row: flush.cursor.row, col: flush.cursor.col) ?? false
-        let blockWidth = isWide ? cw * 2 : cw
         let attrID = mode?.attrID ?? 0
         let modeAttrs = attrID == 0 ? nil : flush.highlights.resolved(id: attrID)
         let fill: NvimKit.RGBColor
@@ -101,21 +127,10 @@ final class CursorLayer: CALayer {
             contentsScale = scale
         }
 
-        switch mode?.cursorShape ?? .block {
-        case .vertical:
-            frame = CGRect(x: cellOrigin.x, y: cellOrigin.y,
-                           width: max(1, cw * pct), height: ch)
-        case .horizontal:
-            let h = max(1, ch * pct)
-            frame = CGRect(x: cellOrigin.x, y: cellOrigin.y + ch - h,
-                           width: cw, height: h)
-        case .block:
-            frame = CGRect(x: cellOrigin.x, y: cellOrigin.y, width: blockWidth, height: ch)
-            if styleChanged {
-                renderBlockGlyph(
-                    flush: flush, glyphColor: glyphColor, fill: fill,
-                    fonts: fonts, cache: cache, scale: scale, isWide: isWide)
-            }
+        if shape == .block, styleChanged {
+            renderBlockGlyph(
+                flush: flush, glyphColor: glyphColor, fill: fill,
+                fonts: fonts, cache: cache, scale: scale, isWide: isWide)
         }
         lastStyleSignature = styleSignature
 
@@ -131,6 +146,15 @@ final class CursorLayer: CALayer {
             updateBlink(mode)
             lastBlinkSignature = blinkSignature
         }
+    }
+
+    /// Force the next `update(...)` call to re-render the glyph and restart
+    /// the blink animation even if the style/position it computes turns out
+    /// identical to what was last drawn (e.g. nothing changed while a
+    /// suppressed update kept this layer hidden during a wheel scroll).
+    func invalidate() {
+        lastStyleSignature = nil
+        lastBlinkSignature = nil
     }
 
     /// Display-link cursor motion only changes position. It never recreates
