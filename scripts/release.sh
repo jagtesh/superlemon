@@ -2,13 +2,32 @@
 set -euo pipefail
 
 root=${0:A:h:h}
-version=${1:-}
+arg=${1:-}
 
-if [[ ! "$version" =~ '^[0-9]+\.[0-9]+\.[0-9]+$' ]]; then
-  echo "usage: scripts/release.sh <version>"
-  echo "example: scripts/release.sh 0.2.0"
-  exit 2
-fi
+usage() {
+  echo "usage: scripts/release.sh [minor|major|X.Y.Z]"
+  echo "with no argument, bumps the patch version automatically"
+  echo "examples:"
+  echo "  scripts/release.sh          # e.g. 0.1.4 -> 0.1.5"
+  echo "  scripts/release.sh minor    # e.g. 0.1.4 -> 0.2.0"
+  echo "  scripts/release.sh major    # e.g. 0.1.4 -> 1.0.0"
+  echo "  scripts/release.sh 0.2.0    # explicit version"
+}
+
+bump=""
+explicit_version=""
+case "$arg" in
+  '') bump="patch" ;;
+  minor | major) bump="$arg" ;;
+  *)
+    if [[ "$arg" =~ '^[0-9]+\.[0-9]+\.[0-9]+$' ]]; then
+      explicit_version="$arg"
+    else
+      usage
+      exit 2
+    fi
+    ;;
+esac
 
 cd "$root"
 
@@ -31,6 +50,12 @@ if [[ $(git rev-parse HEAD) != $(git rev-parse origin/main) ]]; then
   exit 1
 fi
 
+if [[ -n "$explicit_version" ]]; then
+  version="$explicit_version"
+else
+  version=$("$root/scripts/version.sh" next "$bump")
+fi
+
 tag="v$version"
 if git rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
   echo "$tag already exists"
@@ -51,16 +76,19 @@ if [[ -n "$latest_tag" ]]; then
   fi
 fi
 
-/usr/libexec/PlistBuddy -c \
-  "Set :CFBundleShortVersionString $version" packaging/Info.plist
-/usr/libexec/PlistBuddy -c \
-  "Set :CFBundleVersion $(( $(git rev-list --count HEAD) + 1 ))" packaging/Info.plist
+# packaging/Info.plist deliberately stays at a placeholder version
+# (0.0.0 / 0). The real per-build version is stamped into the *built app
+# bundle* by scripts/package-app.sh, derived from scripts/version.sh, which
+# reads git tags/history — not this checked-in template. Editing the repo
+# plist here would just be a version nobody ever ships.
+echo "$version" >"$root/VERSION"
 
-git add packaging/Info.plist
+git add VERSION
 git commit -m "Release $tag"
 git tag -a "$tag" -m "Superlemon $version"
 git push --atomic origin HEAD:main "refs/tags/$tag"
 
+echo "Released $tag"
 echo "Release build started: https://github.com/jagtesh/superlemon/actions"
 echo "After it completes, publish the source-build Homebrew formula with:"
 echo "  scripts/publish-homebrew-formula.sh $version"

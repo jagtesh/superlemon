@@ -64,6 +64,28 @@ xcrun actool "$root/packaging/Assets.xcassets" \
   --output-partial-info-plist "$asset_info"
 
 /usr/libexec/PlistBuddy -c "Merge $asset_info" "$contents/Info.plist"
+
+# Stamp the *bundle's* Info.plist with the real version, derived from git.
+# packaging/Info.plist itself stays at a placeholder — see scripts/release.sh.
+marketing_version=$("$root/scripts/version.sh" marketing)
+build_number=$("$root/scripts/version.sh" build)
+semver=$("$root/scripts/version.sh" semver)
+commit=$("$root/scripts/version.sh" commit)
+
+plist_set_or_add() {
+  local key=$1 type=$2 value=$3
+  if /usr/libexec/PlistBuddy -c "Print :$key" "$contents/Info.plist" >/dev/null 2>&1; then
+    /usr/libexec/PlistBuddy -c "Set :$key $value" "$contents/Info.plist"
+  else
+    /usr/libexec/PlistBuddy -c "Add :$key $type $value" "$contents/Info.plist"
+  fi
+}
+plist_set_or_add CFBundleShortVersionString string "$marketing_version"
+plist_set_or_add CFBundleVersion string "$build_number"
+plist_set_or_add SuperlemonVersion string "$semver"
+plist_set_or_add SuperlemonCommit string "$commit"
+
 "$root/scripts/sign-app.sh" "$app"
 "$root/scripts/verify-package.sh" "$app"
+echo "Superlemon $semver (build $build_number, $commit)"
 echo "$app"

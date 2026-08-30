@@ -59,12 +59,32 @@ swift build
 Superlemon opens the current directory as its workspace. Press `⌘P` for Quick
 Open, `⌘O` to open a file, and `⇧⌘O` to switch folders.
 
-To build a native application bundle with the system-managed macOS icon:
+To build a native application bundle with the system-managed macOS icon and
+install it to `/Applications`, replacing and relaunching any running copy:
 
 ```sh
-scripts/package-app.sh
-open dist/Superlemon.app
+scripts/publish-local.sh
 ```
+
+Pass `--dry-run` to build and verify without touching `/Applications`, or run
+`scripts/package-app.sh` directly if you only want the bundle at
+`dist/Superlemon.app` without installing it.
+
+### Versioning
+
+Superlemon's version is derived from git, not typed in by hand. Every build
+reads `scripts/version.sh`, which looks at the latest `vX.Y.Z` tag and how far
+HEAD has moved past it:
+
+- At a clean tagged commit, the version is the tag itself, e.g. `0.1.4`.
+- Otherwise it's the next patch version plus a dev suffix, e.g.
+  `0.1.5-dev.17` (with `.dirty` appended if the working tree has
+  uncommitted changes). This is what Superlemon shows for local and CI
+  builds.
+
+`scripts/release.sh` needs no argument — it bumps the patch version
+automatically. Pass `minor` or `major` to bump those instead, or an explicit
+`X.Y.Z` to override.
 
 ## Configure
 
@@ -118,14 +138,17 @@ repository-level, `gui-acceptance`, or `release-acceptance` secrets.
 To create a versioned GitHub Release from a clean, up-to-date `main` branch:
 
 ```sh
-scripts/release.sh 0.2.0
+scripts/release.sh
 ```
 
-The command updates the application version, creates the release commit and
-`v0.2.0` tag, and pushes them atomically. GitHub Actions tests the tagged source,
-signs the exact tested app with Developer ID, notarizes and staples it, and
-attaches the arm64 archive plus SHA-256 to the corresponding GitHub Release.
-Once the release workflow completes, publish its checksum-pinned source formula:
+With no argument this bumps the patch version automatically (see
+[Versioning](#versioning) above); pass `minor`, `major`, or an explicit
+`X.Y.Z` to choose a different version. The command records the version,
+creates the release commit and tag, and pushes them atomically. GitHub
+Actions tests the tagged source, signs the exact tested app with Developer
+ID, notarizes and staples it, and attaches the arm64 archive plus SHA-256 to
+the corresponding GitHub Release. Once the release workflow completes,
+publish its checksum-pinned source formula:
 
 ```sh
 scripts/publish-homebrew-formula.sh 0.2.0
