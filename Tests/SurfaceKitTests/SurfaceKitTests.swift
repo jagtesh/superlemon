@@ -955,33 +955,167 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
             - state.follower.stiffness.squareRoot()) < 0.000_001)
     }
 
-    @Test func noteScrollInputPendingIsANoOpUntilPhase4Prediction() {
-        let host = CALayer()
+    // MARK: - `noteScrollInput` (Phase 4: predict ahead, reconcile on arrival)
+    //
+    // "Quantize ahead, render behind" (docs/research/scroll-camera.md): the
+    // host's `InputKit.WheelGesture` requests rows from nvim as soon as the
+    // finger enters them, running up to one row ahead of the finger. The
+    // follower's `target` tracks the clamped predicted offset —
+    // `gestureInputRows - confirmedRows` — so the camera renders the
+    // fractional finger position over rows nvim has already confirmed, never
+    // a row it doesn't have.
+
+    /// A fresh 6x10 grid, seeded and idle, for the `noteScrollInput` tests.
+    private func idleState(gridID: Int, host: CALayer) -> SmoothViewportState {
         let image = solidImage(width: 80, height: 96)
-        let state = SmoothViewportState(gridID: 23)
+        let state = SmoothViewportState(gridID: gridID)
         _ = state.present(
             image: image, rows: 6, cols: 10, margins: nil, scrolls: [],
             semanticDelta: nil, cellSize: cellSize, scale: 1, host: host,
-            animate: true, arrivalTimestamp: 10.0)
-        _ = presentOneRowStep(state, image: image, host: host, at: 10.0)
-        for _ in 0..<10 { _ = state.advance(by: 1.0 / 120.0) }
+            animate: true)
+        return state
+    }
 
-        // Phase 4 will retarget the follower toward a predicted offset while
-        // a wheel step's authoritative response is in flight; until then the
-        // hook GridSurfaceView calls on every wheel step is wired but inert.
-        let positionBefore = state.position
-        let velocityBefore = state.velocity
-        let wasActive = state.isActive
-        state.noteScrollInputPending()
-        #expect(state.position == positionBefore)
-        #expect(state.velocity == velocityBefore)
-        #expect(state.isActive == wasActive)
+    /// One 1-row-down scroll arrival against a 6x10 grid.
+    private func presentOneRowDownArrival(
+        _ state: SmoothViewportState, host: CALayer
+    ) -> Bool {
+        state.present(
+            image: solidImage(width: 80, height: 96), rows: 6, cols: 10,
+            margins: nil,
+            scrolls: [ScrollDelta(top: 0, bottom: 6, left: 0, right: 10, rows: 1, cols: 0)],
+            semanticDelta: 1, cellSize: cellSize, scale: 1, host: host, animate: true)
+    }
+
+    @Test func targetWaitsAtZeroThenTracksTheConfirmedFraction() {
+        let host = CALayer()
+        let state = idleState(gridID: 23, host: host)
+
+        // The finger has moved 0.3 rows down; `WheelGesture` requests the
+        // next row (`ceil(0.3) == 1`), but nvim has not confirmed it yet:
+        // the camera must wait at the origin rather than expose a row it
+        // does not have.
+        state.noteScrollInput(inputRows: 0.3, requestedRows: 1, gestureOpen: true)
+        #expect(state.follower.target == 0)
+        #expect(state.position == 0)
+        #expect(!state.isActive)
+
+        // nvim confirms the requested row. The arrival retargets `position`
+        // by -1 (the previous picture, in the new coordinate frame) while
+        // the predicted target becomes -0.7: the content has moved 0.3 of
+        // the finger's 0.3-row travel into the newly confirmed row.
+        #expect(presentOneRowDownArrival(state, host: host))
+        #expect(abs(state.follower.target - (-0.7)) < 0.000_001)
+        #expect(state.position == -1)
+
+        // The follower must glide monotonically from -1 up toward -0.7,
+        // never overshooting past it and never reversing direction.
+        var previous = state.position
+        for _ in 0..<240 where state.isActive {
+            _ = state.advance(by: 1.0 / 120.0)
+            #expect(state.velocity >= -0.000_001)
+            #expect(state.position >= previous - 0.000_001)
+            #expect(state.position <= -0.7 + 0.000_001)
+            previous = state.position
+        }
+        #expect(!state.isActive)
+        #expect(abs(state.position - (-0.7)) < 0.000_001)
+    }
+
+    @Test func slowFingerAdvancesInSmallStepsNeverAWholeRow() {
+        let host = CALayer()
+        let state = idleState(gridID: 24, host: host)
+
+        var inputRows = 0.0
+        var previousPosition: CGFloat = 0
+        for step in 0..<10 {
+            inputRows += 0.1
+            let requested = Int(inputRows.rounded(.up))
+            state.noteScrollInput(inputRows: inputRows, requestedRows: requested, gestureOpen: true)
+
+            if step == 0 {
+                // The single row this slow gesture ever requests is
+                // confirmed right after the first input.
+                #expect(presentOneRowDownArrival(state, host: host))
+            }
+            for _ in 0..<20 where state.isActive {
+                _ = state.advance(by: 1.0 / 120.0)
+            }
+
+            let jump = abs(state.position - previousPosition)
+            #expect(jump < 0.99, "the camera must never step by a whole row at once")
+            previousPosition = state.position
+        }
+        // Ten 0.1-row inputs against one confirmed row: the camera ends
+        // almost exactly caught up (target -> 0 as inputRows -> 1).
+        #expect(abs(state.position) < 0.05)
+    }
+
+    @Test func bufferEdgeNeverPredictsAheadWithoutConfirmation() {
+        let host = CALayer()
+        let state = idleState(gridID: 25, host: host)
+
+        // nvim ignores every step (e.g. already at the last line): no
+        // arrival ever lands, so the target — and the camera — must stay
+        // pinned at the origin no matter how far the finger travels.
+        var inputRows = 0.0
+        for _ in 0..<20 {
+            inputRows += 0.3
+            let requested = Int(inputRows.rounded(.up))
+            state.noteScrollInput(inputRows: inputRows, requestedRows: requested, gestureOpen: true)
+            #expect(state.follower.target == 0)
+            #expect(state.position == 0)
+            #expect(!state.isActive)
+        }
+    }
+
+    @Test func gestureEndTargetsZeroAndGlidesToASettle() {
+        let host = CALayer()
+        let state = idleState(gridID: 26, host: host)
+
+        state.noteScrollInput(inputRows: 0.3, requestedRows: 1, gestureOpen: true)
+        #expect(presentOneRowDownArrival(state, host: host))
+        #expect(abs(state.follower.target - (-0.7)) < 0.000_001)
+
+        // The finger lifts mid-row: `WheelGesture` finalizes (`inputRows`
+        // snaps to `requestedRows == 1`) and reports the gesture closed.
+        state.noteScrollInput(inputRows: 1, requestedRows: 1, gestureOpen: false)
+        #expect(state.follower.target == 0)
+        #expect(state.isActive, "ending must glide the remaining fraction, not jump")
 
         for _ in 0..<240 where state.isActive {
             _ = state.advance(by: 1.0 / 120.0)
         }
         #expect(!state.isActive)
         #expect(state.position == 0)
+    }
+
+    @Test func trueFarCutResetsTheGestureCounters() {
+        let host = CALayer()
+        let state = idleState(gridID: 27, host: host)
+
+        state.noteScrollInput(inputRows: 0.3, requestedRows: 1, gestureOpen: true)
+        #expect(presentOneRowDownArrival(state, host: host))
+        #expect(state.confirmedRows == 1)
+
+        // Let the follower fully settle so the next big jump reads as an
+        // isolated far cut (`!follower.isActive`) rather than sustained
+        // wheel backlog.
+        for _ in 0..<240 where state.isActive {
+            _ = state.advance(by: 1.0 / 120.0)
+        }
+        #expect(!state.isActive)
+
+        // An unrelated far jump (e.g. `G`), not from the wheel: seven
+        // rotated rows on a six-row inner viewport is a teleport cut.
+        let started = state.present(
+            image: solidImage(width: 80, height: 96), rows: 6, cols: 10,
+            margins: nil,
+            scrolls: [ScrollDelta(top: 0, bottom: 6, left: 0, right: 10, rows: 7, cols: 0)],
+            semanticDelta: 7, cellSize: cellSize, scale: 1, host: host, animate: true)
+        #expect(started)
+        #expect(state.confirmedRows == 0)
+        #expect(state.follower.target == 0)
     }
 
     @Test func idleGapsAndUntimestampedPresentsLeaveTheCadenceUntouched() {

@@ -54,10 +54,11 @@ struct CriticalDampedSpring: Equatable {
 /// State is in ROWS. `position` is the visual offset of the retained
 /// filmstrip relative to the authoritative viewport, using the same sign
 /// convention as the previous `motion.position`: an arrival of
-/// `animatedDelta` rows adds `-animatedDelta`. `target` is always zero in
-/// this phase — a future phase retargets it to the unacknowledged predicted
-/// offset instead of the origin, so the field is kept real rather than
-/// assumed to be zero throughout.
+/// `animatedDelta` rows adds `-animatedDelta`. `target` is zero whenever no
+/// wheel gesture is predicting ahead of nvim's confirmation (all of this
+/// file's direct-`present` tests, and the resting state between gestures);
+/// `SmoothViewportState` retargets it to the clamped predicted offset while
+/// a gesture is open and running ahead — see `clampedTarget()`.
 struct ScrollFollower: Equatable {
     /// Soft-start stiffness (s⁻²): the first movement-carrying arrival, or
     /// any arrival far enough from the previous one to read as a fresh
@@ -113,7 +114,12 @@ struct ScrollFollower: Equatable {
     private var current = State()
     private var accumulator: CFTimeInterval = 0
 
-    /// Always zero in this phase; see the type-level doc comment.
+    /// The follower's current aim point, in rows. Zero is "camera exactly on
+    /// the authoritative viewport" (today's behaviour whenever no wheel
+    /// gesture is in flight). While a gesture is open and running ahead of
+    /// nvim's confirmation, `SmoothViewportState` retargets this to the
+    /// clamped predicted offset so the glide continues toward the finger
+    /// instead of the origin; see `SmoothViewportState.clampedTarget()`.
     var target: CGFloat = 0
     private(set) var stiffness: Double = ScrollFollower.softStartStiffness
     /// Peak-hold-with-decay estimate of the gap between scroll-frame
@@ -407,6 +413,20 @@ final class SmoothViewportState {
     private(set) var follower = ScrollFollower()
     private(set) var isActive = false
     private(set) var lastSemanticDelta = 0
+    /// Cumulative animated arrival rows for the currently open wheel
+    /// gesture, same sign convention as `gestureInputRows` (down positive).
+    /// Rebased to zero when a gesture opens (`noteScrollInput`); incremented
+    /// by `animatedDelta` on every non-far arrival (`rotateForNewViewport`);
+    /// reset by an isolated far-jump cut, which did not come from the wheel.
+    private(set) var confirmedRows = 0
+    /// The open wheel gesture's own bookkeeping, mirrored from
+    /// `InputKit.WheelGesture` by `noteScrollInput`. `gestureIsOpen` is
+    /// tracked separately from the incoming `gestureOpen` flag so a
+    /// transition into "open" (not just "is open") can be detected, which is
+    /// what triggers the `confirmedRows` rebase.
+    private var gestureInputRows: Double = 0
+    private var gestureRequestedRows = 0
+    private var gestureIsOpen = false
     /// Peak-hold-with-decay estimate of the gap between scroll-frame
     /// arrivals. Zero until two movement-carrying frames arrive within one
     /// gesture window of each other. Feeds `follower.estimatedArrivalGap`,
@@ -651,6 +671,20 @@ final class SmoothViewportState {
     }
 
     func settle() {
+        // A hard settle (an atomic/Reduce-Motion frame, a layout change, or
+        // teardown) abandons any in-flight prediction along with the visual
+        // tail: reset the target before `follower.settle()` snaps `position`
+        // to it, so a nonzero predicted target left over from an open
+        // gesture cannot strand the camera off the authoritative viewport.
+        // If the gesture is still physically open, the very next
+        // `noteScrollInput` call re-syncs from the real `WheelGesture`
+        // state and rebases `confirmedRows` to the (now-authoritative)
+        // present picture.
+        gestureInputRows = 0
+        gestureRequestedRows = 0
+        gestureIsOpen = false
+        confirmedRows = 0
+        follower.target = 0
         follower.settle()
         isActive = false
         lastSemanticDelta = 0
@@ -700,14 +734,51 @@ final class SmoothViewportState {
             stiffness: follower.stiffness)
     }
 
-    /// The host reports a wheel step it just sent whose authoritative
-    /// response has not arrived. Kept for source compatibility with
-    /// `GridSurfaceView`'s wheel bookkeeping, which calls this on every
-    /// wheel step; intentionally inert for now. A future phase will use the
-    /// pending step to retarget the follower toward the predicted offset
-    /// while the round trip is in flight, instead of stretching a residual's
-    /// duration as the previous design did.
-    func noteScrollInputPending() {}
+    /// The host reports the latest state of the open (or just-closed) wheel
+    /// gesture for this grid, mirroring `InputKit.WheelGesture`'s own
+    /// counters after every wheel sample. Moves the follower's `target`
+    /// ahead of the origin to the clamped predicted offset so the camera
+    /// runs ahead of nvim's confirmation instead of waiting for it —
+    /// "quantize ahead, render behind" (docs/research/scroll-camera.md).
+    ///
+    /// - Parameters:
+    ///   - inputRows: cumulative fractional finger travel this gesture, rows
+    ///     down positive (`WheelGesture.inputRows`).
+    ///   - requestedRows: cumulative whole rows requested from nvim this
+    ///     gesture (`WheelGesture.requestedRows`).
+    ///   - gestureOpen: `WheelGesture.isOpen`. `false` means the gesture just
+    ///     finalized (finger lifted, or momentum ended): the target snaps to
+    ///     zero and the follower glides the remaining fraction — the only
+    ///     "snap", and it is a glide, not a jump.
+    func noteScrollInput(inputRows: Double, requestedRows: Int, gestureOpen: Bool) {
+        if gestureOpen, !gestureIsOpen {
+            // A fresh gesture starts predicting from here: forget whatever
+            // arrival history accumulated (or never rebased) up to now.
+            confirmedRows = 0
+        }
+        gestureIsOpen = gestureOpen
+        gestureInputRows = inputRows
+        gestureRequestedRows = requestedRows
+        follower.target = gestureOpen ? clampedTarget() : 0
+    }
+
+    /// The predicted camera offset while a wheel gesture is open, clamped so
+    /// the camera never exposes a row nvim has not confirmed:
+    /// `raw = gestureInputRows - confirmedRows` is the finger's travel past
+    /// what has been confirmed so far. Clamped toward the gesture's own
+    /// direction (down: `target <= 0`; up: `target >= 0`) and to
+    /// `±innerRows`, the retained-filmstrip bound. Zero whenever nothing is
+    /// requested, or the finger's travel has been fully confirmed (today's
+    /// behaviour).
+    private func clampedTarget() -> CGFloat {
+        let raw = CGFloat(gestureInputRows) - CGFloat(confirmedRows)
+        let bound = CGFloat(geometry.innerRows)
+        switch gestureRequestedRows.signum() {
+        case 1: return max(-bound, min(0, raw))
+        case -1: return min(bound, max(0, raw))
+        default: return 0
+        }
+    }
 
     /// Fold one movement-carrying arrival into both the peak-hold cadence
     /// estimate (which only caps the follower's settle horizon on
@@ -747,10 +818,23 @@ final class SmoothViewportState {
 
         if trueFar, !follower.isActive {
             // An isolated far jump stays a cut: teleport with a one-row cue.
+            // This did not come from the wheel (a mid-gesture jump this far
+            // takes the sustained-backlog path below, since the follower is
+            // already active), so any open gesture's prediction is stale:
+            // reset it rather than let a resumed gesture predict against a
+            // confirmedRows baseline from before the cut.
+            gestureInputRows = 0
+            gestureRequestedRows = 0
+            gestureIsOpen = false
+            confirmedRows = 0
             discardNonCurrentHistory()
             guard copyDisplacedRows(for: direction) else { return false }
             history.rotate(by: direction)
             shiftFilmstripSlots(by: -direction)
+            // Reset the target to zero before settling so a stale nonzero
+            // prediction target (left over from before the cut) does not
+            // leave the settle at a nonzero position.
+            follower.target = 0
             follower.settle()
             follower.retarget(byRows: -CGFloat(direction), bound: CGFloat(height))
             return true
@@ -763,6 +847,16 @@ final class SmoothViewportState {
         guard copyDisplacedRows(for: animatedDelta) else { return false }
         history.rotate(by: animatedDelta)
         shiftFilmstripSlots(by: -animatedDelta)
+
+        // This arrival confirms `animatedDelta` more rows of the open
+        // gesture's prediction (a no-op when no gesture is open, since
+        // `clampedTarget()` is zero whenever `gestureRequestedRows == 0`).
+        // Recompute the target from the updated `confirmedRows` *before*
+        // retargeting: the retarget moves `position` by `-animatedDelta` and
+        // the target moves by the same amount at the same time, so the
+        // visual picture stays continuous even though both jump.
+        confirmedRows += animatedDelta
+        follower.target = clampedTarget()
 
         // The follower's own ±height retarget clamp replaces the previous
         // two-regime split (a fixed-duration envelope while capacity

@@ -21,7 +21,23 @@ public final class InputHostView: NSView, @preconcurrency NSTextInputClient, NSM
 
     private let keyTranslator = KeyTranslator()
     private let mouseTranslator = MouseTranslator()
+    /// Horizontal-axis-only now: `WheelGesture` (below) owns the vertical
+    /// axis's quantize-ahead prediction (docs/research/scroll-camera.md).
     private var scrollAccumulator = ScrollAccumulator()
+    /// The trackpad/wheel gesture in progress for `scrollWheel`, keyed to the
+    /// grid under the pointer when it opened.
+    private var wheelGesture = WheelGesture()
+    private var wheelGestureGridID: Int?
+    /// The accessory (minimap/scroller) gesture in progress for
+    /// `handleAccessoryWheel`. AppKit gives these views no phases, so each
+    /// call reads as `.changed` of an open gesture; `accessoryWheelFinalizeTask`
+    /// closes it after a quiet period instead.
+    private var accessoryWheelGesture = WheelGesture()
+    private var accessoryWheelGridID: Int?
+    private var accessoryWheelFinalizeTask: Task<Void, Never>?
+    /// How long an accessory wheel gesture may go quiet before it is treated
+    /// as finished, since these views deliver no `.ended`/momentum phases.
+    private static let accessoryWheelStalenessInterval: TimeInterval = 0.250
 
     /// A small, coherent text-storage window for the active composition. The
     /// actual Neovim buffer is deliberately not mirrored: ordinary committed
@@ -498,37 +514,122 @@ public final class InputHostView: NSView, @preconcurrency NSTextInputClient, NSM
 
     public override func scrollWheel(with event: NSEvent) {
         guard let controller, controller.isMouseEnabled else { return }
-        let steps = scrollAccumulator.accumulate(
-            deltaX: event.scrollingDeltaX,
-            deltaY: event.scrollingDeltaY,
-            cellWidth: surface.cellSize.width,
-            cellHeight: surface.cellSize.height,
-            isPrecise: event.hasPreciseScrollingDeltas)
-        guard !steps.isEmpty, let cell = cellUnderPointer(event) else { return }
+        guard let cell = cellUnderPointer(event) else { return }
+
+        if let wheelGestureGridID, wheelGestureGridID != cell.grid {
+            // The pointer moved to a different grid mid-gesture: the old
+            // grid's gesture gets no more samples, so close it out now
+            // rather than leave its follower predicting forever.
+            finalizeWheelGesture(gridID: wheelGestureGridID)
+        }
+        wheelGestureGridID = cell.grid
+
         let modifiers = Modifiers(rawValue: event.modifierFlags.rawValue)
-        emitWheel(.up, count: steps.up, modifiers: modifiers, cell: cell)
-        emitWheel(.down, count: steps.down, modifiers: modifiers, cell: cell)
-        emitWheel(.left, count: steps.left, modifiers: modifiers, cell: cell)
-        emitWheel(.right, count: steps.right, modifiers: modifiers, cell: cell)
+        let isPrecise = event.hasPreciseScrollingDeltas
+        let cellHeight = surface.cellSize.height
+        // Down-positive, matching `WheelGesture`'s convention — the inverse
+        // of AppKit's `scrollingDeltaY` (positive = up).
+        let deltaRows = isPrecise
+            ? (cellHeight > 0 ? -Double(event.scrollingDeltaY) / Double(cellHeight) : 0)
+            : -Double(event.scrollingDeltaY)
+
+        let verticalSteps = wheelGesture.input(
+            deltaRows: deltaRows,
+            phase: WheelPhase(event.phase), momentumPhase: WheelPhase(event.momentumPhase))
+
+        let horizontalSteps = scrollAccumulator.accumulate(
+            deltaX: event.scrollingDeltaX, deltaY: 0,
+            cellWidth: surface.cellSize.width, cellHeight: cellHeight,
+            isPrecise: isPrecise, timestamp: event.timestamp)
+
+        emitVerticalSteps(verticalSteps, modifiers: modifiers, cell: cell)
+        emitWheel(.left, count: horizontalSteps.left, modifiers: modifiers, cell: cell)
+        emitWheel(.right, count: horizontalSteps.right, modifiers: modifiers, cell: cell)
+
+        surface.noteScrollInput(
+            gridID: cell.grid, inputRows: wheelGesture.inputRows,
+            requestedRows: wheelGesture.requestedRows, gestureOpen: wheelGesture.isOpen)
+        if !wheelGesture.isOpen { wheelGestureGridID = nil }
+    }
+
+    private func finalizeWheelGesture(gridID: Int) {
+        guard wheelGesture.isOpen else { return }
+        _ = wheelGesture.input(deltaRows: 0, phase: .ended, momentumPhase: .none)
+        surface.noteScrollInput(
+            gridID: gridID, inputRows: wheelGesture.inputRows,
+            requestedRows: wheelGesture.requestedRows, gestureOpen: wheelGesture.isOpen)
     }
 
     /// Native minimap/scroller views forward wheel deltas here so there is
-    /// still exactly one accumulator and one ordered Neovim mouse route.
+    /// still exactly one accumulator/gesture and one ordered Neovim mouse
+    /// route. These views deliver no AppKit gesture phases, so every call
+    /// reads as `.changed` of an open gesture; `accessoryWheelFinalizeTask`
+    /// closes the gesture after a quiet period in place of a real `.ended`.
     private func handleAccessoryWheel(_ request: GridAccessoryWheelRequest) {
         guard let controller, controller.isMouseEnabled else { return }
-        let steps = scrollAccumulator.accumulate(
-            deltaX: request.deltaX,
-            deltaY: request.deltaY,
-            cellWidth: surface.cellSize.width,
-            cellHeight: surface.cellSize.height,
-            isPrecise: request.hasPreciseDeltas)
-        guard !steps.isEmpty else { return }
+
+        if let accessoryWheelGridID, accessoryWheelGridID != request.gridID {
+            finalizeAccessoryWheelGesture(gridID: accessoryWheelGridID)
+        }
+        accessoryWheelGridID = request.gridID
+
+        let isPrecise = request.hasPreciseDeltas
+        let cellHeight = surface.cellSize.height
+        let deltaRows = isPrecise
+            ? (cellHeight > 0 ? -Double(request.deltaY) / Double(cellHeight) : 0)
+            : -Double(request.deltaY)
+
+        let verticalSteps = accessoryWheelGesture.input(
+            deltaRows: deltaRows, phase: .changed, momentumPhase: .none)
+
+        let horizontalSteps = scrollAccumulator.accumulate(
+            deltaX: request.deltaX, deltaY: 0,
+            cellWidth: surface.cellSize.width, cellHeight: cellHeight,
+            isPrecise: isPrecise)
+
         let modifiers = Modifiers(rawValue: request.modifierFlagsRawValue)
         let cell = (grid: request.gridID, row: 0, col: 0)
-        emitWheel(.up, count: steps.up, modifiers: modifiers, cell: cell)
-        emitWheel(.down, count: steps.down, modifiers: modifiers, cell: cell)
-        emitWheel(.left, count: steps.left, modifiers: modifiers, cell: cell)
-        emitWheel(.right, count: steps.right, modifiers: modifiers, cell: cell)
+        emitVerticalSteps(verticalSteps, modifiers: modifiers, cell: cell)
+        emitWheel(.left, count: horizontalSteps.left, modifiers: modifiers, cell: cell)
+        emitWheel(.right, count: horizontalSteps.right, modifiers: modifiers, cell: cell)
+
+        surface.noteScrollInput(
+            gridID: request.gridID, inputRows: accessoryWheelGesture.inputRows,
+            requestedRows: accessoryWheelGesture.requestedRows,
+            gestureOpen: accessoryWheelGesture.isOpen)
+        scheduleAccessoryWheelFinalize(gridID: request.gridID)
+    }
+
+    private func scheduleAccessoryWheelFinalize(gridID: Int) {
+        accessoryWheelFinalizeTask?.cancel()
+        let nanoseconds = UInt64(Self.accessoryWheelStalenessInterval * 1_000_000_000)
+        accessoryWheelFinalizeTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: nanoseconds)
+            guard !Task.isCancelled else { return }
+            self?.finalizeAccessoryWheelGesture(gridID: gridID)
+        }
+    }
+
+    private func finalizeAccessoryWheelGesture(gridID: Int) {
+        accessoryWheelFinalizeTask?.cancel()
+        accessoryWheelFinalizeTask = nil
+        guard accessoryWheelGesture.isOpen else { return }
+        _ = accessoryWheelGesture.input(deltaRows: 0, phase: .ended, momentumPhase: .none)
+        surface.noteScrollInput(
+            gridID: gridID, inputRows: accessoryWheelGesture.inputRows,
+            requestedRows: accessoryWheelGesture.requestedRows,
+            gestureOpen: accessoryWheelGesture.isOpen)
+        if accessoryWheelGridID == gridID { accessoryWheelGridID = nil }
+    }
+
+    private func emitVerticalSteps(
+        _ steps: Int, modifiers: Modifiers, cell: (grid: Int, row: Int, col: Int)
+    ) {
+        if steps > 0 {
+            emitWheel(.down, count: steps, modifiers: modifiers, cell: cell)
+        } else if steps < 0 {
+            emitWheel(.up, count: -steps, modifiers: modifiers, cell: cell)
+        }
     }
 
     private func emitWheel(
@@ -544,12 +645,6 @@ public final class InputHostView: NSView, @preconcurrency NSTextInputClient, NSM
             modifier: arguments.modifier,
             grid: arguments.grid, row: arguments.row, col: arguments.col,
             repeatCount: count)
-        if direction == .up || direction == .down {
-            // Gesture-aware velocity hold: the response to this step is now
-            // in flight; keep that grid's active envelope moving across the
-            // transport round trip.
-            surface.noteScrollInputPending(gridID: cell.grid)
-        }
     }
 
     private func cellUnderPointer(_ event: NSEvent) -> (grid: Int, row: Int, col: Int)? {

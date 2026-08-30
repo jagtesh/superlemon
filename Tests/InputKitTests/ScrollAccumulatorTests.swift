@@ -134,6 +134,43 @@ struct ScrollAccumulatorTests {
         #expect(acc.precise(y: 4) == WheelSteps(up: 1))
     }
 
+    @Test("a stale gap zeroes the remainder and rounds the next nudge away from zero")
+    func staleGapRoundsAwayFromZero() {
+        var acc = ScrollAccumulator()
+        _ = acc.accumulate(
+            deltaX: 0, deltaY: 8, cellWidth: cellW, cellHeight: cellH,
+            isPrecise: true, timestamp: 0)  // +0.4 cells pending
+
+        // A gap at the staleness threshold: the +0.4 credit is dropped, and
+        // this event's own small delta rounds away from zero instead of
+        // being absorbed as sub-cell credit.
+        let steps = acc.accumulate(
+            deltaX: 0, deltaY: 2, cellWidth: cellW, cellHeight: cellH,
+            isPrecise: true, timestamp: ScrollAccumulator.stalenessGap)
+        #expect(steps == WheelSteps(up: 1))  // 0.1 cells rounds up to 1, not 0
+
+        // A gap just under the threshold behaves exactly as before: no reset.
+        var noReset = ScrollAccumulator()
+        _ = noReset.accumulate(
+            deltaX: 0, deltaY: 8, cellWidth: cellW, cellHeight: cellH,
+            isPrecise: true, timestamp: 0)
+        let unstaleSteps = noReset.accumulate(
+            deltaX: 0, deltaY: 2, cellWidth: cellW, cellHeight: cellH,
+            isPrecise: true,
+            timestamp: ScrollAccumulator.stalenessGap - 0.001)
+        #expect(unstaleSteps.isEmpty)  // 0.4 + 0.1 = 0.5 cells, still pending
+    }
+
+    @Test("omitting the timestamp never tracks staleness")
+    func omittingTimestampNeverTracksStaleness() {
+        var acc = ScrollAccumulator()
+        #expect(acc.precise(y: 8).isEmpty)
+        // No timestamp supplied on either call: behaves exactly as the
+        // existing sub-cell accumulation tests expect, regardless of gap.
+        #expect(acc.precise(y: 8).isEmpty)
+        #expect(acc.precise(y: 8) == WheelSteps(up: 1))
+    }
+
     @Test("degenerate cell metrics never divide by zero")
     func degenerateCellMetrics() {
         var acc = ScrollAccumulator()

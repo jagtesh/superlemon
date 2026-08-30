@@ -39,10 +39,21 @@ public struct WheelSteps: Sendable, Hashable {
 
 /// Accumulates scroll deltas per axis and emits whole-cell wheel steps.
 public struct ScrollAccumulator: Sendable, Hashable {
+    /// A gap at or above this many seconds since the previous event reads as
+    /// delivery having stopped and resumed, not a continuous gesture (WezTerm
+    /// macOS accumulator). The stale remainder is dropped, and the event that
+    /// ends the gap rounds away from zero instead of draining toward zero, so
+    /// a slow first nudge after a pause is never swallowed by truncation.
+    public static let stalenessGap: Double = 0.250
+
     /// Pending sub-cell scroll credit, in cells (X axis: positive = left).
     private var pendingX: Double = 0
     /// Pending sub-cell scroll credit, in cells (Y axis: positive = up).
     private var pendingY: Double = 0
+    /// Timestamp of the last event fed to `accumulate`, when the caller
+    /// supplies one. Nil means staleness is not tracked (existing callers
+    /// that omit `timestamp` see no behavior change).
+    private var lastEventTimestamp: Double?
 
     public init() {}
 
@@ -51,6 +62,7 @@ public struct ScrollAccumulator: Sendable, Hashable {
     public mutating func reset() {
         pendingX = 0
         pendingY = 0
+        lastEventTimestamp = nil
     }
 
     /// Feed one scroll event; returns the whole steps to emit now.
@@ -61,22 +73,35 @@ public struct ScrollAccumulator: Sendable, Hashable {
     ///   - cellWidth, cellHeight: current cell metrics in points (used only
     ///     for precise deltas).
     ///   - isPrecise: `NSEvent.hasPreciseScrollingDeltas`.
+    ///   - timestamp: event time, for the staleness rule above. Omit (the
+    ///     default) to leave staleness untracked, as before.
     public mutating func accumulate(
         deltaX: Double,
         deltaY: Double,
         cellWidth: Double,
         cellHeight: Double,
-        isPrecise: Bool
+        isPrecise: Bool,
+        timestamp: Double? = nil
     ) -> WheelSteps {
+        var stale = false
+        if let timestamp {
+            if let lastEventTimestamp, timestamp - lastEventTimestamp >= Self.stalenessGap {
+                pendingX = 0
+                pendingY = 0
+                stale = true
+            }
+            self.lastEventTimestamp = timestamp
+        }
+
         var steps = WheelSteps()
 
         let x: Int
         let y: Int
         if isPrecise {
             x = cellWidth > 0
-                ? Self.drain(&pendingX, adding: deltaX / cellWidth) : 0
+                ? Self.drain(&pendingX, adding: deltaX / cellWidth, roundAwayFromZero: stale) : 0
             y = cellHeight > 0
-                ? Self.drain(&pendingY, adding: deltaY / cellHeight) : 0
+                ? Self.drain(&pendingY, adding: deltaY / cellHeight, roundAwayFromZero: stale) : 0
         } else {
             x = Self.wholeSteps(forLineDelta: deltaX)
             y = Self.wholeSteps(forLineDelta: deltaY)
@@ -90,14 +115,21 @@ public struct ScrollAccumulator: Sendable, Hashable {
     // MARK: - Internals
 
     /// Add `delta` (in cells) to the pending remainder — resetting it first
-    /// on a direction reversal — and drain whole steps.
-    private static func drain(_ pending: inout Double, adding delta: Double) -> Int {
+    /// on a direction reversal — and drain whole steps. `roundAwayFromZero`
+    /// rounds up (for a positive remainder) or down (negative) instead of
+    /// truncating toward zero, so the first nudge after a stale gap always
+    /// registers instead of being absorbed as sub-cell credit.
+    private static func drain(
+        _ pending: inout Double, adding delta: Double, roundAwayFromZero: Bool = false
+    ) -> Int {
         guard delta != 0 else { return 0 }
         if pending != 0, (delta > 0) != (pending > 0) {
             pending = 0
         }
         pending += delta
-        let whole = pending.rounded(.towardZero)
+        let whole = roundAwayFromZero
+            ? (pending >= 0 ? pending.rounded(.up) : pending.rounded(.down))
+            : pending.rounded(.towardZero)
         pending -= whole
         return Int(whole)
     }

@@ -497,12 +497,14 @@ public final class GridSurfaceView: NSView {
         return true
     }
 
-    /// Input-side hint: a vertical wheel step was just sent to Neovim for
-    /// this grid and its authoritative response is still in flight. While
-    /// that grid's motion is active, the envelope is held moving for at
-    /// least one adaptive duration so a high-latency transport's round trip
-    /// does not land on a camera that already came to rest. No-op when the
-    /// grid is idle, when motion is disabled, or under Reduce Motion.
+    /// Input-side hint that a wheel step (or the cursor-hide-relevant part of
+    /// one) just happened for this grid: records the timestamp the
+    /// wheel-scroll cursor-hide feature keys off. Kept as its own entry
+    /// point — distinct from `noteScrollInput(gridID:inputRows:requestedRows
+    /// :gestureOpen:)` below — because tests drive the cursor-hide window
+    /// directly without needing to fabricate a `WheelGesture`. No-op effect
+    /// beyond the timestamp; the follower-prediction wiring lives in
+    /// `noteScrollInput`.
     public func noteScrollInputPending(gridID: Int) {
         noteScrollInputPending(gridID: gridID, at: CACurrentMediaTime())
     }
@@ -513,7 +515,21 @@ public final class GridSurfaceView: NSView {
         guard scrollMotionStyle == .tightNative, !reducedMotion else { return }
         lastWheelInputTimestamp = timestamp
         cancelPendingCursorReveal()
-        smoothViewports[gridID]?.noteScrollInputPending()
+    }
+
+    /// Input-side hint: the host's `WheelGesture` for this grid was just fed
+    /// a wheel sample. Forwards the gesture's own bookkeeping to that grid's
+    /// `SmoothViewportState`, which moves the follower's target ahead of the
+    /// origin to the clamped predicted offset — "quantize ahead, render
+    /// behind" (docs/research/scroll-camera.md) — under the same
+    /// `tightNative`/`!reducedMotion` gate as the rest of smooth motion.
+    /// Also records the wheel timestamp for the cursor-hide feature, exactly
+    /// as `noteScrollInputPending` does.
+    public func noteScrollInput(gridID: Int, inputRows: Double, requestedRows: Int, gestureOpen: Bool) {
+        noteScrollInputPending(gridID: gridID)
+        guard scrollMotionStyle == .tightNative, !reducedMotion else { return }
+        smoothViewports[gridID]?.noteScrollInput(
+            inputRows: inputRows, requestedRows: requestedRows, gestureOpen: gestureOpen)
     }
 
     /// Bounded, allocation-stable diagnostic history. Unlike the former
