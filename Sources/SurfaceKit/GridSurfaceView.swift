@@ -643,7 +643,18 @@ public final class GridSurfaceView: NSView {
                 smoothViewports[frame.gridID] = state
                 let animate = scrollMotionStyle == .tightNative && !reducedMotion
                     && !redrawAll && flush.allowsScrollInterpolation
-                if !animate { atomicallySettledGrids.insert(frame.gridID) }
+                // Reasons that actually invalidate the filmstrip's
+                // coordinate system or the session's motion policy —
+                // deliberately *not* `!animate`: a per-flush
+                // classifier-atomic frame (`flush.allowsScrollInterpolation
+                // == false`, e.g. a cursor-line/matchparen repaint with no
+                // scroll at all) must not hard-settle a glide still in
+                // flight, only rebind rows underneath it. See
+                // `ScrollTransitionCoordinator.present`'s `forceAtomic` and
+                // docs/research/scroll-camera.md §C/§D.
+                let forceAtomic = redrawAll || scrollMotionStyle != .tightNative
+                    || reducedMotion
+                if forceAtomic { atomicallySettledGrids.insert(frame.gridID) }
                 let started = state.present(
                     rowSnapshots: rowSnapshots, rows: grid.rows, cols: grid.cols,
                     margins: grid.viewportMargins,
@@ -651,7 +662,8 @@ public final class GridSurfaceView: NSView {
                     semanticDelta: redrawAll ? nil : flush.viewportScrollDeltas[frame.gridID],
                     semanticMotion: redrawAll ? nil : viewportMotion,
                     cellSize: cellSize, scale: scale, host: gridLayer,
-                    animate: animate, arrivalTimestamp: CACurrentMediaTime())
+                    animate: animate, forceAtomic: forceAtomic,
+                    arrivalTimestamp: CACurrentMediaTime())
                 motionStarted = motionStarted || started
                 assert(state.currentRowsMatch(rowSnapshots),
                        "filmstrip must end on authoritative row revisions")

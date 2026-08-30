@@ -554,7 +554,14 @@ public final class InputHostView: NSView, @preconcurrency NSTextInputClient, NSM
 
     private func finalizeWheelGesture(gridID: Int) {
         guard wheelGesture.isOpen else { return }
-        _ = wheelGesture.input(deltaRows: 0, phase: .ended, momentumPhase: .none)
+        // Finalize may return a nearest-row step-back (`WheelGesture.input`),
+        // not just `0` — send it like any other step, or nvim's viewport
+        // never receives the un-scroll and the camera glides to a target the
+        // grid never confirmed.
+        let steps = wheelGesture.input(deltaRows: 0, phase: .ended, momentumPhase: .none)
+        emitVerticalSteps(
+            steps, modifiers: Modifiers(rawValue: 0),
+            cell: (grid: gridID, row: 0, col: 0))
         surface.noteScrollInput(
             gridID: gridID, inputRows: wheelGesture.inputRows,
             requestedRows: wheelGesture.requestedRows, gestureOpen: wheelGesture.isOpen)
@@ -614,7 +621,12 @@ public final class InputHostView: NSView, @preconcurrency NSTextInputClient, NSM
         accessoryWheelFinalizeTask?.cancel()
         accessoryWheelFinalizeTask = nil
         guard accessoryWheelGesture.isOpen else { return }
-        _ = accessoryWheelGesture.input(deltaRows: 0, phase: .ended, momentumPhase: .none)
+        // See `finalizeWheelGesture`: finalize may return a nearest-row
+        // step-back that must still be sent to Neovim.
+        let steps = accessoryWheelGesture.input(deltaRows: 0, phase: .ended, momentumPhase: .none)
+        emitVerticalSteps(
+            steps, modifiers: Modifiers(rawValue: 0),
+            cell: (grid: gridID, row: 0, col: 0))
         surface.noteScrollInput(
             gridID: gridID, inputRows: accessoryWheelGesture.inputRows,
             requestedRows: accessoryWheelGesture.requestedRows,

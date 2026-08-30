@@ -81,6 +81,13 @@ struct ScrollFollower: Equatable {
     /// An arrival gap at least this many times the previous gap reads as
     /// slowing down.
     static let stoppingGapRatio: Double = 1.3
+    /// Gentle stiffness for the glide after a gesture has finalized
+    /// (`noteScrollInput(gestureOpen: false)`): the remaining fractional-row
+    /// correction — at most half a row, `WheelGesture`'s nearest-row
+    /// finalize — should settle calmly rather than at whatever
+    /// cadence-selected stiffness happened to be active when the finger
+    /// lifted. ω ≈ 22, about 180 ms to rest.
+    static let settleStiffness: Double = 500
 
     /// Fixed physics substep (Fiedler, "Fix Your Timestep!"; Firefox
     /// `AxisPhysicsModel`). `advance(by:)` integrates whole substeps and
@@ -127,6 +134,13 @@ struct ScrollFollower: Equatable {
     /// the settle horizon spans high-latency bursts; see `angularFrequency`.
     var estimatedArrivalGap: CFTimeInterval = 0
     private(set) var isActive = false
+    /// Set by `lockSettleStiffness()` when a gesture finalizes; cleared by
+    /// `unlockStiffness()` (a new gesture opened) or `settle()` (the glide
+    /// finished). While locked, `updateStiffness` leaves `stiffness` alone —
+    /// otherwise the arrival that confirms a finalize's possible
+    /// nearest-row step-back would immediately override the gentle settle
+    /// stiffness with whatever the cadence rule selects for that arrival.
+    private var stiffnessLocked = false
 
     /// `ω = √stiffness`, capped so the settle time (`4/ω`) spans roughly two
     /// observed arrival gaps on a high-latency transport, and floored so
@@ -170,6 +184,7 @@ struct ScrollFollower: Equatable {
     /// the very first one); `previousGap` is the gap before that. Firefox
     /// `ComputeSpringConstant`.
     mutating func updateStiffness(gap: CFTimeInterval?, previousGap: CFTimeInterval?) {
+        guard !stiffnessLocked else { return }
         guard let gap else {
             stiffness = Self.softStartStiffness
             return
@@ -183,6 +198,20 @@ struct ScrollFollower: Equatable {
         } else {
             stiffness = Self.steadyStiffness
         }
+    }
+
+    /// A gesture just finalized (`noteScrollInput(gestureOpen: false)`): the
+    /// remaining glide settles at the gentle `settleStiffness` and
+    /// `updateStiffness` ignores the cadence rule until a new gesture opens
+    /// or the follower comes to rest.
+    mutating func lockSettleStiffness() {
+        stiffness = Self.settleStiffness
+        stiffnessLocked = true
+    }
+
+    /// A new gesture opened: cadence-selected stiffness resumes.
+    mutating func unlockStiffness() {
+        stiffnessLocked = false
     }
 
     /// Move the follower's state by `delta` rows without resetting velocity
@@ -247,6 +276,7 @@ struct ScrollFollower: Equatable {
         current = State(position: target, velocity: 0)
         accumulator = 0
         isActive = false
+        stiffnessLocked = false
     }
 }
 
@@ -494,12 +524,26 @@ final class SmoothViewportState {
     /// Production entry point: install cached row-sized renderer revisions.
     /// `arrivalTimestamp` feeds the arrival-cadence estimate; nil (the
     /// default, used by deterministic tests) leaves the estimate untouched.
+    /// - Parameter forceAtomic: `nil` (the default, used by every existing
+    ///   direct-`present` test) preserves prior behavior by falling back to
+    ///   `!animate` — an explicitly atomic/Reduce-Motion/non-`tightNative`
+    ///   frame, or a per-flush classifier-atomic frame (`animate == false`
+    ///   because the flush merely wasn't safe to interpolate — e.g. it
+    ///   carried no motion at all), both hard-settled exactly as before.
+    ///   Production (`GridSurfaceView`) passes an explicit value decoupled
+    ///   from `animate`: `redrawAll || style != .tightNative ||
+    ///   reducedMotion` — the reasons that actually invalidate the
+    ///   filmstrip's coordinate system or the session's motion policy — so a
+    ///   damage-only atomic frame (an edit, a cursor-line/matchparen repaint,
+    ///   no scroll, same geometry) rebinds rows without cutting off a glide
+    ///   still in flight. See `docs/research/scroll-camera.md` §C/§D.
     @discardableResult
     func present(
         rowSnapshots: [RenderedRowSnapshot], rows: Int, cols: Int,
         margins: ViewportMargins?, scrolls: [ScrollDelta], semanticDelta: Int?,
         semanticMotion: ViewportScrollMotion? = nil,
         cellSize: CGSize, scale: CGFloat, host: CALayer, animate: Bool,
+        forceAtomic: Bool? = nil,
         arrivalTimestamp: CFTimeInterval? = nil
     ) -> Bool {
         let sourceRows = rowSnapshots.enumerated().map { row, snapshot in
@@ -516,7 +560,7 @@ final class SmoothViewportState {
             margins: margins, scrolls: scrolls, semanticDelta: semanticDelta,
             semanticMotion: semanticMotion,
             cellSize: cellSize, scale: scale, host: host, animate: animate,
-            arrivalTimestamp: arrivalTimestamp)
+            forceAtomic: forceAtomic, arrivalTimestamp: arrivalTimestamp)
     }
 
     /// Testing/snapshot compatibility. The application never takes this
@@ -527,6 +571,7 @@ final class SmoothViewportState {
         scrolls: [ScrollDelta], semanticDelta: Int?,
         semanticMotion: ViewportScrollMotion? = nil, cellSize: CGSize,
         scale: CGFloat, host: CALayer, animate: Bool,
+        forceAtomic: Bool? = nil,
         arrivalTimestamp: CFTimeInterval? = nil
     ) -> Bool {
         presentationGeneration &+= 1
@@ -550,7 +595,7 @@ final class SmoothViewportState {
             margins: margins, scrolls: scrolls, semanticDelta: semanticDelta,
             semanticMotion: semanticMotion,
             cellSize: cellSize, scale: scale, host: host, animate: animate,
-            arrivalTimestamp: arrivalTimestamp)
+            forceAtomic: forceAtomic, arrivalTimestamp: arrivalTimestamp)
     }
 
     @discardableResult
@@ -559,6 +604,7 @@ final class SmoothViewportState {
         margins: ViewportMargins?, scrolls: [ScrollDelta], semanticDelta: Int?,
         semanticMotion: ViewportScrollMotion?,
         cellSize: CGSize, scale: CGFloat, host: CALayer, animate: Bool,
+        forceAtomic: Bool?,
         arrivalTimestamp: CFTimeInterval?
     ) -> Bool {
         let nextGeometry = SmoothViewportGeometry(rows: rows, cols: cols, margins: margins)
@@ -590,11 +636,28 @@ final class SmoothViewportState {
         if animate, carriesMovement, let arrivalTimestamp {
             updateArrivalCadence(arrivalTimestamp)
         }
-        if !animate, isActive {
-            // An explicitly atomic/Reduce Motion frame supersedes any visual
-            // tail even when it contains only edits or highlight changes.
+        // `resolvedForceAtomic` is the set of reasons that actually
+        // invalidate the filmstrip's coordinate system or the session's
+        // motion policy: an explicit full redraw, Reduce Motion, the
+        // `.immediate` style, or (absent an explicit caller value) any
+        // `animate == false` frame, matching the previous behavior exactly
+        // for every direct-`present` call site that does not pass
+        // `forceAtomic`. It is deliberately *not* `!animate` on its own in
+        // production: `GridSurfaceView` passes the narrower explicit value
+        // so a damage-only atomic frame (an edit, a cursor-line/matchparen
+        // repaint — `animate == false` only because the flush classifier
+        // found nothing safe to interpolate, not because anything
+        // invalidated the coordinate system) rebinds rows without cutting
+        // off a glide still in flight.
+        let resolvedForceAtomic = forceAtomic ?? !animate
+        if resolvedForceAtomic, isActive {
+            // A genuinely atomic frame supersedes any visual tail even when
+            // it contains only edits or highlight changes.
             settle()
         } else if !eligible, carriesMovement {
+            // This frame carries movement the follower cannot represent
+            // (incompatible geometry/direction) — settle regardless of why
+            // `animate` was false.
             settle()
         }
 
@@ -753,8 +816,16 @@ final class SmoothViewportState {
     func noteScrollInput(inputRows: Double, requestedRows: Int, gestureOpen: Bool) {
         if gestureOpen, !gestureIsOpen {
             // A fresh gesture starts predicting from here: forget whatever
-            // arrival history accumulated (or never rebased) up to now.
+            // arrival history accumulated (or never rebased) up to now, and
+            // let cadence-selected stiffness govern again.
             confirmedRows = 0
+            follower.unlockStiffness()
+        } else if !gestureOpen, gestureIsOpen {
+            // The gesture just finalized: the remaining glide (at most half
+            // a row — `WheelGesture`'s nearest-row finalize) settles gently
+            // rather than at whatever stiffness the last arrival's cadence
+            // selected.
+            follower.lockSettleStiffness()
         }
         gestureIsOpen = gestureOpen
         gestureInputRows = inputRows

@@ -32,12 +32,14 @@ public enum WheelPhase: Sendable, Equatable {
 public struct WheelGesture: Sendable, Equatable {
     /// Cumulative fractional finger travel this gesture, in rows, down
     /// positive. While the gesture is open this can run ahead of whole rows;
-    /// on finalize it snaps to `requestedRows` (the camera completes the row
-    /// it is in rather than leaving a fractional remainder stranded after the
-    /// finger lifts).
+    /// on finalize it snaps to the nearest row (`requestedRows`, stepped
+    /// back one row first if the camera was more than half a row short of
+    /// it) rather than leaving a fractional remainder stranded after the
+    /// finger lifts.
     public private(set) var inputRows: Double = 0
     /// Cumulative whole rows requested from Neovim this gesture, down
-    /// positive. Always `inputRows` quantized ahead of zero.
+    /// positive. Always `inputRows` quantized ahead of zero, except for the
+    /// possible one-row step-back at finalize (see `inputRows`).
     public private(set) var requestedRows: Int = 0
     /// Whether a gesture is currently open. A fresh `.began`, or any input
     /// arriving while closed, opens a new gesture with both counters reset
@@ -49,7 +51,10 @@ public struct WheelGesture: Sendable, Equatable {
     /// Feed one wheel sample. Returns the signed number of row steps to send
     /// to Neovim right now (positive = down); `0` means either the sample
     /// stayed within the already-requested row or this call finalized the
-    /// gesture.
+    /// gesture exactly on a row boundary. A call that finalizes the gesture
+    /// (`phase`/`momentumPhase` ending) may also return `±1`: the nearest-row
+    /// step-back described on `inputRows` — callers must send this like any
+    /// other step, not just the steps from a still-open gesture.
     ///
     /// - Parameters:
     ///   - deltaRows: signed fractional rows of finger travel since the last
@@ -71,11 +76,27 @@ public struct WheelGesture: Sendable, Equatable {
             && momentumPhase == .none
         let momentumEnded = momentumPhase == .ended || momentumPhase == .cancelled
         if endedWithoutMomentum || momentumEnded {
-            // The camera completes the row it is in rather than stranding a
-            // fractional remainder once the finger (or momentum) stops.
-            inputRows = Double(requestedRows)
+            // Nearest-row finalize (docs/research/scroll-camera.md §B):
+            // `requestedRows` was quantized ahead of the finger (`ceil`), so
+            // at the moment the gesture ends the camera may be less than one
+            // row into that requested row. Gliding the full remainder at the
+            // "coming to a stop" stiffness reads as a lurch. If the camera is
+            // more than half a row short, step back one row toward the
+            // finger instead: un-request it from Neovim (return the signed
+            // step) and rebase `requestedRows`/`inputRows` to the row the
+            // camera is actually near, so the completing glide is at most
+            // half a row. Otherwise the camera is already past the row's
+            // midpoint and completes forward exactly as before.
+            let remaining = Double(requestedRows) - inputRows
             isOpen = false
-            return 0
+            guard abs(remaining) > 0.5 else {
+                inputRows = Double(requestedRows)
+                return 0
+            }
+            let signum = remaining > 0 ? 1 : -1
+            requestedRows -= signum
+            inputRows = Double(requestedRows)
+            return -signum
         }
 
         inputRows += deltaRows

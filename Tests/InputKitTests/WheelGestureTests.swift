@@ -69,10 +69,14 @@ struct WheelGestureTests {
         #expect(gesture.input(deltaRows: 0.6, phase: .none, momentumPhase: .changed) == 1)
         #expect(gesture.requestedRows == 2)
 
-        // Momentum itself ends: finalize.
+        // Momentum itself ends: finalize. The camera is only 1.1 rows into
+        // a 2-row request — 0.9 row short, more than half a row — so
+        // nearest-row finalize steps back one row toward where the camera
+        // actually is rather than gliding the full 0.9-row remainder.
         let finalSteps = gesture.input(deltaRows: 0, phase: .none, momentumPhase: .ended)
-        #expect(finalSteps == 0)
+        #expect(finalSteps == -1)
         #expect(!gesture.isOpen)
+        #expect(gesture.requestedRows == 1)
         #expect(gesture.inputRows == Double(gesture.requestedRows))
     }
 
@@ -129,9 +133,78 @@ struct WheelGestureTests {
     @Test("cancelled without momentum finalizes just like ended")
     func cancelledFinalizes() {
         var gesture = WheelGesture()
+        // 0.4 rows into the row quantized ahead (requestedRows == 1): nearer
+        // to 0 than to 1, so nearest-row finalize steps back rather than
+        // gliding forward the remaining 0.6 row.
         _ = gesture.input(deltaRows: 0.4, phase: .began, momentumPhase: .none)
         let steps = gesture.input(deltaRows: 0, phase: .cancelled, momentumPhase: .none)
-        #expect(steps == 0)
+        #expect(steps == -1)
         #expect(!gesture.isOpen)
+        #expect(gesture.requestedRows == 0)
+        #expect(gesture.inputRows == 0)
+    }
+
+    // MARK: - Nearest-row finalize (docs/research/scroll-camera.md §B)
+
+    @Test("finalize just past the midpoint steps back one row toward the finger")
+    func finalizeJustPastMidpointStepsBack() {
+        var gesture = WheelGesture()
+        _ = gesture.input(deltaRows: 1.05, phase: .began, momentumPhase: .none)
+        #expect(gesture.requestedRows == 2)
+
+        let steps = gesture.input(deltaRows: 0, phase: .ended, momentumPhase: .none)
+        #expect(steps == -1)
+        #expect(gesture.requestedRows == 1)
+        #expect(gesture.inputRows == 1)
+    }
+
+    @Test("finalize just before the far edge completes forward")
+    func finalizeJustBeforeFarEdgeCompletesForward() {
+        var gesture = WheelGesture()
+        _ = gesture.input(deltaRows: 1.6, phase: .began, momentumPhase: .none)
+        #expect(gesture.requestedRows == 2)
+
+        let steps = gesture.input(deltaRows: 0, phase: .ended, momentumPhase: .none)
+        #expect(steps == 0)
+        #expect(gesture.requestedRows == 2)
+        #expect(gesture.inputRows == 2)
+    }
+
+    @Test("upward finalize steps back symmetrically")
+    func upwardFinalizeStepsBackSymmetrically() {
+        var gesture = WheelGesture()
+        _ = gesture.input(deltaRows: -1.05, phase: .began, momentumPhase: .none)
+        #expect(gesture.requestedRows == -2)
+
+        let steps = gesture.input(deltaRows: 0, phase: .ended, momentumPhase: .none)
+        #expect(steps == 1)
+        #expect(gesture.requestedRows == -1)
+        #expect(gesture.inputRows == -1)
+    }
+
+    @Test("momentum ending applies the same nearest-row finalize as a lifted finger")
+    func momentumEndedAppliesNearestRowFinalize() {
+        var gesture = WheelGesture()
+        _ = gesture.input(deltaRows: 1.05, phase: .began, momentumPhase: .none)
+        _ = gesture.input(deltaRows: 0, phase: .ended, momentumPhase: .began)
+        #expect(gesture.isOpen)
+
+        let steps = gesture.input(deltaRows: 0, phase: .none, momentumPhase: .ended)
+        #expect(steps == -1)
+        #expect(!gesture.isOpen)
+        #expect(gesture.requestedRows == 1)
+        #expect(gesture.inputRows == 1)
+    }
+
+    @Test("finalize exactly at the midpoint completes forward")
+    func finalizeExactlyAtMidpointCompletesForward() {
+        var gesture = WheelGesture()
+        _ = gesture.input(deltaRows: 0.5, phase: .began, momentumPhase: .none)
+        #expect(gesture.requestedRows == 1)
+
+        let steps = gesture.input(deltaRows: 0, phase: .ended, momentumPhase: .none)
+        #expect(steps == 0)
+        #expect(gesture.requestedRows == 1)
+        #expect(gesture.inputRows == 1)
     }
 }

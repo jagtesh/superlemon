@@ -1916,6 +1916,140 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
         #expect(state.velocity == 0)
     }
 
+    // MARK: - `forceAtomic` (docs/research/scroll-camera.md §C: a damage-only
+    // atomic frame — a cursor-line/matchparen repaint arriving mid-glide —
+    // must rebind rows without cutting the glide short; only a frame that
+    // actually invalidates the filmstrip's coordinate system, or the
+    // session's motion policy, may hard-settle it.)
+
+    @Test func damageOnlyAtomicFrameLeavesAnActiveGlideUntouched() {
+        let host = CALayer()
+        let state = idleState(gridID: 40, host: host)
+        #expect(presentOneRowDownArrival(state, host: host))
+        #expect(state.isActive)
+
+        // Advance partway into the glide so it is mid-flight, not at rest.
+        _ = state.advance(by: 1.0 / 120.0)
+        #expect(state.isActive)
+        let midPosition = state.position
+
+        // A damage-only frame: no scrolls, no semantic delta, same geometry.
+        // `animate` is false only because the flush classifier found
+        // nothing safe to interpolate (e.g. a cursor-line/matchparen
+        // repaint with no scroll at all); `forceAtomic` is explicitly
+        // false, as `GridSurfaceView` passes for this case.
+        let started = state.present(
+            image: solidImage(width: 80, height: 96), rows: 6, cols: 10,
+            margins: nil, scrolls: [], semanticDelta: nil, cellSize: cellSize,
+            scale: 1, host: host, animate: false, forceAtomic: false)
+        #expect(!started)
+        #expect(state.isActive,
+                "a damage-only atomic frame must not settle a live glide")
+        #expect(state.position == midPosition,
+                "rebinding rows underneath the glide must not itself move it")
+
+        // The follower keeps gliding afterward — it was never settled.
+        _ = state.advance(by: 1.0 / 120.0)
+        #expect(state.position != midPosition)
+    }
+
+    @Test func atomicFrameCarryingIneligibleMovementStillSettles() {
+        let host = CALayer()
+        let state = idleState(gridID: 41, host: host)
+        #expect(presentOneRowDownArrival(state, host: host))
+        #expect(state.isActive)
+
+        // A horizontal-only scroll carries movement (a nonzero semantic
+        // delta) that the filmstrip's vertical-only coordinate system
+        // cannot represent (`geometry.accepts` rejects nonzero `cols`) —
+        // this must still settle even with `forceAtomic: false`, because
+        // `carriesMovement && !eligible` is its own, independent settle
+        // reason.
+        let started = state.present(
+            image: solidImage(width: 80, height: 96), rows: 6, cols: 10,
+            margins: nil,
+            scrolls: [ScrollDelta(
+                top: 0, bottom: 6, left: 0, right: 10, rows: 0, cols: 1)],
+            semanticDelta: 1, cellSize: cellSize, scale: 1, host: host,
+            animate: true, forceAtomic: false)
+        #expect(!started)
+        #expect(!state.isActive,
+                "movement the follower cannot represent must still settle")
+        #expect(state.position == 0)
+    }
+
+    @Test func geometryChangeSettlesEvenWhenForceAtomicIsFalse() {
+        let host = CALayer()
+        let state = idleState(gridID: 42, host: host)
+        #expect(presentOneRowDownArrival(state, host: host))
+        #expect(state.isActive)
+
+        // A resize changes `geometry`, which takes the unconditional
+        // `needsReset` reset path before `forceAtomic` is even consulted:
+        // an explicit `forceAtomic: false` must not suppress it.
+        let started = state.present(
+            image: solidImage(width: 80, height: 128), rows: 8, cols: 10,
+            margins: nil, scrolls: [], semanticDelta: nil, cellSize: cellSize,
+            scale: 1, host: host, animate: true, forceAtomic: false)
+        #expect(!started)
+        #expect(!state.isActive)
+        #expect(state.position == 0)
+    }
+
+    @Test func finalizeLocksSettleStiffnessAgainstASubsequentArrival() {
+        let host = CALayer()
+        let state = idleState(gridID: 43, host: host)
+
+        state.noteScrollInput(inputRows: 0.3, requestedRows: 1, gestureOpen: true)
+        #expect(presentOneRowDownArrival(state, host: host))
+
+        // The gesture finalizes (finger lifts mid-row): the remaining
+        // glide locks to the gentle settle stiffness.
+        state.noteScrollInput(inputRows: 1, requestedRows: 1, gestureOpen: false)
+        #expect(state.follower.stiffness == ScrollFollower.settleStiffness)
+
+        // A dense arrival that would otherwise select `steadyStiffness`
+        // (or, as the very first timestamped arrival here, `softStart`)
+        // must not override the locked settle stiffness.
+        #expect(presentOneRowStep(
+            state, image: solidImage(width: 80, height: 96), host: host, at: 10.0))
+        #expect(state.follower.stiffness == ScrollFollower.settleStiffness)
+
+        // A fresh gesture opening again is the only thing (besides
+        // settling) that unlocks cadence-selected stiffness.
+        state.noteScrollInput(inputRows: 0.1, requestedRows: 0, gestureOpen: true)
+        #expect(presentOneRowStep(
+            state, image: solidImage(width: 80, height: 96), host: host, at: 10.020))
+        #expect(state.follower.stiffness != ScrollFollower.settleStiffness)
+    }
+
+    @Test func finalizeGlideNeverExceedsHalfARowAndKeepsVelocitySign() {
+        // `WheelGesture`'s nearest-row finalize bounds the camera's
+        // remaining distance from the target to at most half a row; the
+        // glide there uses the gentle settle stiffness (`noteScrollInput`
+        // locks it). This must settle monotonically, at most half a row
+        // from where it started, with velocity that never changes sign.
+        for startingPosition: CGFloat in [-0.5, 0.5] {
+            var follower = ScrollFollower()
+            follower.retarget(byRows: startingPosition, bound: 1000)
+            follower.lockSettleStiffness()
+            #expect(follower.isActive)
+
+            var sawPositiveVelocity = false
+            var sawNegativeVelocity = false
+            for _ in 0..<240 where follower.isActive {
+                follower.advance(by: 1.0 / 120.0)
+                #expect(abs(follower.position) <= abs(startingPosition) + 0.000_001)
+                if follower.velocity > 0.000_001 { sawPositiveVelocity = true }
+                if follower.velocity < -0.000_001 { sawNegativeVelocity = true }
+                #expect(!(sawPositiveVelocity && sawNegativeVelocity),
+                        "velocity must not change sign during the finalize glide")
+            }
+            #expect(!follower.isActive)
+            #expect(follower.position == 0)
+        }
+    }
+
     @Test func unsupportedScrollSettlesAnActiveViewportTail() {
         let host = CALayer()
         let first = solidImage(width: 80, height: 96)
