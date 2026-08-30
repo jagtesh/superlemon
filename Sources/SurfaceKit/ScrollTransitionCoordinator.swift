@@ -41,134 +41,206 @@ struct CriticalDampedSpring: Equatable {
     }
 }
 
-struct ScrollMotionSample: Equatable {
-    var position: CGFloat = 0
-    var velocity: CGFloat = 0
-    var acceleration: CGFloat = 0
+/// A single `(position, velocity)` critically damped follower that is
+/// retargeted on every scroll arrival, replacing the previous design's sum
+/// of one fixed-duration minimum-jerk residual per arrival
+/// (`ContinuousScrollEnvelope`/`MinimumJerkScrollSegment`) plus a separate
+/// backlog spring (`catchUp`). Every shipping smooth-scroll implementation
+/// surveyed (Chromium, Firefox APZ, Neovide) keeps one follower and
+/// retargets it; summing per-arrival bells produced isolated 0→peak→0
+/// pulses once arrivals were spaced wider than half a bell, and up to 2×
+/// overshoot when they were closer together.
+///
+/// State is in ROWS. `position` is the visual offset of the retained
+/// filmstrip relative to the authoritative viewport, using the same sign
+/// convention as the previous `motion.position`: an arrival of
+/// `animatedDelta` rows adds `-animatedDelta`. `target` is always zero in
+/// this phase — a future phase retargets it to the unacknowledged predicted
+/// offset instead of the origin, so the field is kept real rather than
+/// assumed to be zero throughout.
+struct ScrollFollower: Equatable {
+    /// Soft-start stiffness (s⁻²): the first movement-carrying arrival, or
+    /// any arrival far enough from the previous one to read as a fresh
+    /// gesture rather than a continuation. Firefox `ComputeSpringConstant`
+    /// (`ScrollAnimationPhysics.cpp`).
+    static let softStartStiffness: Double = 1250
+    /// "Coming to a stop" stiffness: an arrival slower than, and slowing
+    /// down relative to, the previous one settles the spring faster so the
+    /// camera does not linger behind a stream that is winding down.
+    static let stoppingStiffness: Double = 2000
+    /// Steady-cadence stiffness for dense, evenly spaced arrivals.
+    static let steadyStiffness: Double = 1000
+    /// A gap at or above this many seconds reads as a fresh gesture rather
+    /// than a continuation of the previous one.
+    static let gestureRestartGap: CFTimeInterval = 0.120
+    /// The "coming to a stop" rule only applies once the gap itself clears
+    /// this floor, so sub-frame jitter between two dense arrivals does not
+    /// read as slowing down.
+    static let stoppingGapFloor: CFTimeInterval = 0.012
+    /// An arrival gap at least this many times the previous gap reads as
+    /// slowing down.
+    static let stoppingGapRatio: Double = 1.3
 
-    static func + (lhs: Self, rhs: Self) -> Self {
-        Self(
-            position: lhs.position + rhs.position,
-            velocity: lhs.velocity + rhs.velocity,
-            acceleration: lhs.acceleration + rhs.acceleration)
+    /// Fixed physics substep (Fiedler, "Fix Your Timestep!"; Firefox
+    /// `AxisPhysicsModel`). `advance(by:)` integrates whole substeps and
+    /// extrapolates any fractional remainder exactly (see `readout`), so the
+    /// result is independent of the caller's frame rate.
+    static let substep: CFTimeInterval = 1.0 / 120.0
+    /// A single `advance(by:)` call integrates at most this many seconds, so
+    /// a display link resuming after a long stall does not replay an
+    /// unbounded number of substeps.
+    static let maximumAdvance: CFTimeInterval = 0.25
+
+    /// Settle threshold, in rows and rows/second (Neovide).
+    static let settleEpsilon: CGFloat = 0.01
+    /// Below this observed arrival gap, delivery is local-pipe cadence and
+    /// the natural `√stiffness` frequency applies unstretched.
+    static let cadenceStretchThreshold: CFTimeInterval = 0.090
+    /// The settle horizon stretches to span about this many observed arrival
+    /// gaps, so the next burst on a high-latency transport always lands
+    /// mid-glide with nonzero velocity instead of after the camera has
+    /// already come to rest.
+    static let cadenceStretchFactor: Double = 2.0
+    /// Ceiling on the stretched settle time (`4 / ω`); a very sparse remote
+    /// cadence must not stretch the glide indefinitely.
+    static let maximumSettleDuration: CFTimeInterval = 0.480
+
+    struct State: Equatable {
+        var position: CGFloat = 0
+        var velocity: CGFloat = 0
     }
-}
 
-/// A quintic minimum-jerk residual that reaches rest with continuous position,
-/// velocity, and acceleration. The residual begins at `initial.position` and
-/// ends at zero; adding `-delta` when the authoritative viewport rotates keeps
-/// the visible camera stationary without injecting a velocity/acceleration
-/// tooth at the row boundary.
-struct MinimumJerkScrollSegment: Equatable {
-    let initial: ScrollMotionSample
-    let duration: CFTimeInterval
-    private(set) var elapsed: CFTimeInterval = 0
+    private var current = State()
+    private var accumulator: CFTimeInterval = 0
 
-    init(initial: ScrollMotionSample, duration: CFTimeInterval) {
-        self.initial = initial
-        self.duration = max(0.001, duration)
+    /// Always zero in this phase; see the type-level doc comment.
+    var target: CGFloat = 0
+    private(set) var stiffness: Double = ScrollFollower.softStartStiffness
+    /// Peak-hold-with-decay estimate of the gap between scroll-frame
+    /// arrivals, fed by the host's cadence tracking. Used only to cap `ω` so
+    /// the settle horizon spans high-latency bursts; see `angularFrequency`.
+    var estimatedArrivalGap: CFTimeInterval = 0
+    private(set) var isActive = false
+
+    /// `ω = √stiffness`, capped so the settle time (`4/ω`) spans roughly two
+    /// observed arrival gaps on a high-latency transport, and floored so
+    /// that stretch never exceeds `maximumSettleDuration`.
+    var angularFrequency: CGFloat {
+        let natural = CGFloat(stiffness.squareRoot())
+        guard estimatedArrivalGap > Self.cadenceStretchThreshold else { return natural }
+        let stretched = CGFloat(4 / (Self.cadenceStretchFactor * estimatedArrivalGap))
+        let floor = CGFloat(4 / Self.maximumSettleDuration)
+        return max(floor, min(natural, stretched))
     }
 
-    var isFinished: Bool { elapsed >= duration }
-
-    var sample: ScrollMotionSample {
-        guard !isFinished else { return ScrollMotionSample() }
-        let u = CGFloat(min(1, max(0, elapsed / duration)))
-        let u2 = u * u
-        let u3 = u2 * u
-        let u4 = u3 * u
-        let u5 = u4 * u
-        let time = CGFloat(duration)
-
-        // Quintic Hermite basis for initial position/velocity/acceleration,
-        // with final position/velocity/acceleration all equal to zero.
-        let hPosition = 1 - 10 * u3 + 15 * u4 - 6 * u5
-        let hVelocity = u - 6 * u3 + 8 * u4 - 3 * u5
-        let hAcceleration = 0.5 * (u2 - 3 * u3 + 3 * u4 - u5)
-
-        let dhPosition = -30 * u2 + 60 * u3 - 30 * u4
-        let dhVelocity = 1 - 18 * u2 + 32 * u3 - 15 * u4
-        let dhAcceleration = u - 4.5 * u2 + 6 * u3 - 2.5 * u4
-
-        let ddhPosition = -60 * u + 180 * u2 - 120 * u3
-        let ddhVelocity = -36 * u + 96 * u2 - 60 * u3
-        let ddhAcceleration = 1 - 9 * u + 18 * u2 - 10 * u3
-
-        return ScrollMotionSample(
-            position: hPosition * initial.position
-                + hVelocity * time * initial.velocity
-                + hAcceleration * time * time * initial.acceleration,
-            velocity: dhPosition * initial.position / time
-                + dhVelocity * initial.velocity
-                + dhAcceleration * time * initial.acceleration,
-            acceleration: ddhPosition * initial.position / (time * time)
-                + ddhVelocity * initial.velocity / time
-                + ddhAcceleration * initial.acceleration)
+    /// The follower's exact state at "now": whole `substep`s already folded
+    /// into `current` by `advance(by:)`, plus one more closed-form step for
+    /// the leftover fractional remainder in `accumulator`. Unlike a generic
+    /// fixed-step integrator, the closed form is stable and exact at any
+    /// `dt` (Holden), so this remainder step is an exact analytic
+    /// extrapolation, not a linear approximation toward a stale
+    /// once-per-substep sample — which matters here because `substep`
+    /// (1/120 s) is also the typical display-callback period: a caller that
+    /// always advances by exactly one substep would otherwise see `current`
+    /// change on every call but the *interpolated* readout stay perpetually
+    /// one substep stale, so a retarget's motion would not become visible
+    /// until the *second* subsequent callback.
+    private var readout: State {
+        accumulator > 0 ? step(current, dt: accumulator) : current
     }
 
+    var position: CGFloat { isActive ? readout.position : target }
+    var velocity: CGFloat { isActive ? readout.velocity : 0 }
+    /// Diagnostics only, evaluated at the extrapolated readout — not itself
+    /// integrated.
+    var acceleration: CGFloat {
+        guard isActive else { return 0 }
+        let omega = angularFrequency
+        return -omega * omega * (position - target) - 2 * omega * velocity
+    }
+
+    /// Select the stiffness for the glide this arrival starts. `gap` is the
+    /// elapsed time since the previous movement-carrying arrival (`nil` for
+    /// the very first one); `previousGap` is the gap before that. Firefox
+    /// `ComputeSpringConstant`.
+    mutating func updateStiffness(gap: CFTimeInterval?, previousGap: CFTimeInterval?) {
+        guard let gap else {
+            stiffness = Self.softStartStiffness
+            return
+        }
+        if gap >= Self.gestureRestartGap {
+            stiffness = Self.softStartStiffness
+        } else if gap >= Self.stoppingGapFloor, let previousGap,
+            gap >= Self.stoppingGapRatio * previousGap
+        {
+            stiffness = Self.stoppingStiffness
+        } else {
+            stiffness = Self.steadyStiffness
+        }
+    }
+
+    /// Move the follower's state by `delta` rows without resetting velocity
+    /// — the retarget that keeps the camera continuous across a filmstrip
+    /// rotation. Clamped to `±bound` (the retained-history filmstrip
+    /// bound — Neovide's clamp), then the resulting velocity is clamped so
+    /// an arrival cannot leave the spring carrying more energy than its own
+    /// remaining error could produce (Firefox bug 1846935).
+    mutating func retarget(byRows delta: CGFloat, bound: CGFloat) {
+        guard delta != 0 else { return }
+        let clampBound = max(0, bound)
+        current.position = clampPosition(current.position + delta, bound: clampBound)
+        current.velocity = clampVelocity(current.velocity, position: current.position)
+        isActive = true
+    }
+
+    private func clampPosition(_ position: CGFloat, bound: CGFloat) -> CGFloat {
+        min(bound, max(-bound, position))
+    }
+
+    private func clampVelocity(_ velocity: CGFloat, position: CGFloat) -> CGFloat {
+        let limit = angularFrequency * abs(position - target)
+        guard abs(velocity) > limit else { return velocity }
+        return velocity < 0 ? -limit : limit
+    }
+
+    /// Closed-form critically damped step, stable at any `dt` (Holden
+    /// `simple_spring_damper_exact`; Juckett; Neovide).
+    private func step(_ state: State, dt: CFTimeInterval) -> State {
+        let omega = angularFrequency
+        let time = CGFloat(dt)
+        let j0 = state.position - target
+        let j1 = state.velocity + j0 * omega
+        let decay = exp(-omega * time)
+        return State(
+            position: decay * (j0 + j1 * time) + target,
+            velocity: decay * (state.velocity - j1 * omega * time))
+    }
+
+    /// Integrate whole `substep`s into `current` — independent of the
+    /// caller's frame rate (Fiedler, "Fix Your Timestep!"; Firefox
+    /// `AxisPhysicsModel`) — leaving any fractional remainder in
+    /// `accumulator` for `readout` to extrapolate exactly.
     mutating func advance(by elapsed: CFTimeInterval) {
-        self.elapsed = min(duration, self.elapsed + max(0, elapsed))
-    }
-}
-
-/// A gesture-level camera envelope. Every authoritative displacement adds a
-/// C2 residual pulse; overlapping pulses turn repeated rows into one smooth
-/// velocity envelope without changing derivatives at insertion boundaries.
-struct ContinuousScrollEnvelope: Equatable {
-    private(set) var segments: [MinimumJerkScrollSegment] = []
-
-    var sample: ScrollMotionSample {
-        segments.reduce(ScrollMotionSample()) { $0 + $1.sample }
-    }
-    var position: CGFloat { sample.position }
-    var velocity: CGFloat { sample.velocity }
-    var acceleration: CGFloat { sample.acceleration }
-    var isActive: Bool { !segments.isEmpty }
-    var negativeMagnitude: CGFloat {
-        -segments.reduce(CGFloat.zero) { result, segment in
-            result + min(0, segment.sample.position)
+        guard isActive else { return }
+        accumulator += min(max(0, elapsed), Self.maximumAdvance)
+        while accumulator >= Self.substep {
+            current = step(current, dt: Self.substep)
+            accumulator -= Self.substep
         }
-    }
-    var positiveMagnitude: CGFloat {
-        segments.reduce(CGFloat.zero) { result, segment in
-            result + max(0, segment.sample.position)
-        }
+        if isSettled(readout) { settle() }
     }
 
-    mutating func add(positionOffset: CGFloat, duration: CFTimeInterval) {
-        guard positionOffset != 0 else { return }
-        segments.append(MinimumJerkScrollSegment(
-            initial: ScrollMotionSample(position: positionOffset),
-            duration: duration))
-    }
-
-    /// Longest time before every residual reaches rest.
-    var remainingDuration: CFTimeInterval {
-        segments.reduce(0) { max($0, $1.duration - $1.elapsed) }
-    }
-
-    /// C2-consolidate the envelope so it keeps moving for at least
-    /// `duration`. The summed sample continues as one residual with the same
-    /// position, velocity, and acceleration, still ending at rest —
-    /// displacement invariants are unchanged, only the decay horizon moves.
-    /// Consolidation nets mixed-sign residuals into one signed budget; the
-    /// retained-history availability check on the next rotation remains the
-    /// backstop when that netting was optimistic.
-    mutating func ensureRemaining(atLeast duration: CFTimeInterval) {
-        guard isActive, remainingDuration < duration else { return }
-        segments = [MinimumJerkScrollSegment(initial: sample, duration: duration)]
-    }
-
-    mutating func advance(by elapsed: CFTimeInterval) {
-        guard elapsed > 0 else { return }
-        for index in segments.indices {
-            segments[index].advance(by: elapsed)
-        }
-        segments.removeAll(where: \.isFinished)
+    private func isSettled(_ state: State) -> Bool {
+        guard abs(state.position - target) < Self.settleEpsilon else { return false }
+        let omega = angularFrequency
+        let projectedVelocityError = abs(state.velocity) * (4 / max(omega, .leastNormalMagnitude))
+        return projectedVelocityError < Self.settleEpsilon
     }
 
     mutating func settle() {
-        segments.removeAll(keepingCapacity: true)
+        current = State(position: target, velocity: 0)
+        accumulator = 0
+        isActive = false
     }
 }
 
@@ -287,8 +359,11 @@ package struct ScrollDiagnosticSample: Sendable, Equatable {
     package let snappedTranslationPixels: Int
     package let cursorAuthoritativeY: CGFloat?
     package let cursorVisualY: CGFloat?
-    /// The latency-adaptive residual duration in effect for new arrivals.
+    /// The follower's current settle-time estimate (`4 / ω`), for parity
+    /// with the previous latency-adaptive residual duration.
     package let envelopeDuration: CFTimeInterval
+    /// The follower's current spring stiffness (s⁻²).
+    package let stiffness: Double
 }
 
 private struct RowLayerBinding: Equatable {
@@ -307,52 +382,44 @@ private struct FilmstripSlot {
 /// crossed and translates one clipped container between those boundaries.
 @MainActor
 final class SmoothViewportState {
-    /// At this width, three 60 ms row steps already overlap; denser wheel and
-    /// key-repeat streams converge on a nearly flat, continuous velocity.
-    /// This is the base residual duration for local-cadence delivery; see
-    /// `adaptiveEnvelopeDuration` for high-latency transports.
-    static let motionEnvelopeDuration: CFTimeInterval = 0.180
-    /// Latency-adaptive ceiling. High-latency transports (an ssh bridge to a
-    /// remote nvim) deliver scroll frames in RTT-sized bursts 100–300 ms
-    /// apart; a base-width envelope decays to rest between bursts and the
-    /// gesture lurches. Residuals may stretch up to this long so velocity
-    /// spans the gap to the next burst instead of settling at each one.
-    static let maximumMotionEnvelopeDuration: CFTimeInterval = 0.480
-    /// Arrival gaps at or below this are local-pipe cadence and keep the base
-    /// envelope. `threshold × stretch factor == base duration`, so the
-    /// stretched duration is continuous across this boundary.
-    static let cadenceStretchThreshold: CFTimeInterval = 0.090
     /// A gap longer than this is a pause between gestures, not delivery
-    /// cadence; it neither feeds nor resets the estimate (transport latency
-    /// is a session property, not a gesture property).
+    /// cadence; it neither feeds nor resets the peak-hold estimate below
+    /// (transport latency is a session property, not a gesture property).
+    /// A gap this long already reads as a fresh gesture to
+    /// `ScrollFollower.updateStiffness`, so it needs no separate handling
+    /// there.
     static let cadenceGestureWindow: CFTimeInterval = 0.600
     /// Per-arrival decay of the peak-hold cadence estimate. About fifteen
     /// dense local arrivals — a fraction of a second of wheel motion — fully
     /// unlearn a stretched remote cadence after a transport hiccup.
     static let cadenceDecay: Double = 0.9
-    /// The envelope outlives roughly two observed arrival gaps, so the next
-    /// burst always lands mid-envelope with velocity still nonzero.
-    static let cadenceStretchFactor: Double = 2.0
 
     let gridID: Int
 
     private(set) var geometry = SmoothViewportGeometry(rows: 0, cols: 0, margins: nil)
     private(set) var history = CircularRowHistory<SharedImageRow>(capacity: 0)
-    private(set) var motion = ContinuousScrollEnvelope()
-    /// Backlog absorber for sustained far scrolling. The fixed-duration
-    /// envelope drains debt too slowly under page-jump storms, forcing
-    /// per-event cuts at the retained-history bound; this spring's drain
-    /// rate scales with the backlog, so storms reach a smooth equilibrium
-    /// below the physical one-screenful limit.
-    private(set) var catchUp = CriticalDampedSpring(
-        animationLength: SmoothViewportState.motionEnvelopeDuration)
+    /// The single camera follower. Replaces the previous fixed-duration
+    /// residual envelope plus a separate backlog spring: one
+    /// `(position, velocity)` pair retargeted on every arrival, including
+    /// far-jump cuts and sustained backlog, stays continuous and reaches a
+    /// smooth equilibrium below the retained-history bound without a
+    /// separate regime switch.
+    private(set) var follower = ScrollFollower()
     private(set) var isActive = false
     private(set) var lastSemanticDelta = 0
     /// Peak-hold-with-decay estimate of the gap between scroll-frame
     /// arrivals. Zero until two movement-carrying frames arrive within one
-    /// gesture window of each other.
+    /// gesture window of each other. Feeds `follower.estimatedArrivalGap`,
+    /// which only caps the settle horizon (see `ScrollFollower.
+    /// angularFrequency`) — it does not select the stiffness.
     private(set) var estimatedArrivalGap: CFTimeInterval = 0
     private var lastScrollArrival: CFTimeInterval?
+    /// The raw gap before the most recent one, feeding
+    /// `ScrollFollower.updateStiffness`'s "coming to a stop" rule. Unlike
+    /// `estimatedArrivalGap` this is never filtered by
+    /// `cadenceGestureWindow` — a long pause already reads as a fresh
+    /// gesture through the stiffness rule's own gap threshold.
+    private var previousArrivalGap: CFTimeInterval?
 
     private weak var hostLayer: CALayer?
     private let baseLayer = CALayer()
@@ -382,21 +449,9 @@ final class SmoothViewportState {
         clipLayer.addSublayer(rowContainerLayer)
     }
 
-    /// The residual duration for newly arriving displacement: the base
-    /// envelope on a local-cadence stream, stretched toward two observed
-    /// arrival gaps (bounded) when frames arrive in high-latency bursts.
-    var adaptiveEnvelopeDuration: CFTimeInterval {
-        guard estimatedArrivalGap > Self.cadenceStretchThreshold else {
-            return Self.motionEnvelopeDuration
-        }
-        return min(
-            Self.maximumMotionEnvelopeDuration,
-            estimatedArrivalGap * Self.cadenceStretchFactor)
-    }
-
-    var position: CGFloat { motion.position + catchUp.position }
-    var velocity: CGFloat { motion.velocity + catchUp.velocity }
-    var acceleration: CGFloat { motion.acceleration }
+    var position: CGFloat { follower.position }
+    var velocity: CGFloat { follower.velocity }
+    var acceleration: CGFloat { follower.acceleration }
     var snappedTranslationY: CGFloat {
         lastTranslationY.isFinite
             ? lastTranslationY
@@ -497,8 +552,7 @@ final class SmoothViewportState {
             self.cellSize = cellSize
             self.scale = nextScale
             rebuildLayers()
-            motion.settle()
-            catchUp.settle()
+            follower.settle()
             isActive = false
             authoritativeRows = nextRows
             bindAuthoritativeRows()
@@ -566,14 +620,14 @@ final class SmoothViewportState {
             lastSemanticDelta = displacement != 0
                 ? displacement
                 : (semanticMotion?.lastDelta ?? delta)
-            isActive = motion.isActive || !catchUp.isSettled
+            isActive = follower.isActive
         }
         render(forceBindings: false)
         return eligible && hasAuthoritativeRows && isActive
     }
 
-    /// Advance every active analytical residual to the latest display target.
-    /// Delayed callbacks render only that exact resulting filmstrip position.
+    /// Advance the follower to the latest display target. Delayed callbacks
+    /// render only that exact resulting filmstrip position.
     @discardableResult
     func advance(
         by elapsed: CFTimeInterval,
@@ -585,28 +639,19 @@ final class SmoothViewportState {
         _ = nominalDisplayPeriod
         _ = detectDisplayGap
 
-        if isActive {
-            motion.advance(by: bounded)
-            if !catchUp.isSettled {
-                catchUp.advance(by: bounded)
-                if catchUp.isSettled { catchUp.settle() }
-            }
-            if !motion.isActive, catchUp.isSettled {
-                motion.settle()
-                catchUp.settle()
-                isActive = false
-                lastSemanticDelta = 0
-                discardNonCurrentHistory()
-            }
-            render(forceBindings: false)
+        follower.advance(by: bounded)
+        if !follower.isActive {
+            isActive = false
+            lastSemanticDelta = 0
+            discardNonCurrentHistory()
         }
+        render(forceBindings: false)
 
         return isActive
     }
 
     func settle() {
-        motion.settle()
-        catchUp.settle()
+        follower.settle()
         isActive = false
         lastSemanticDelta = 0
         discardNonCurrentHistory()
@@ -646,37 +691,46 @@ final class SmoothViewportState {
     ) -> ScrollDiagnosticSample {
         ScrollDiagnosticSample(
             timestamp: timestamp, gridID: gridID, delta: lastSemanticDelta,
-            historyHead: history.head, position: motion.position,
-            velocity: motion.velocity, acceleration: motion.acceleration,
+            historyHead: history.head, position: follower.position,
+            velocity: follower.velocity, acceleration: follower.acceleration,
             snappedTranslationPixels: snappedTranslationPixels,
             cursorAuthoritativeY: cursorAuthoritativeY,
             cursorVisualY: cursorVisualY,
-            envelopeDuration: adaptiveEnvelopeDuration)
+            envelopeDuration: 4 / Double(follower.angularFrequency),
+            stiffness: follower.stiffness)
     }
 
-    /// Gesture-aware velocity hold. The host reports a wheel step it just
-    /// sent whose authoritative response has not arrived; stretch the active
-    /// envelope so the camera is still moving when that response lands
-    /// instead of decaying to rest inside the round trip. Every residual
-    /// still ends at zero displacement, so an unanswered step — a wheel
-    /// event at the buffer edge that Neovim ignores — simply glides out at
-    /// the authoritative viewport with no correction to unwind.
-    func noteScrollInputPending() {
-        guard isActive, motion.isActive else { return }
-        motion.ensureRemaining(atLeast: adaptiveEnvelopeDuration)
-    }
+    /// The host reports a wheel step it just sent whose authoritative
+    /// response has not arrived. Kept for source compatibility with
+    /// `GridSurfaceView`'s wheel bookkeeping, which calls this on every
+    /// wheel step; intentionally inert for now. A future phase will use the
+    /// pending step to retarget the follower toward the predicted offset
+    /// while the round trip is in flight, instead of stretching a residual's
+    /// duration as the previous design did.
+    func noteScrollInputPending() {}
 
-    /// Fold one movement-carrying arrival into the cadence estimate. The
-    /// peak-hold keeps the estimate at the burst spacing rather than the
-    /// intra-burst spacing (a burst delivers several frames a few ms apart
-    /// and then nothing for a round trip), while the per-arrival decay lets
-    /// a dense local stream unlearn a stretched cadence quickly.
+    /// Fold one movement-carrying arrival into both the peak-hold cadence
+    /// estimate (which only caps the follower's settle horizon on
+    /// high-latency transports) and the raw last-two-gap history that
+    /// selects the follower's stiffness for the glide this arrival starts
+    /// (Firefox `ComputeSpringConstant`). The peak-hold keeps the estimate
+    /// at the burst spacing rather than the intra-burst spacing (a burst
+    /// delivers several frames a few ms apart and then nothing for a round
+    /// trip), while the per-arrival decay lets a dense local stream unlearn
+    /// a stretched cadence quickly.
     private func updateArrivalCadence(_ timestamp: CFTimeInterval) {
         defer { lastScrollArrival = timestamp }
-        guard let lastScrollArrival else { return }
+        guard let lastScrollArrival else {
+            follower.updateStiffness(gap: nil, previousGap: nil)
+            return
+        }
         let gap = timestamp - lastScrollArrival
-        guard gap > 0, gap <= Self.cadenceGestureWindow else { return }
+        guard gap > 0 else { return }
+        follower.updateStiffness(gap: gap, previousGap: previousArrivalGap)
+        previousArrivalGap = gap
+        guard gap <= Self.cadenceGestureWindow else { return }
         estimatedArrivalGap = max(gap, estimatedArrivalGap * Self.cadenceDecay)
+        follower.estimatedArrivalGap = estimatedArrivalGap
     }
 
     // MARK: - History
@@ -690,18 +744,15 @@ final class SmoothViewportState {
 
         let direction = trueFar ? farDirection : delta.signum()
         guard direction != 0 else { return false }
-        let catchingUp = !catchUp.isSettled
 
-        if trueFar, !motion.isActive, !catchingUp {
+        if trueFar, !follower.isActive {
             // An isolated far jump stays a cut: teleport with a one-row cue.
             discardNonCurrentHistory()
             guard copyDisplacedRows(for: direction) else { return false }
             history.rotate(by: direction)
             shiftFilmstripSlots(by: -direction)
-            motion.settle()
-            motion.add(
-                positionOffset: -CGFloat(direction),
-                duration: Self.motionEnvelopeDuration)
+            follower.settle()
+            follower.retarget(byRows: -CGFloat(direction), bound: CGFloat(height))
             return true
         }
 
@@ -713,33 +764,13 @@ final class SmoothViewportState {
         history.rotate(by: animatedDelta)
         shiftFilmstripSlots(by: -animatedDelta)
 
+        // The follower's own ±height retarget clamp replaces the previous
+        // two-regime split (a fixed-duration envelope while capacity
+        // remained, migrating into a separate backlog spring beyond it):
+        // one continuous follower already reaches a smooth equilibrium at
+        // the retained-history bound under sustained far input.
         let requestedOffset = -CGFloat(animatedDelta)
-        if !trueFar, !catchingUp {
-            let capacity = CGFloat(height)
-            let available = requestedOffset < 0
-                ? max(0, capacity - motion.negativeMagnitude)
-                : max(0, capacity - motion.positiveMagnitude)
-            if abs(requestedOffset) <= available {
-                motion.add(
-                    positionOffset: requestedOffset,
-                    duration: adaptiveEnvelopeDuration)
-                return true
-            }
-        }
-
-        // Catch-up regime: migrating the envelope's position and velocity
-        // into the spring keeps the camera continuous; only the retained-
-        // history screenful remains a hard bound, and in equilibrium the
-        // spring's backlog-proportional drain stays below it. The spring
-        // matches the adaptive width so it, too, spans inter-burst gaps on
-        // high-latency transports instead of settling between them.
-        catchUp.animationLength = adaptiveEnvelopeDuration
-        catchUp.position += motion.position
-        catchUp.velocity += motion.velocity
-        motion.settle()
-        catchUp.position = max(
-            -CGFloat(height),
-            min(CGFloat(height), catchUp.position + requestedOffset))
+        follower.retarget(byRows: requestedOffset, bound: CGFloat(height))
         return true
     }
 

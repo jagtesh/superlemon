@@ -643,90 +643,120 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
         #expect(abs(monotonic.position) < 0.000_1)
     }
 
-    @Test func minimumJerkSegmentHasExactC2EndpointsAndSymmetry() {
-        let duration = 0.180
-        var down = MinimumJerkScrollSegment(
-            initial: ScrollMotionSample(position: -1), duration: duration)
-        var up = MinimumJerkScrollSegment(
-            initial: ScrollMotionSample(position: 1), duration: duration)
+    // MARK: - ScrollFollower (single retargeted critically damped follower)
+    //
+    // Replaces the previous sum-of-per-arrival-residuals design
+    // (`ContinuousScrollEnvelope`/`MinimumJerkScrollSegment`) and its
+    // separate backlog spring (`catchUp`). The tests below exercise the
+    // follower directly (it is a value type, so this is a true unit test)
+    // and the cadence/latency integration through `SmoothViewportState`
+    // stays covered by the bursty/dense-cadence tests further down.
 
-        #expect(down.sample == ScrollMotionSample(position: -1))
-        #expect(up.sample == ScrollMotionSample(position: 1))
-        var previous = down.sample.position
-        for _ in 0..<180 {
-            down.advance(by: 0.001)
-            up.advance(by: 0.001)
-            #expect(down.sample.position >= previous)
-            #expect(down.sample.position <= 0)
-            #expect(down.sample.position == -up.sample.position)
-            #expect(down.sample.velocity == -up.sample.velocity)
-            #expect(down.sample.acceleration == -up.sample.acceleration)
-            previous = down.sample.position
-        }
-        #expect(down.sample == ScrollMotionSample())
-        #expect(up.sample == ScrollMotionSample())
-    }
+    @Test func slowCadenceArrivalsProduceNoIsolatedVelocityPulses() {
+        // Five one-row arrivals 400 ms apart, each with plenty of time to
+        // fully settle before the next one lands: this must decay smoothly
+        // to rest every time, never overshooting past the origin and back
+        // (the isolated 0→peak→0 pulse the previous per-arrival design
+        // produced once arrivals were spaced wider than half a bell).
+        var follower = ScrollFollower()
+        let step: CFTimeInterval = 1.0 / 60.0
+        let gap: CFTimeInterval = 0.400
+        let ticksPerGap = Int((gap / step).rounded())
 
-    @Test func fiveRowBurstPreservesC2CameraAndStopsExactly() {
-        let duration = 0.180
-        let period = 1.0 / 120.0
-        var motion = ContinuousScrollEnvelope()
-        var semanticRows: CGFloat = 0
-
-        for input in 1...5 {
-            if input > 1 { motion.advance(by: period) }
-            let before = motion.sample
-            let cameraBefore = semanticRows + before.position
-            semanticRows += 1
-            motion.add(positionOffset: -1, duration: duration)
-            let after = motion.sample
-            #expect(abs(semanticRows + after.position - cameraBefore) < 0.000_001)
-            #expect(after.velocity == before.velocity)
-            #expect(after.acceleration == before.acceleration)
-            if input >= 3 { #expect(after.velocity > 0) }
-        }
-
-        var previousCamera = semanticRows + motion.position
-        for _ in 0..<240 where motion.isActive {
-            motion.advance(by: period)
-            let camera = semanticRows + motion.position
-            #expect(camera >= previousCamera)
-            #expect(camera <= semanticRows)
-            previousCamera = camera
-        }
-        #expect(!motion.isActive)
-        #expect(motion.sample == ScrollMotionSample())
-        #expect(previousCamera == 5)
-    }
-
-    @Test func identicalEnvelopeTimelineMatchesAt60And120Hz() {
-        let duration = 0.180
-        func trajectory(hz: Int) -> [ScrollMotionSample] {
-            var motion = ContinuousScrollEnvelope()
-            var result: [ScrollMotionSample] = []
-            let period = 1.0 / Double(hz)
-            for frame in 0...(hz * 3 / 5) {
-                if frame > 0 { motion.advance(by: period) }
-                let time = Double(frame) * period
-                let eventIndex = Int((time * 60).rounded())
-                if eventIndex < 5,
-                    abs(time - Double(eventIndex) / 60.0) < 0.000_001
-                {
-                    motion.add(positionOffset: -1, duration: duration)
-                }
-                result.append(motion.sample)
+        for _ in 0..<5 {
+            follower.retarget(byRows: -1, bound: 1000)
+            var previousPosition = follower.position
+            for _ in 0..<ticksPerGap {
+                follower.advance(by: step)
+                // Moving up from a negative offset toward zero: velocity
+                // must stay non-negative throughout the glide, and position
+                // must climb monotonically without crossing the target.
+                #expect(follower.velocity >= -0.000_001)
+                #expect(follower.position >= previousPosition - 0.000_001)
+                #expect(follower.position <= 0.000_001)
+                previousPosition = follower.position
             }
-            return result
         }
-        let at60 = trajectory(hz: 60)
-        let at120 = trajectory(hz: 120)
-        for index in at60.indices where index * 2 < at120.count {
-            let lhs = at60[index]
-            let rhs = at120[index * 2]
-            #expect(abs(lhs.position - rhs.position) < 0.000_001)
-            #expect(abs(lhs.velocity - rhs.velocity) < 0.000_001)
-            #expect(abs(lhs.acceleration - rhs.acceleration) < 0.000_001)
+    }
+
+    @Test func denseCadenceArrivalsNeverOvershootPastTheOrigin() {
+        // Twenty one-row arrivals 10 ms apart — far denser than the
+        // follower's settle time — must never cross the origin (the up to
+        // 2x overshoot the previous design produced at dense cadence), and
+        // the velocity clamp applied on every retarget must hold.
+        var follower = ScrollFollower()
+        let step: CFTimeInterval = 0.010
+
+        for _ in 0..<20 {
+            follower.retarget(byRows: -1, bound: 1000)
+            let omega = follower.angularFrequency
+            #expect(abs(follower.velocity) <= omega * abs(follower.position) + 0.000_001)
+            #expect(follower.position <= 0)
+            follower.advance(by: step)
+            #expect(follower.position <= 0)
         }
+    }
+
+    @Test func arrivalCadenceSelectsFirefoxStiffnessRule() {
+        var follower = ScrollFollower()
+        follower.updateStiffness(gap: nil, previousGap: nil)
+        #expect(follower.stiffness == ScrollFollower.softStartStiffness)
+
+        follower.updateStiffness(gap: 0.020, previousGap: nil)
+        #expect(follower.stiffness == ScrollFollower.steadyStiffness)
+
+        follower.updateStiffness(gap: 0.020, previousGap: 0.020)
+        #expect(follower.stiffness == ScrollFollower.steadyStiffness)
+
+        // 40 ms is ≥ 1.3x the previous 20 ms gap: coming to a stop.
+        follower.updateStiffness(gap: 0.040, previousGap: 0.020)
+        #expect(follower.stiffness == ScrollFollower.stoppingStiffness)
+
+        // 130 ms clears the fresh-gesture threshold outright, regardless of
+        // the stopping rule.
+        follower.updateStiffness(gap: 0.130, previousGap: 0.040)
+        #expect(follower.stiffness == ScrollFollower.softStartStiffness)
+    }
+
+    @Test func fixedSubstepIntegrationIsDeterministicAcrossCallBoundaries() {
+        var a = ScrollFollower()
+        a.retarget(byRows: -5, bound: 1000)
+        var b = a
+
+        a.advance(by: 1.0 / 30.0)
+        b.advance(by: 1.0 / 60.0)
+        b.advance(by: 1.0 / 60.0)
+
+        #expect(abs(a.position - b.position) < 0.000_001)
+        #expect(abs(a.velocity - b.velocity) < 0.000_001)
+
+        // A stalled callback must not replay an unbounded number of
+        // substeps: elapsed beyond the cap advances only `maximumAdvance`
+        // seconds' worth.
+        var clamped = ScrollFollower()
+        clamped.retarget(byRows: -5, bound: 1000)
+        var capped = clamped
+        clamped.advance(by: 5.0)
+        capped.advance(by: ScrollFollower.maximumAdvance)
+        #expect(clamped.position == capped.position)
+        #expect(clamped.velocity == capped.velocity)
+    }
+
+    @Test func followerSettlesExactlyAtTarget() {
+        var follower = ScrollFollower()
+        follower.retarget(byRows: -3, bound: 1000)
+        for _ in 0..<600 where follower.isActive {
+            follower.advance(by: 1.0 / 120.0)
+        }
+        #expect(!follower.isActive)
+        #expect(follower.position == follower.target)
+        #expect(follower.velocity == 0)
+    }
+
+    @Test func highLatencyCadenceStretchesTheAngularFrequency() {
+        var follower = ScrollFollower()
+        follower.estimatedArrivalGap = 0.2
+        #expect(abs(Double(follower.angularFrequency) - 10) < 0.000_001)
     }
 
     @Test func stateSeedsTwoViewportHistoryAndAnimatesSharedImageRows() {
@@ -857,7 +887,7 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
         #expect(state.isActive)
     }
 
-    @Test func burstyArrivalCadenceStretchesTheEnvelopeAcrossGaps() {
+    @Test func burstyArrivalCadenceStretchesTheFollowerAcrossGaps() {
         let host = CALayer()
         let image = solidImage(width: 80, height: 96)
         let state = SmoothViewportState(gridID: 11)
@@ -866,24 +896,28 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
             semanticDelta: nil, cellSize: cellSize, scale: 1, host: host,
             animate: true, arrivalTimestamp: 10.0)
 
-        // The first movement arrival has no measurable gap: base width.
+        // The first movement arrival has no measurable gap: natural,
+        // unstretched frequency.
         #expect(presentOneRowStep(state, image: image, host: host, at: 10.0))
-        #expect(state.adaptiveEnvelopeDuration
-            == SmoothViewportState.motionEnvelopeDuration)
+        #expect(abs(Double(state.follower.angularFrequency)
+            - state.follower.stiffness.squareRoot()) < 0.000_001)
 
-        // The base envelope settles before a 250 ms round trip completes —
-        // this is the inter-burst lurch on a high-latency transport.
+        // The natural-frequency glide settles before a 250 ms round trip
+        // completes — this is the inter-burst lurch on a high-latency
+        // transport.
         for _ in 0..<30 { _ = state.advance(by: 1.0 / 120.0) }
         #expect(!state.isActive)
 
         // The second arrival, one round trip later, teaches the cadence and
-        // stretches new residuals to the bounded two-gap width.
+        // stretches the follower's settle horizon to its bounded ceiling
+        // (4 / maximumSettleDuration, since an uncapped 0.25 s gap would
+        // stretch the horizon past that ceiling).
         #expect(presentOneRowStep(state, image: image, host: host, at: 10.25))
         #expect(abs(state.estimatedArrivalGap - 0.25) < 0.000_001)
-        #expect(abs(state.adaptiveEnvelopeDuration
-            - SmoothViewportState.maximumMotionEnvelopeDuration) < 0.000_001)
+        #expect(abs(Double(state.follower.angularFrequency)
+            - 4 / ScrollFollower.maximumSettleDuration) < 0.000_001)
 
-        // The stretched envelope is still carrying velocity when the next
+        // The stretched follower is still carrying velocity when the next
         // burst lands one gap later, so the camera never comes to rest.
         for _ in 0..<30 { _ = state.advance(by: 1.0 / 120.0) }
         #expect(state.isActive)
@@ -891,7 +925,7 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
         #expect(state.isActive)
     }
 
-    @Test func denseLocalCadenceKeepsAndRestoresTheBaseEnvelope() {
+    @Test func denseLocalCadenceKeepsAndRestoresTheNaturalFrequency() {
         let host = CALayer()
         let image = solidImage(width: 80, height: 96)
         let state = SmoothViewportState(gridID: 12)
@@ -903,8 +937,9 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
         // Learn a remote cadence first.
         _ = presentOneRowStep(state, image: image, host: host, at: 10.0)
         _ = presentOneRowStep(state, image: image, host: host, at: 10.30)
-        #expect(state.adaptiveEnvelopeDuration
-            > SmoothViewportState.motionEnvelopeDuration)
+        #expect(state.estimatedArrivalGap > ScrollFollower.cadenceStretchThreshold)
+        #expect(state.follower.angularFrequency
+            < CGFloat(state.follower.stiffness.squareRoot()))
 
         // A dense local stream (about 60 Hz) decays the peak-hold estimate
         // back below the stretch threshold within a fraction of a second.
@@ -915,36 +950,12 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
             _ = state.advance(by: 0.016)
         }
         #expect(state.estimatedArrivalGap
-            <= SmoothViewportState.cadenceStretchThreshold)
-        #expect(state.adaptiveEnvelopeDuration
-            == SmoothViewportState.motionEnvelopeDuration)
+            <= ScrollFollower.cadenceStretchThreshold)
+        #expect(abs(Double(state.follower.angularFrequency)
+            - state.follower.stiffness.squareRoot()) < 0.000_001)
     }
 
-    @Test func envelopeConsolidationIsC2ContinuousAndStillEndsAtRest() {
-        var motion = ContinuousScrollEnvelope()
-        motion.add(positionOffset: -1, duration: 0.180)
-        motion.advance(by: 0.100)
-        motion.add(positionOffset: -1, duration: 0.180)
-        motion.advance(by: 0.050)
-
-        let before = motion.sample
-        motion.ensureRemaining(atLeast: 0.480)
-        let after = motion.sample
-        #expect(abs(before.position - after.position) < 0.000_001)
-        #expect(abs(before.velocity - after.velocity) < 0.000_001)
-        #expect(abs(before.acceleration - after.acceleration) < 0.000_001)
-        #expect(abs(motion.remainingDuration - 0.480) < 0.000_001)
-
-        // A hold horizon at or below the current remaining time is a no-op.
-        let segments = motion.segments
-        motion.ensureRemaining(atLeast: 0.200)
-        #expect(motion.segments == segments)
-
-        for _ in 0..<120 { motion.advance(by: 1.0 / 120.0) }
-        #expect(!motion.isActive, "a consolidated residual still reaches rest")
-    }
-
-    @Test func pendingInputHoldsVelocityAcrossAResponseGap() {
+    @Test func noteScrollInputPendingIsANoOpUntilPhase4Prediction() {
         let host = CALayer()
         let image = solidImage(width: 80, height: 96)
         let state = SmoothViewportState(gridID: 23)
@@ -952,31 +963,20 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
             image: image, rows: 6, cols: 10, margins: nil, scrolls: [],
             semanticDelta: nil, cellSize: cellSize, scale: 1, host: host,
             animate: true, arrivalTimestamp: 10.0)
-
-        // Learn a 250 ms remote cadence.
         _ = presentOneRowStep(state, image: image, host: host, at: 10.0)
-        for _ in 0..<30 { _ = state.advance(by: 1.0 / 120.0) }
-        _ = presentOneRowStep(state, image: image, host: host, at: 10.25)
+        for _ in 0..<10 { _ = state.advance(by: 1.0 / 120.0) }
 
-        // Age the stretched envelope down to its tail, then report a wheel
-        // step whose response is still crossing the transport.
-        for _ in 0..<48 { _ = state.advance(by: 1.0 / 120.0) }  // 0.40 s
+        // Phase 4 will retarget the follower toward a predicted offset while
+        // a wheel step's authoritative response is in flight; until then the
+        // hook GridSurfaceView calls on every wheel step is wired but inert.
         let positionBefore = state.position
         let velocityBefore = state.velocity
+        let wasActive = state.isActive
         state.noteScrollInputPending()
-        #expect(abs(state.position - positionBefore) < 0.000_001)
-        #expect(abs(state.velocity - velocityBefore) < 0.000_001)
+        #expect(state.position == positionBefore)
+        #expect(state.velocity == velocityBefore)
+        #expect(state.isActive == wasActive)
 
-        // Without the hold the envelope had 80 ms left; with it the camera
-        // is still carrying motion when the response lands 250 ms later.
-        for _ in 0..<30 { _ = state.advance(by: 1.0 / 120.0) }  // 0.25 s
-        #expect(state.isActive)
-        #expect(presentOneRowStep(state, image: image, host: host, at: 10.90))
-        #expect(state.isActive)
-
-        // An unanswered step (buffer edge) still glides out at the
-        // authoritative viewport: residuals end at rest, nothing to unwind.
-        state.noteScrollInputPending()
         for _ in 0..<240 where state.isActive {
             _ = state.advance(by: 1.0 / 120.0)
         }
@@ -1002,11 +1002,16 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
         #expect(state.estimatedArrivalGap == 0)
         _ = presentOneRowStep(state, image: image, host: host, at: nil)
         #expect(state.estimatedArrivalGap == 0)
-        #expect(state.adaptiveEnvelopeDuration
-            == SmoothViewportState.motionEnvelopeDuration)
     }
 
-    @Test func reversalPreservesC2MotionAndReturnsToExactViewport() {
+    // A retargeted spring, unlike the previous jerk-limited residual, does
+    // not promise continuous acceleration (or even velocity, once the
+    // clamp engages) across a retarget — that is an inherent property of
+    // an instantaneous position correction on a spring, not a regression.
+    // What must still hold is the visual invariant that actually matters:
+    // the rendered camera does not jump at the moment of reversal, and the
+    // follower still reaches an exact, stable rest afterward.
+    @Test func reversalPreservesTheVisibleCameraAndSettlesExactly() {
         let rowPixels = Int(cellSize.height * 2)
         let period = 1.0 / 120.0
 
@@ -1035,8 +1040,6 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
                 var semanticRows = direction
                 let before = semanticRows * rowPixels
                     + state.snappedTranslationPixels
-                let velocityBefore = state.velocity
-                let accelerationBefore = state.acceleration
                 _ = state.present(
                     image: solidImage(width: 160, height: 192),
                     rows: 6, cols: 10, margins: nil,
@@ -1050,23 +1053,12 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
                     + state.snappedTranslationPixels
                 #expect(abs(atRetarget - before) <= 1,
                         "reversal retargeting must preserve the visible camera")
-                #expect(state.velocity == velocityBefore)
-                #expect(state.acceleration == accelerationBefore,
-                        "a row reversal must not add an acceleration tooth")
+                #expect(state.velocity.isFinite)
+                #expect(state.acceleration.isFinite)
 
-                var camera = [atRetarget]
-                var sawReverseVelocity = ticksBeforeReversal == 0
                 for _ in 0..<240 where state.isActive {
                     _ = state.advance(by: period, nominalDisplayPeriod: period)
-                    camera.append(semanticRows * rowPixels
-                        + state.snappedTranslationPixels)
-                    if state.velocity * CGFloat(direction) < 0 {
-                        sawReverseVelocity = true
-                    }
                 }
-                #expect(sawReverseVelocity,
-                        "the opposite pulse must smoothly turn carried momentum")
-                #expect(camera.last == 0)
                 #expect(!state.isActive)
                 #expect(state.position == 0)
                 #expect(state.velocity == 0)
@@ -1279,7 +1271,7 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
         }
     }
 
-    @Test func alternatingDirectionsBoundSignedResidualsAndCleanUpExactly() {
+    @Test func alternatingDirectionsNetExactlyAndSettleCleanly() {
         let rows = 6
         let host = CALayer()
         let image = solidImage(width: 80, height: 96)
@@ -1293,29 +1285,12 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
         let up = ScrollDelta(
             top: 0, bottom: rows, left: 0, right: 10, rows: -1, cols: 0)
 
-        // Net position remains zero after every pair. Each direction must
-        // nevertheless consume and clamp its own retained-history capacity
-        // while the envelope has room.
-        for pair in 1...rows {
-            _ = state.present(
-                image: image, rows: rows, cols: 10, margins: nil,
-                scrolls: [down], semanticDelta: 1, cellSize: cellSize,
-                scale: 1, host: host, animate: true)
-            #expect(state.motion.negativeMagnitude == CGFloat(pair))
-            #expect(state.motion.positiveMagnitude == CGFloat(pair - 1))
-
-            _ = state.present(
-                image: image, rows: rows, cols: 10, margins: nil,
-                scrolls: [up], semanticDelta: -1, cellSize: cellSize,
-                scale: 1, host: host, animate: true)
-            #expect(state.motion.negativeMagnitude == CGFloat(pair))
-            #expect(state.motion.positiveMagnitude == CGFloat(pair))
-        }
-
-        // Beyond envelope capacity the catch-up spring carries the debt.
-        // The presented camera invariant is what matters: one row behind
-        // after each down, exactly recovered after each up.
-        for _ in 1...rows {
+        // With no time elapsed between the two retargets of a pair, one row
+        // down immediately followed by one row up must land the camera back
+        // exactly where it started — the single follower has no separate
+        // per-direction capacity to exhaust the way the previous summed
+        // envelope did.
+        for _ in 1...(rows * 3) {
             _ = state.present(
                 image: image, rows: rows, cols: 10, margins: nil,
                 scrolls: [down], semanticDelta: 1, cellSize: cellSize,
@@ -1330,10 +1305,6 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
             #expect(state.position == 0)
         }
 
-        #expect(!state.motion.segments.isEmpty)
-        #expect(state.position == 0)
-        #expect(state.velocity == 0)
-        #expect(state.acceleration == 0)
         #expect(state.isActive)
         #expect(state.historyHead == 0)
 
@@ -1341,10 +1312,9 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
             by: 1, nominalDisplayPeriod: 1.0 / 120.0,
             detectDisplayGap: false))
         #expect(!state.isActive)
-        #expect(state.motion.segments.isEmpty)
-        #expect(state.motion.sample == ScrollMotionSample())
-        #expect(state.motion.negativeMagnitude == 0)
-        #expect(state.motion.positiveMagnitude == 0)
+        #expect(state.position == 0)
+        #expect(state.velocity == 0)
+        #expect(state.acceleration == 0)
         #expect(state.snappedTranslationPixels == 0)
         #expect(state.historyHead == 0)
         #expect(state.currentRowsReference(image))
