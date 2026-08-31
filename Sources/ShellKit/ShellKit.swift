@@ -7,5 +7,6 @@
 //   FileIndex                — actor; project file walk + gitignore + queries
 //   QuickOpenPanelController — fuzzy file palette (498×346 NSPanel + scrim)
 //   StatusBarView            — 24pt powerline status bar fed by superlemon.status
-//   FileTreeSidebarView      — lazy NSOutlineView file tree + context menu
+//   FileTreeSidebarView      — lazy NSOutlineView file tree (remote file panel)
+//   TreeSurfaceView          — the navbar overlay for the surface vim window
 //   FileOperations           — FileManager mutations behind sidebar callbacks

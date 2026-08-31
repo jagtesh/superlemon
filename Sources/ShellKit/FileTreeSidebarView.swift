@@ -1,14 +1,11 @@
-// FileTreeSidebarView — Superlemon's native file-tree sidebar
-// (NORTHSTAR §4.1 item 3, §5 "Sidebar", DESIGN §14.1).
+// FileTreeSidebarView — a lazy, lister-driven NSOutlineView file tree.
 //
-// NSOutlineView-based, ~370 pt design width, 24 pt rows. The directory
-// model is LAZY: a directory's children are listed only when the node is
-// first expanded (never a whole-tree walk). File rows get a small colored
-// type dot (swift orange / js yellow / md blue / json green / gray).
-// Context menu: New File, New Folder, Rename, Move to Trash, Reveal in
-// Finder — all emitted through `onFileOperation`; actual mutations happen
-// in the embedder via `FileOperations`, followed by `reload(path:)`.
-// WorkspaceChrome refreshes this lazy model from a debounced FSEvents watcher.
+// Formerly the workspace sidebar; the navbar is now a vim window rendered
+// by TreeSurfaceView (docs/design/surface-navbar-v1.md), and this view's
+// remaining product role is the remote file panel
+// (WorkspaceFilePanelController), which browses a `DirectoryLister` where
+// NSSavePanel cannot reach. NSOutlineView-based, 24 pt rows; a directory's
+// children are listed only when the node is first expanded.
 
 import AppKit
 import Darwin
@@ -312,53 +309,6 @@ public final class FileTreeSidebarView: NSView {
     /// embedder performs the cd (through nvim) and calls `setRoot` back.
     public var onChangeWorkingDirectory: ((String) -> Void)?
 
-    /// Git badges (superlemon.git): absolute file path → one-letter status
-    /// (M A D R C U ?). Directories containing a flagged file get a dot.
-    private var gitStatuses: [String: String] = [:]
-    private var gitDirtyDirs: Set<String> = []
-
-    /// superlemon.ui sidebar decorations (runtime/CONTRACT.md), already
-    /// COMPOSED across namespaces by the embedder: absolute path →
-    /// decoration. Precedence rule: where a ui decoration and a git badge
-    /// target the same path, the UI DECORATION WINS — explicit plugin
-    /// intent outranks the built-in git provider. Built-in Git still uses its
-    /// bespoke notification path (DESIGN §15). Paths without a ui decoration
-    /// keep their git badge; `setGitStatus` keeps working unchanged.
-    private var uiDecorations: [String: SidebarDecoration] = [:]
-
-    /// Additive superlemon.ui entry point: replaces the full composed
-    /// decoration map (keys are absolute paths). Coexists with
-    /// `setGitStatus`; see `uiDecorations` for the precedence rule.
-    public func setUIDecorations(_ decorations: [String: SidebarDecoration]) {
-        uiDecorations = decorations
-        reloadAllRowsPreservingLayout()
-    }
-
-    public func setGitStatus(_ statuses: [String: String]) {
-        gitStatuses = statuses
-        gitDirtyDirs = []
-        let rootPath = rootNode?.url.path ?? "/"
-        for path in statuses.keys {
-            var dir = (path as NSString).deletingLastPathComponent
-            while dir.count >= rootPath.count, dir != "/" {
-                gitDirtyDirs.insert(dir)
-                dir = (dir as NSString).deletingLastPathComponent
-            }
-        }
-        reloadAllRowsPreservingLayout()
-    }
-
-    static func gitBadge(status: String, dark: Bool) -> (text: String, color: NSColor) {
-        switch status {
-        case "M": return ("M", ShellPalette.gitModified(dark: dark))
-        case "A": return ("A", ShellPalette.gitAdded(dark: dark))
-        case "D": return ("D", ShellPalette.gitDeleted(dark: dark))
-        case "R", "C": return ("R", ShellPalette.gitRenamed(dark: dark))
-        case "U": return ("U", ShellPalette.gitDeleted(dark: dark))
-        case "?": return ("?", ShellPalette.gitUntracked(dark: dark))
-        default: return (status, ShellPalette.secondaryText(dark: dark))
-        }
-    }
     public var onFileOperation: ((FileOperation) -> Void)?
 
     /// Whether rows offer local-filesystem affordances (the context menu's
@@ -1191,26 +1141,6 @@ extension FileTreeSidebarView: NSOutlineViewDataSource, NSOutlineViewDelegate {
         let cell = outlineView.makeView(withIdentifier: identifier, owner: nil)
             as? FileTreeCellView ?? FileTreeCellView(identifier: identifier)
         cell.configure(node: node, dark: isDark)
-        if let decoration = uiDecorations[node.url.path] {
-            // superlemon.ui decoration wins over git for the same path.
-            switch decoration.kind {
-            case .badge(let text):
-                cell.setGitBadge(
-                    text,
-                    color: decoration.color ?? ShellPalette.secondaryText(dark: isDark))
-            case .dot:
-                cell.setGitBadge(
-                    "●",
-                    color: decoration.color ?? ShellPalette.secondaryText(dark: isDark))
-            }
-        } else if node.isDirectory {
-            if gitDirtyDirs.contains(node.url.path) {
-                cell.setGitBadge("•", color: ShellPalette.gitModified(dark: isDark))
-            }
-        } else if let status = gitStatuses[node.url.path] {
-            let badge = Self.gitBadge(status: status, dark: isDark)
-            cell.setGitBadge(badge.text, color: badge.color)
-        }
         return cell
     }
 
