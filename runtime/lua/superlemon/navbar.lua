@@ -823,8 +823,11 @@ function M.setup(group, opts)
   ensure_loaded(state.root)
   watch_dir(state.root)
 
-  local chrome_state = require("superlemon.chrome").state()
-  if chrome_state.native_sidebar then
+  if surface then
+    -- Idempotent re-setup (same contract as superlemon.setup): the window
+    -- stays; re-render so changed opts (remote, new root) take effect.
+    do_render()
+  elseif require("superlemon.chrome").state().native_sidebar then
     open_surface()
   end
 end

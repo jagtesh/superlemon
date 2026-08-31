@@ -10,6 +10,9 @@ vim.keymap.set("n", "<ScrollWheelDown>", "<Cmd>echo 'user-scroll'<CR>", { desc =
 -- Opt out of scroll-homing for the FIRST setup() call, so we can prove no
 -- default ScrollWheel map gets installed anywhere while it is off.
 vim.g.superlemon_scroll_homes_cursor = 0
+-- Keep the navbar window out of this spec: the scroll/cursor scenarios
+-- below assert exact cursor rows in a single-window layout.
+vim.g.superlemon_native_sidebar = 0
 
 require("superlemon").setup(4)
 

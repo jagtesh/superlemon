@@ -43,9 +43,12 @@ H.eq(inert_closed, 1, "on_closed still fires locally without a channel")
 H.eq(#calls.notify, 0, "no channel: surface.close sends nothing")
 
 ---------------------------------------------------------------------------
--- active GUI from here on
+-- active GUI from here on. The default navbar stays closed: this spec
+-- exercises surface.lua directly with its own surfaces, and the ambient
+-- navbar's debounced renders would interleave with the captured stream.
 ---------------------------------------------------------------------------
 
+vim.g.superlemon_native_sidebar = 0
 require("superlemon").setup(1)
 
 ---------------------------------------------------------------------------

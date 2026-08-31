@@ -63,30 +63,49 @@ H.ok(ui._orig_select == stock_select, "original vim.ui.select stashed")
 H.ok(ui._orig_input == stock_input, "original vim.ui.input stashed")
 
 ---------------------------------------------------------------------------
--- sidebar namespaces
+-- sidebar namespaces — routed into the navbar model (docs/design/
+-- surface-navbar-v1.md §5). ui.lua's responsibility is only the
+-- forwarding; the merge semantics live in navbar_spec.lua.
 ---------------------------------------------------------------------------
+
+local navbar = require("superlemon.navbar")
+local dec_calls = {}
+local orig_decorations = navbar.decorations
+navbar.decorations = function(ns, method, args)
+  table.insert(dec_calls, { ns = ns, method = method, args = args })
+end
 
 local git_ns = ui.sidebar.namespace("git")
 git_ns:set_badge("Sources/a.swift", { text = "M", color = "#E0B268" })
 H.eq(
-  last_ui(),
-  { "sidebar", "set_badge", "git", { path = "Sources/a.swift", text = "M", color = "#E0B268" } },
-  "set_badge sends the 4-tuple"
+  dec_calls[#dec_calls],
+  {
+    ns = "git",
+    method = "set_badge",
+    args = { path = "Sources/a.swift", text = "M", color = "#E0B268" },
+  },
+  "set_badge forwards to navbar.decorations"
 )
 
 git_ns:set_badge("new.txt", { text = "?" })
-H.eq(last_ui()[4], { path = "new.txt", text = "?" }, "badge color is optional")
+H.eq(dec_calls[#dec_calls].args, { path = "new.txt", text = "?" }, "badge color is optional")
 
 git_ns:set_dot("Sources", { color = "#ADC694" })
 H.eq(
-  last_ui(),
-  { "sidebar", "set_dot", "git", { path = "Sources", color = "#ADC694" } },
-  "set_dot sends the 4-tuple"
+  dec_calls[#dec_calls],
+  { ns = "git", method = "set_dot", args = { path = "Sources", color = "#ADC694" } },
+  "set_dot forwards to navbar.decorations"
 )
 
 local lint_ns = ui.sidebar.namespace("lint")
 lint_ns:clear()
-H.eq(last_ui(), { "sidebar", "clear", "lint", {} }, "clear names only its own namespace")
+H.eq(
+  dec_calls[#dec_calls],
+  { ns = "lint", method = "clear", args = {} },
+  "clear forwards only its own namespace"
+)
+
+navbar.decorations = orig_decorations
 
 ---------------------------------------------------------------------------
 -- palette: registration, dispatch round trip, session lifecycle

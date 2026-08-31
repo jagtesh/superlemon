@@ -98,11 +98,11 @@ public final class EditorHostNSView: NSView {
 
         controller.chrome = chrome
 
-        if controller.navbarSurfaceEnabled {
-            // Surface-mode navbar (docs/design/surface-navbar-v1.md §3/§7):
-            // the tree is a vim window overlaid inside the editor area, so
-            // the legacy split-view pane stays collapsed for the session.
-            chrome.sidebar.isHidden = true
+        // Surface-mode navbar (docs/design/surface-navbar-v1.md §3/§7):
+        // the tree is a vim window overlaid inside the editor area; the
+        // legacy split-view pane never shows (deleted next).
+        chrome.sidebar.isHidden = true
+        do {
             let host = chrome.surfaceHost
             host.mountOverlay = { [weak inputHost] view in
                 inputHost?.setSurfaceOverlay(view)
@@ -290,14 +290,10 @@ public final class EditorHostNSView: NSView {
         window?.makeFirstResponder(inputHost)
     }
 
-    /// View ▸ Toggle Sidebar. Surface mode routes through nvim (the plugin
-    /// owns the window); legacy mode flips the pane directly.
+    /// View ▸ Toggle Sidebar — routed through nvim: the runtime plugin owns
+    /// the navbar window (docs/design/surface-navbar-v1.md §3).
     public func toggleSidebar() {
-        if controller.navbarSurfaceEnabled {
-            controller.toggleNativeChrome("sidebar")
-        } else {
-            chrome.sidebar.isHidden.toggle()
-        }
+        controller.toggleNativeChrome("sidebar")
     }
 
     /// Show or hide the project sidebar. Remote-filesystem sessions
@@ -306,10 +302,9 @@ public final class EditorHostNSView: NSView {
     /// hosts no longer need to hide the sidebar for correctness — this
     /// remains a purely presentational choice.
     public func setSidebarVisible(_ visible: Bool) {
-        // Surface mode: the navbar is a vim window inside the editor area;
-        // the legacy pane never opens.
-        guard !controller.navbarSurfaceEnabled else { return }
-        chrome.sidebar.isHidden = !visible
+        // The navbar is a vim window inside the editor area; the runtime
+        // plugin owns its visibility (chrome "sidebar" state). Nothing to
+        // do on the AppKit side.
     }
 
     /// Temporary native font-size override (the ⌘= zoom path); nil returns

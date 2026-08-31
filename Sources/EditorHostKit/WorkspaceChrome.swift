@@ -335,9 +335,7 @@ public final class WorkspaceChrome {
         sidebar.applyAppearance(dark: dark)
         quickOpen.applyAppearance(dark: dark)
         tabStrip.applyAppearance(dark: dark)
-        if controller?.navbarSurfaceEnabled == true {
-            surfaceHost.applyAppearance(dark: dark)
-        }
+        surfaceHost.applyAppearance(dark: dark)
     }
 
     // MARK: - ChromeKit sync
@@ -599,11 +597,7 @@ public final class WorkspaceChrome {
             self?.dragWriter(forPath: path, isDirectory: isDirectory)
         }
         fileTransfers.onProgress = { [weak self] progress in
-            guard let self else { return }
-            self.sidebar.renderTransferProgress(progress)
-            if self.controller?.navbarSurfaceEnabled == true {
-                self.surfaceHost.treeView?.renderTransferProgress(progress)
-            }
+            self?.surfaceHost.treeView?.renderTransferProgress(progress)
         }
         fileTransfers.onError = { [weak self] message in
             self?.presentTransferError(message)
