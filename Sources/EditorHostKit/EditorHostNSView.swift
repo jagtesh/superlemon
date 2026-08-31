@@ -83,6 +83,8 @@ public final class EditorHostNSView: NSView {
 
         // FontSpec default (nil name → system mono 13pt) until guifont arrives.
         let surface = GridSurfaceView(frame: frameRect, font: FontSpec())
+        surface.scrollMotionStyle =
+            ScrollPreferences.loadSmoothScrolling() ? .tightNative : .immediate
         self.surface = surface
         let inputHost = InputHostView(
             frame: frameRect, surface: surface, controller: controller)
@@ -283,6 +285,13 @@ public final class EditorHostNSView: NSView {
     /// the navbar window (docs/design/surface-navbar-v1.md §3).
     public func toggleSidebar() {
         controller.toggleNativeChrome("sidebar")
+    }
+
+    /// View ▸ Smooth Scrolling: display-linked scroll motion (on) vs.
+    /// presenting every authoritative Neovim frame as-is (off). The host
+    /// app persists the choice through `ScrollPreferences`.
+    public func setSmoothScrollingEnabled(_ enabled: Bool) {
+        surface.scrollMotionStyle = enabled ? .tightNative : .immediate
     }
 
     /// Temporary native font-size override (the ⌘= zoom path); nil returns

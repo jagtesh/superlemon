@@ -458,8 +458,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         case #selector(toggleSidebar(_:)):
             menuItem.state = (chrome?.nativeSidebar ?? true) ? .on : .off
             return activeController?.editorCommandsAvailable ?? false
+        case #selector(toggleSmoothScrolling(_:)):
+            menuItem.state = ScrollPreferences.loadSmoothScrolling() ? .on : .off
+            return true
         default:
             return true
+        }
+    }
+
+    /// View ▸ Smooth Scrolling: a GUI-side rendering preference, persisted
+    /// in UserDefaults (ScrollPreferences) and applied to every open editor
+    /// window immediately; new windows pick it up at construction.
+    @objc private func toggleSmoothScrolling(_ sender: Any?) {
+        let enabled = !ScrollPreferences.loadSmoothScrolling()
+        ScrollPreferences.save(smoothScrolling: enabled)
+        for window in NSApp.windows {
+            (window.contentView as? EditorHostNSView)?
+                .setSmoothScrollingEnabled(enabled)
         }
     }
 
@@ -742,6 +757,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             keyEquivalent: "")
         minimapItem.target = self
         viewMenu.addItem(minimapItem)
+        let smoothScrollItem = NSMenuItem(
+            title: "Smooth Scrolling",
+            action: #selector(toggleSmoothScrolling(_:)),
+            keyEquivalent: "")
+        smoothScrollItem.target = self
+        viewMenu.addItem(smoothScrollItem)
         // Native scroll bars are hidden from the menu while the standalone
         // NSScroller presentation is unreliable; the runtime plumbing stays
         // (:SuperlemonChrome scrollbars / g:superlemon_native_scrollbars,
