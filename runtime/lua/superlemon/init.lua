@@ -61,6 +61,13 @@ function M.setup(channel, opts)
   require("superlemon.sltheme").apply()
   require("superlemon.chrome").setup(group, opts)
   local chrome = require("superlemon.chrome").state()
+  -- Surface-mode navbar (docs/design/surface-navbar-v1.md): opt-in via the
+  -- GUI's navbar_surface flag. Set up after chrome (reads its sidebar
+  -- state) and before minimap/git (subscribes to git.on_update so it gets
+  -- the very first refresh's data).
+  if opts and opts.navbar_surface then
+    require("superlemon.navbar").setup(group, opts)
+  end
   require("superlemon.minimap").setup(
     group, chrome.native_minimap or chrome.native_scrollbars
   )

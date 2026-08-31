@@ -159,6 +159,10 @@ function M.set(part, on)
       return
     end
     state.native_sidebar = on
+    local ok, navbar = pcall(require, "superlemon.navbar")
+    if ok and navbar.enabled() then
+      navbar.set_open(on)
+    end
   else
     return
   end

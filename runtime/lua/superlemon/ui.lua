@@ -49,6 +49,15 @@ local function register(fn)
   return next_id
 end
 
+--- Mint a callback id in this module's shared registry — surface.lua uses
+--- this so surface events flow through the same blocking `_dispatch` path
+--- as every other `superlemon.ui` component.
+---@param fn function
+---@return integer id
+function M._register(fn)
+  return register(fn)
+end
+
 -- Components with open/close lifecycles (palette, input) group their ids
 -- into a session; the session's ids are freed together when it ends —
 -- close/select/submit, or a new open replacing it.
@@ -104,10 +113,27 @@ end
 local Namespace = {}
 Namespace.__index = Namespace
 
+--- True when surface-mode navbar owns sidebar rendering — decorations then
+--- route to navbar.lua instead of the GUI (docs/design/surface-navbar-v1.md
+--- §5). `pcall`ed: navbar.lua is optional and must never be a hard
+--- dependency of the generic ui component framework.
+local function navbar_enabled()
+  local ok, navbar = pcall(require, "superlemon.navbar")
+  return ok and navbar.enabled()
+end
+
 --- Badge on a file/dir row. `opts.text` required, `opts.color` "#RRGGBB".
 ---@param path string cwd-relative path
 ---@param opts { text: string, color?: string }
 function Namespace:set_badge(path, opts)
+  if navbar_enabled() then
+    require("superlemon.navbar").decorations(self.name, "set_badge", {
+      path = path,
+      text = opts.text,
+      color = opts.color,
+    })
+    return
+  end
   send("sidebar", "set_badge", self.name, {
     path = path,
     text = opts.text,
@@ -119,11 +145,19 @@ end
 ---@param path string cwd-relative path
 ---@param opts { color: string }
 function Namespace:set_dot(path, opts)
+  if navbar_enabled() then
+    require("superlemon.navbar").decorations(self.name, "set_dot", { path = path, color = opts.color })
+    return
+  end
   send("sidebar", "set_dot", self.name, { path = path, color = opts.color })
 end
 
 --- Remove every decoration in THIS namespace; other namespaces untouched.
 function Namespace:clear()
+  if navbar_enabled() then
+    require("superlemon.navbar").decorations(self.name, "clear", {})
+    return
+  end
   send("sidebar", "clear", self.name, vim.empty_dict())
 end
 

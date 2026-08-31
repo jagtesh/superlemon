@@ -7,6 +7,27 @@ local M = {}
 local DEBOUNCE_MS = 150
 local timer
 local generation = 0
+local subscribers = {}
+
+--- Register a subscriber called with the parsed `files` list on every
+--- refresh (success or failure/not-a-repo, which reports `{}`), in addition
+--- to the existing unconditional `superlemon.git` notification. Used by
+--- navbar.lua (surface mode) to merge git badges onto the tree; never
+--- unregistered — setup() is called at most once per session.
+---@param fn fun(files: table[])
+function M.on_update(fn)
+  subscribers[#subscribers + 1] = fn
+end
+
+local function publish(files)
+  for _, fn in ipairs(subscribers) do
+    local ok, err = pcall(fn, files)
+    if not ok then
+      vim.notify("superlemon.git subscriber error: " .. tostring(err), vim.log.levels.ERROR)
+    end
+  end
+  vim.rpcnotify(vim.g.superlemon_channel, "superlemon.git", { files = files })
+end
 
 --- Parse `git status --porcelain -z` output into { {path, status}, ... }.
 --- Status is one letter: M(odified) A(dded) D(eleted) R(enamed) C(opied)
@@ -69,11 +90,11 @@ function M.refresh()
         files = M.parse_porcelain(result.stdout)
       end
       -- Not a repo / git missing → empty list: the GUI clears its badges.
-      vim.rpcnotify(vim.g.superlemon_channel, "superlemon.git", { files = files })
+      publish(files)
     end)
   end)
   if not ok then
-    vim.rpcnotify(vim.g.superlemon_channel, "superlemon.git", { files = {} })
+    publish({})
   end
 end
 

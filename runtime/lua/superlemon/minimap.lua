@@ -126,18 +126,24 @@ local function visible_windows()
   for _, winid in ipairs(api.nvim_tabpage_list_wins(0)) do
     if is_normal_window(winid) then
       local bufnr = api.nvim_win_get_buf(winid)
-      attach_buffer(bufnr)
-      windows[#windows + 1] = {
-        winid = winid,
-        bufnr = bufnr,
-        buftype = vim.bo[bufnr].buftype,
-        buffer_name = api.nvim_buf_get_name(bufnr),
-        filetype = vim.bo[bufnr].filetype,
-        tabstop = vim.bo[bufnr].tabstop,
-        changedtick = changedtick(bufnr),
-        line_count = line_count(bufnr),
-        highlight_generation = highlight_generation,
-      }
+      -- The surface-mode navbar window (docs/design/surface-navbar-v1.md
+      -- §9): the GUI paints a native tree control over its grid, so it must
+      -- never be offered as a minimap/scrollbar target (belt-and-suspenders
+      -- with the GUI-side accessory exclusion).
+      if vim.bo[bufnr].filetype ~= "superlemon-navbar" then
+        attach_buffer(bufnr)
+        windows[#windows + 1] = {
+          winid = winid,
+          bufnr = bufnr,
+          buftype = vim.bo[bufnr].buftype,
+          buffer_name = api.nvim_buf_get_name(bufnr),
+          filetype = vim.bo[bufnr].filetype,
+          tabstop = vim.bo[bufnr].tabstop,
+          changedtick = changedtick(bufnr),
+          line_count = line_count(bufnr),
+          highlight_generation = highlight_generation,
+        }
+      end
     end
   end
   return windows
