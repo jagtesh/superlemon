@@ -104,9 +104,23 @@ public final class EditorHostNSView: NSView {
             }
             host.overlayFrame = { [weak surface, weak inputHost] gridID in
                 guard let surface, let inputHost,
-                    let rect = surface.rect(ofGrid: gridID)
+                    let gridRect = surface.rect(ofGrid: gridID)
                 else { return nil }
-                return inputHost.convert(rect, from: surface)
+                var rect = inputHost.convert(gridRect, from: surface)
+                // Cell rounding leaves sub-cell slivers of grid background
+                // at the container edges; the navbar reads as a full-height
+                // panel, so snap its frame to the left and bottom edges
+                // when it already reaches within a cell of them (the
+                // hairline border extends with the view).
+                let cell = surface.cellSize
+                if cell != .zero {
+                    if rect.minX < cell.width { rect.origin.x = 0 }
+                    let bottom = inputHost.bounds.maxY
+                    if bottom - rect.maxY < cell.height * 1.5 {
+                        rect.size.height = bottom - rect.origin.y
+                    }
+                }
+                return rect
             }
             host.setOverlaidWindowHandles = { [weak surface] handles in
                 surface?.setOverlaidWindowHandles(handles)
