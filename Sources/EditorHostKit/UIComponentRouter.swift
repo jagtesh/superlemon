@@ -1,14 +1,13 @@
 // UIComponentRouter — the GUI half of the superlemon.ui component
 // framework (runtime/CONTRACT.md "superlemon.ui", DESIGN §15): routes the
 // one generic `superlemon.ui` notification `[component, method, namespace,
-// args]` to the native components (sidebar decorations, palette sessions,
-// toasts, statusbar segments, input prompts) and drives Lua callbacks back
-// through `require('superlemon.ui')._dispatch`.
+// args]` to the native components (palette sessions, toasts, statusbar
+// segments, input prompts — surface/host components peel off to
+// SurfaceHostRouter first; sidebar decorations live in navbar.lua) and
+// drives Lua callbacks back through `require('superlemon.ui')._dispatch`.
 //
 // Malformed payloads are logged and dropped — never crash. Decoding is
-// structured as pure static functions; the composition and hex-parsing
-// logic it leans on lives in ShellKit (UIDecorations.swift) where it is
-// unit-tested.
+// structured as pure static functions.
 
 import AppKit
 import ChromeKit
@@ -21,26 +20,11 @@ final class UIComponentRouter {
 
     private weak var chrome: WorkspaceChrome?
     private weak var controller: NvimController?
-    private var projectRoot: URL
     private let logger = Logger(subsystem: "com.superlemon.app", category: "ui")
-
-    /// Namespace-isolated sidebar state; composition rule (sorted by
-    /// namespace name, later wins per path) lives in the store.
-    private var sidebarDecorations = SidebarDecorationStore()
 
     init(chrome: WorkspaceChrome, controller: NvimController?, projectRoot: URL) {
         self.chrome = chrome
         self.controller = controller
-        self.projectRoot = projectRoot.standardizedFileURL
-    }
-
-    /// Updates the base used to resolve cwd-relative component paths. Native
-    /// sidebar decorations belong to the old workspace and are discarded;
-    /// plugins can republish them for the new root.
-    func setProjectRoot(_ root: URL) {
-        projectRoot = root.standardizedFileURL
-        sidebarDecorations = SidebarDecorationStore()
-        pushSidebarDecorations()
     }
 
     // MARK: - Entry point
@@ -64,28 +48,6 @@ final class UIComponentRouter {
         let args = params[3]
 
         switch (component, method) {
-        case ("sidebar", "set_badge"):
-            guard let path = args["path"]?.stringValue,
-                let text = args["text"]?.stringValue
-            else { return logMalformed(component, method) }
-            sidebarDecorations.set(
-                SidebarDecoration(kind: .badge(text), color: parseColor(args["color"])),
-                path: absolutePath(path), namespace: namespace)
-            pushSidebarDecorations()
-
-        case ("sidebar", "set_dot"):
-            guard let path = args["path"]?.stringValue,
-                let color = parseColor(args["color"])
-            else { return logMalformed(component, method) }
-            sidebarDecorations.set(
-                SidebarDecoration(kind: .dot, color: color),
-                path: absolutePath(path), namespace: namespace)
-            pushSidebarDecorations()
-
-        case ("sidebar", "clear"):
-            sidebarDecorations.clear(namespace: namespace)
-            pushSidebarDecorations()
-
         case ("palette", "open"):
             openPalette(args)
 
@@ -116,18 +78,6 @@ final class UIComponentRouter {
             logger.error(
                 "superlemon.ui: unknown \(component, privacy: .public).\(method, privacy: .public)")
         }
-    }
-
-    // MARK: - Sidebar
-
-    private func pushSidebarDecorations() {
-        chrome?.sidebar.setUIDecorations(sidebarDecorations.composed)
-    }
-
-    /// Wire paths are cwd-relative (the sidebar keys by absolute path, same
-    /// as the superlemon.git handler).
-    private func absolutePath(_ relative: String) -> String {
-        projectRoot.appendingPathComponent(relative).path
     }
 
     // MARK: - Palette sessions

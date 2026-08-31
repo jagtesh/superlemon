@@ -11,12 +11,6 @@ import ShellKit
 import SurfaceKit
 import UniformTypeIdentifiers
 
-private struct WorkspaceFileMutationResult: Sendable {
-    let errorDescription: String?
-    let resultingPath: String?
-    var succeeded: Bool { errorDescription == nil }
-}
-
 enum QuickOpenSelectionError: Error, Equatable, LocalizedError {
     case outsideWorkspace(String)
     case notAFile(String)
@@ -31,22 +25,6 @@ enum QuickOpenSelectionError: Error, Equatable, LocalizedError {
     }
 }
 
-/// Serializes sidebar mutations away from the main actor. Besides keeping
-/// FileManager I/O off the UI thread, this prevents two rapid context-menu
-/// actions from racing each other against the same path.
-private actor WorkspaceFileMutationQueue {
-    func perform(_ operation: FileOperation) -> WorkspaceFileMutationResult {
-        do {
-            let result = try FileOperations.perform(operation)
-            return WorkspaceFileMutationResult(
-                errorDescription: nil, resultingPath: result?.path)
-        } catch {
-            return WorkspaceFileMutationResult(
-                errorDescription: error.localizedDescription, resultingPath: nil)
-        }
-    }
-}
-
 @MainActor
 public final class WorkspaceChrome {
     let chromeState = ChromeState()
@@ -55,7 +33,6 @@ public final class WorkspaceChrome {
     public let toasts = MessageToastController()
 
     let statusBar = StatusBarView()
-    let sidebar: FileTreeSidebarView
     let quickOpen = QuickOpenPanelController()
     let tabStrip = BufferTabStripView()
     private(set) var fileIndex: FileIndex
@@ -91,7 +68,6 @@ public final class WorkspaceChrome {
     private var quickOpenQueryGeneration: UInt64 = 0
     private var quickOpenQueryTask: Task<Void, Never>?
     private var workspaceRefreshTask: Task<Void, Never>?
-    private let fileMutationQueue = WorkspaceFileMutationQueue()
     private let fileWatcher = WorkspaceFileWatcher()
     /// Drag-and-drop transfer batches between this machine and the
     /// workspace filesystem (WorkspaceFileTransfer.swift).
@@ -161,12 +137,8 @@ public final class WorkspaceChrome {
         self.projectRoot = projectRoot
         self.fileAccess = fileAccess
         self.fileIndex = FileIndex(root: projectRoot, source: fileAccess.indexSource)
-        self.sidebar = FileTreeSidebarView(lister: fileAccess.lister)
         self.fileTransfers = WorkspaceFileTransferCoordinator(
             transport: fileAccess.transport, lister: fileAccess.lister)
-        sidebar.allowsFileOperations = fileAccess.isLocal
-        // No change notifications reach a non-local tree; poll on expansion.
-        sidebar.refreshesOnExpand = !fileAccess.isLocal
         let mono = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
         self.cmdlinePanel = CmdlinePanelController(font: mono)
         self.popupMenu = PopupMenuPanelController(font: mono)
@@ -180,7 +152,6 @@ public final class WorkspaceChrome {
         self.window = window
         self.surface = surface
         toasts.attach(to: window)
-        sidebar.setRoot(projectRoot)
         statusBar.render(StatusModel(project: projectRoot.lastPathComponent), dark: isDark)
         Task { await fileIndex.refresh() }
         startWorkspaceWatcher()
@@ -206,10 +177,6 @@ public final class WorkspaceChrome {
         fileIndexGeneration &+= 1
         projectRoot = root
         fileIndex = FileIndex(root: root, source: fileAccess.indexSource)
-
-        sidebar.setGitStatus([:])
-        uiRouter.setProjectRoot(root)
-        sidebar.setRoot(root)
 
         var status = statusBar.model
         status.project = root.lastPathComponent
@@ -280,20 +247,6 @@ public final class WorkspaceChrome {
                     italic: value["italic"]?.boolValue ?? false)
             }
             statusBar.renderStatusline(segments)
-        case "superlemon.git":
-            // Slim git provider (CONTRACT.md): cwd-relative paths + one-letter
-            // statuses → sidebar badges. Empty list clears the badges.
-            guard let payload = params.first,
-                let fileValues = payload["files"]?.arrayValue
-            else { return }
-            var statuses: [String: String] = [:]
-            for value in fileValues {
-                guard let rel = value["path"]?.stringValue,
-                    let status = value["status"]?.stringValue
-                else { continue }
-                statuses[projectRoot.appendingPathComponent(rel).path] = status
-            }
-            sidebar.setGitStatus(statuses)
         case "superlemon.ui":
             // The component framework (CONTRACT.md, DESIGN §15): surface-mode
             // components peel off to the surface host; everything else goes
@@ -332,7 +285,6 @@ public final class WorkspaceChrome {
 
     func applyAppearance(dark: Bool) {
         statusBar.render(statusBar.model, dark: dark)
-        sidebar.applyAppearance(dark: dark)
         quickOpen.applyAppearance(dark: dark)
         tabStrip.applyAppearance(dark: dark)
         surfaceHost.applyAppearance(dark: dark)
@@ -547,55 +499,10 @@ public final class WorkspaceChrome {
             self?.controller?.toggleNativeChrome("minimap")
         }
 
-        // VS Code/Sublime semantics: single-click previews (italic tab,
-        // replaced by the next preview); double-click opens permanently.
-        sidebar.onOpenFile = { [weak self] absolutePath in
-            self?.controller?.previewFile(absolutePath)
-        }
-        sidebar.onOpenFilePermanently = { [weak self] absolutePath in
-            self?.controller?.openFilePermanently(absolutePath)
-        }
-        sidebar.onRequestEditorFocus = { [weak self] in
-            self?.restoreFocus?()
-        }
-        sidebar.onRequestCreateItem = { [weak self] directory, kind in
-            self?.presentCreatePrompt(in: directory, kind: kind)
-        }
-        // ".." row and the folder context menu: cd inside nvim; the tree
-        // re-roots via getcwd readback (and superlemon.cwd for external cds).
-        sidebar.onChangeWorkingDirectory = { [weak self] absolutePath in
-            self?.controller?.openFolder(absolutePath)
-        }
-        sidebar.onFileOperation = { [weak self] op in
-            guard let self else { return }
-            switch op {
-            case .revealInFinder(let path):
-                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
-                self.restoreFocus?()
-            case .rename(let path, _), .trash(let path):
-                self.performFileOperation(
-                    op, reloadPath: (path as NSString).deletingLastPathComponent)
-            case .newFile(let dir, _), .newFolder(let dir, _):
-                self.performFileOperation(op, reloadPath: dir)
-            }
-        }
         fileWatcher.onChange = { [weak self] batch in
             self?.workspaceFilesChanged(batch)
         }
 
-        // Drag & drop: drops import, internal drags move, row drags export.
-        sidebar.onDropFiles = { [weak self] urls, directory in
-            self?.fileTransfers.importItems(urls, into: directory)
-        }
-        sidebar.onMoveItems = { [weak self] paths, directory in
-            self?.fileTransfers.moveItems(paths, into: directory)
-        }
-        sidebar.onCancelTransfers = { [weak self] in
-            self?.fileTransfers.cancelActiveTransfers()
-        }
-        sidebar.dragWriterProvider = { [weak self] path, isDirectory in
-            self?.dragWriter(forPath: path, isDirectory: isDirectory)
-        }
         fileTransfers.onProgress = { [weak self] progress in
             self?.surfaceHost.treeView?.renderTransferProgress(progress)
         }
@@ -635,13 +542,10 @@ public final class WorkspaceChrome {
         return provider
     }
 
-    /// A finished batch is authoritative about what changed: reload those
-    /// directories and rebuild the quick-open index (FSEvents also fires
-    /// for local workspaces; the explicit reload keeps remote trees honest).
+    /// A finished batch is authoritative about what changed: rebuild the
+    /// quick-open index (the navbar's own fs_event watchers — local or on
+    /// the remote host — refresh the tree).
     private func workspaceTransferChanged(_ directories: Set<String>) {
-        for directory in directories {
-            sidebar.reload(path: directory)
-        }
         workspaceRefreshTask?.cancel()
         let generation = fileIndexGeneration
         let index = fileIndex
@@ -823,121 +727,6 @@ public final class WorkspaceChrome {
         if let window { alert.beginSheetModal(for: window) }
     }
 
-    private func performFileOperation(
-        _ operation: FileOperation,
-        reloadPath: String,
-        restoreEditorFocus: Bool = true,
-        onSuccess: ((String?) async -> Void)? = nil,
-        onFailure: ((String) -> Void)? = nil
-    ) {
-        let generation = fileIndexGeneration
-        let index = fileIndex
-        Task { [weak self] in
-            guard let self else { return }
-            let result = await self.fileMutationQueue.perform(operation)
-            guard generation == self.fileIndexGeneration else {
-                if restoreEditorFocus { self.restoreFocus?() }
-                return
-            }
-            if result.succeeded {
-                self.sidebar.reload(path: reloadPath)
-                await index.refresh()
-                guard generation == self.fileIndexGeneration else {
-                    if restoreEditorFocus { self.restoreFocus?() }
-                    return
-                }
-                await self.sidebar.waitForPendingLoads()
-                await onSuccess?(result.resultingPath)
-            } else if let description = result.errorDescription {
-                if case .rename(let path, _) = operation {
-                    self.sidebar.rollbackInlineRename(path: path)
-                }
-                if let onFailure {
-                    onFailure(description)
-                } else {
-                    self.presentFileOperationError(operation, description: description)
-                }
-            }
-            if restoreEditorFocus { self.restoreFocus?() }
-        }
-    }
-
-    private func presentCreatePrompt(
-        in directory: String,
-        kind: FileTreeCreateKind,
-        proposedName: String = "",
-        errorDescription: String? = nil
-    ) {
-        let noun = kind == .file ? "File" : "Folder"
-        let alert = NSAlert()
-        alert.messageText = "New \(noun)"
-        alert.informativeText = errorDescription ?? "Enter a name for the new \(noun.lowercased())."
-        if errorDescription != nil { alert.alertStyle = .warning }
-        let nameField = NSTextField(string: proposedName)
-        nameField.placeholderString = kind == .file ? "example.swift" : "Folder name"
-        nameField.frame.size = NSSize(width: 320, height: 24)
-        nameField.setAccessibilityLabel("New \(noun) name")
-        alert.accessoryView = nameField
-        alert.addButton(withTitle: "Create")
-        alert.addButton(withTitle: "Cancel")
-
-        let submit: (NSApplication.ModalResponse) -> Void = { [weak self, weak nameField] response in
-            guard response == .alertFirstButtonReturn, let self, let nameField else {
-                self?.restoreFocus?()
-                return
-            }
-            let name = nameField.stringValue
-            do {
-                _ = try FileOperations.validateName(name)
-            } catch {
-                self.presentCreatePrompt(
-                    in: directory, kind: kind, proposedName: name,
-                    errorDescription: error.localizedDescription)
-                return
-            }
-
-            let operation: FileOperation = kind == .file
-                ? .newFile(directory: directory, name: name)
-                : .newFolder(directory: directory, name: name)
-            self.performFileOperation(
-                operation,
-                reloadPath: directory,
-                restoreEditorFocus: false,
-                onSuccess: { [weak self] resultingPath in
-                    guard let self, let resultingPath else { return }
-                    if !self.sidebar.selectItem(
-                        path: resultingPath, focus: kind == .folder)
-                    {
-                        _ = await self.sidebar.revealCreatedItem(
-                            path: resultingPath, focus: kind == .folder)
-                    }
-                    if kind == .file {
-                        // Re-checked: `revealCreatedItem` above may have
-                        // suspended long enough for the host to tear the
-                        // controller down.
-                        self.controller?.openFilePermanently(resultingPath)
-                        self.restoreFocus?()
-                    }
-                },
-                onFailure: { [weak self] description in
-                    self?.presentCreatePrompt(
-                        in: directory, kind: kind, proposedName: name,
-                        errorDescription: description)
-                })
-        }
-
-        if let window {
-            alert.beginSheetModal(for: window, completionHandler: submit)
-            DispatchQueue.main.async { [weak alert, weak nameField] in
-                guard let alert, let nameField else { return }
-                alert.window.makeFirstResponder(nameField)
-                nameField.currentEditor()?.selectAll(nil)
-            }
-        } else {
-            submit(alert.runModal())
-        }
-    }
-
     private func startWorkspaceWatcher() {
         // FSEvents watches this machine's filesystem only. A non-local tree
         // polls instead: directories refresh on expansion and the quick-open
@@ -965,36 +754,12 @@ public final class WorkspaceChrome {
         workspaceRefreshTask?.cancel()
         let generation = fileIndexGeneration
         let index = fileIndex
-        sidebar.reload(
-            changedPaths: relevantPaths,
-            requiresFullRescan: batch.requiresFullRescan)
         workspaceRefreshTask = Task { [weak self] in
             await index.refresh()
             guard !Task.isCancelled, let self,
                 generation == self.fileIndexGeneration
             else { return }
             self.workspaceRefreshTask = nil
-        }
-    }
-
-    private func presentFileOperationError(_ operation: FileOperation, description: String) {
-        let action: String
-        switch operation {
-        case .newFile: action = "Create File"
-        case .newFolder: action = "Create Folder"
-        case .rename: action = "Rename Item"
-        case .trash: action = "Move Item to Trash"
-        case .revealInFinder: return
-        }
-        let alert = NSAlert()
-        alert.alertStyle = .warning
-        alert.messageText = "Couldn’t \(action)"
-        alert.informativeText = description
-        alert.addButton(withTitle: "OK")
-        if let window {
-            alert.beginSheetModal(for: window)
-        } else {
-            alert.runModal()
         }
     }
 

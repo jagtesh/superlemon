@@ -49,14 +49,8 @@ public final class EditorHostNSView: NSView {
 
     let surface: GridSurfaceView
     let inputHost: InputHostView
-    private let splitView = NSSplitView()
     private var appearanceObservation: NSKeyValueObservation?
     private weak var attachedWindow: NSWindow?
-    /// Last sidebar visibility applied from a `superlemon.chrome` push.
-    /// Pushes resend the whole map, so only a changed value reaches the
-    /// split view — direct setSidebarVisible calls from embedding hosts
-    /// survive unrelated chrome pushes.
-    private var lastAppliedNativeSidebar: Bool?
     /// Pre-session affordance over the (opaque) editor surface while a slow
     /// transport starts up. Grace-gated so fast local launches never — or
     /// only fleetingly — show it; hidden permanently on the first flush.
@@ -99,9 +93,7 @@ public final class EditorHostNSView: NSView {
         controller.chrome = chrome
 
         // Surface-mode navbar (docs/design/surface-navbar-v1.md §3/§7):
-        // the tree is a vim window overlaid inside the editor area; the
-        // legacy split-view pane never shows (deleted next).
-        chrome.sidebar.isHidden = true
+        // the tree is a vim window overlaid inside the editor area.
         do {
             let host = chrome.surfaceHost
             host.mountOverlay = { [weak inputHost] view in
@@ -130,20 +122,14 @@ public final class EditorHostNSView: NSView {
             }
         }
 
-        // Layout: [ sidebar | editor ] over a full-width 24pt status bar.
-        splitView.isVertical = true
-        splitView.dividerStyle = .thin
-        splitView.addArrangedSubview(chrome.sidebar)
-        splitView.addArrangedSubview(inputHost)
-        splitView.setHoldingPriority(.init(300), forSubviewAt: 0)
-        splitView.setHoldingPriority(.init(250), forSubviewAt: 1)
-        chrome.sidebar.widthAnchor.constraint(greaterThanOrEqualToConstant: 180).isActive = true
-
+        // Layout: [ editor ] between a tab strip above and a full-width
+        // 24pt status bar below. The navbar is a vim window overlaid
+        // INSIDE the editor area, so there is no sidebar pane.
         // Native chrome bands (tab strip above, status bar below) start
         // collapsed; nvim's `superlemon.chrome` state opens them (§14).
         let statusBar = chrome.statusBar
         let tabStrip = chrome.tabStrip
-        for view in [tabStrip, splitView, statusBar] {
+        for view in [tabStrip, inputHost, statusBar] {
             view.translatesAutoresizingMaskIntoConstraints = false
             addSubview(view)
         }
@@ -154,10 +140,10 @@ public final class EditorHostNSView: NSView {
             tabStrip.leadingAnchor.constraint(equalTo: leadingAnchor),
             tabStrip.trailingAnchor.constraint(equalTo: trailingAnchor),
             tabStripHeight,
-            splitView.topAnchor.constraint(equalTo: tabStrip.bottomAnchor),
-            splitView.leadingAnchor.constraint(equalTo: leadingAnchor),
-            splitView.trailingAnchor.constraint(equalTo: trailingAnchor),
-            statusBar.topAnchor.constraint(equalTo: splitView.bottomAnchor),
+            inputHost.topAnchor.constraint(equalTo: tabStrip.bottomAnchor),
+            inputHost.leadingAnchor.constraint(equalTo: leadingAnchor),
+            inputHost.trailingAnchor.constraint(equalTo: trailingAnchor),
+            statusBar.topAnchor.constraint(equalTo: inputHost.bottomAnchor),
             statusBar.leadingAnchor.constraint(equalTo: leadingAnchor),
             statusBar.trailingAnchor.constraint(equalTo: trailingAnchor),
             statusBar.bottomAnchor.constraint(equalTo: bottomAnchor),
@@ -166,19 +152,13 @@ public final class EditorHostNSView: NSView {
         chrome.onChromeModeChange = {
             [weak self, weak controller]
             nativeTabs, nativeStatusbar, nativeMinimap, nativeScrollbars,
-            nativeSidebar in
+            _ in
             tabStripHeight.constant = nativeTabs ? BufferTabStripView.stripHeight : 0
             statusBarHeight.constant = nativeStatusbar ? StatusBarView.barHeight : 0
             // isHidden alongside the collapse: a 0-height NSView still draws
             // its (unclipped) subviews and hit-tests otherwise.
             tabStrip.isHidden = !nativeTabs
             statusBar.isHidden = !nativeStatusbar
-            if let self, nativeSidebar != self.lastAppliedNativeSidebar {
-                self.lastAppliedNativeSidebar = nativeSidebar
-                // Surface mode: the vim window is the sidebar; the pane
-                // stays collapsed (setSidebarVisible also gates on this).
-                self.setSidebarVisible(nativeSidebar)
-            }
             self?.layoutSubtreeIfNeeded()
             controller?.setEditorAccessories(
                 minimap: nativeMinimap, scrollbars: nativeScrollbars)
@@ -262,11 +242,6 @@ public final class EditorHostNSView: NSView {
             window?.makeFirstResponder(inputHost)
         }
 
-        // Sidebar starts at a fraction of the NORTHSTAR 370pt design width,
-        // proportional to our default window.
-        window.layoutIfNeeded()
-        splitView.setPosition(260, ofDividerAt: 0)
-
         // `.initial` styles the chrome for the appearance the window opens
         // with; without it the first styling only happened on the first
         // appearance *change*, leaving a dark-system launch light-themed.
@@ -294,17 +269,6 @@ public final class EditorHostNSView: NSView {
     /// the navbar window (docs/design/surface-navbar-v1.md §3).
     public func toggleSidebar() {
         controller.toggleNativeChrome("sidebar")
-    }
-
-    /// Show or hide the project sidebar. Remote-filesystem sessions
-    /// (`NvimController.hasRemoteFilesystem`) now source the tree and
-    /// quick-open index through the session's RPC channel, so embedding
-    /// hosts no longer need to hide the sidebar for correctness — this
-    /// remains a purely presentational choice.
-    public func setSidebarVisible(_ visible: Bool) {
-        // The navbar is a vim window inside the editor area; the runtime
-        // plugin owns its visibility (chrome "sidebar" state). Nothing to
-        // do on the AppKit side.
     }
 
     /// Temporary native font-size override (the ⌘= zoom path); nil returns
