@@ -394,4 +394,25 @@ H.eq(chrome.state().native_sidebar, false,
 H.eq(last_close(), { surface_id = "navbar" }, "the user-driven close still sends the close notification")
 
 vim.system = real_system
+---------------------------------------------------------------------------
+-- Re-rooting puts the cursor back on the top row
+---------------------------------------------------------------------------
+
+-- The chrome section above ends with the navbar closed (user-driven close
+-- scenario); reopen and use the LATEST open payload's window.
+require("superlemon.chrome").set("sidebar", true)
+local reopened = last_open()
+H.ok(vim.api.nvim_win_is_valid(reopened.win), "navbar reopened for the cursor scenario")
+vim.api.nvim_win_set_cursor(reopened.win, { 4, 0 })
+vim.cmd("cd " .. vim.fn.fnameescape(root .. "/zdir"))
+wait_for_row("inner.txt", function(row)
+  return row.depth == 0 -- depth 0 only once zdir IS the root
+end)
+H.eq(
+  vim.api.nvim_win_get_cursor(reopened.win)[1],
+  1,
+  "cd re-roots the tree with the cursor on the top row"
+)
+vim.cmd("cd " .. vim.fn.fnameescape(root))
+
 H.finish()

@@ -446,6 +446,12 @@ local function re_root(new_root)
   state.pending_select = nil
   ensure_loaded(new_root)
   watch_dir(new_root)
+  -- A new root is a new tree: put the cursor at the top. Without this,
+  -- nvim keeps (or merely clamps) the old line number, leaving the
+  -- selection stranded on an unrelated row of the new listing.
+  if surface and vim.api.nvim_win_is_valid(surface.win) then
+    pcall(vim.api.nvim_win_set_cursor, surface.win, { 1, 0 })
+  end
   schedule_render()
 end
 
