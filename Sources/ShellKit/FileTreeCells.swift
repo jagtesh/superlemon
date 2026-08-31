@@ -35,9 +35,10 @@ final class FileTreeRowView: NSTableRowView {
 
     override func drawSelection(in dirtyRect: NSRect) {
         if isRowEmphasized {
-            // Standard macOS accent selection — TreeSurfaceView uses this
-            // when its navbar window is the current (cursor) vim window.
-            NSColor.controlAccentColor.setFill()
+            // The system list-selection blue (lighter than the raw accent
+            // color, tracks the user's accent preference) — TreeSurfaceView
+            // uses this when its navbar window is the current vim window.
+            NSColor.selectedContentBackgroundColor.setFill()
         } else {
             // Full-width square-edged fill (#EAEAEA light / #343434 dark).
             ShellPalette.sidebarSelection(dark: dark).setFill()
@@ -298,6 +299,10 @@ final class FileTreeCellView: NSView {
     func configure(row: TreeSurfaceRow, dark: Bool) {
         nameLabel.stringValue = row.label
         nameLabel.textColor = ShellPalette.primaryText(dark: dark)
+        // Explicit tint: the template chevron otherwise resolves against the
+        // window's appearance, not the navbar's painted background, and
+        // disappears (white-on-white in a dark-appearance window).
+        chevronButton.contentTintColor = ShellPalette.secondaryText(dark: dark)
         if row.kind == .dir {
             dotLabel.stringValue = ""
         } else {

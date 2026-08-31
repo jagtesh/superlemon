@@ -214,6 +214,10 @@ public final class TreeSurfaceView: NSView {
     private let transferBand = FileTransferProgressView()
     private var transferBandHeight: NSLayoutConstraint!
     private let widthDragStrip = WidthDragStripView()
+    /// Continuous native right border — replaces nvim's `|` window-separator
+    /// glyph column, which the host widens the overlay to cover
+    /// (docs/design/surface-navbar-v1.md §7).
+    private let rightBorder = NSView()
     private let rowContextMenu = NSMenu()
     private let rootContextMenu = NSMenu()
 
@@ -278,6 +282,10 @@ public final class TreeSurfaceView: NSView {
         addSubview(transferBand)
         transferBandHeight = transferBand.heightAnchor.constraint(equalToConstant: 0)
 
+        rightBorder.wantsLayer = true
+        rightBorder.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(rightBorder)
+
         widthDragStrip.translatesAutoresizingMaskIntoConstraints = false
         widthDragStrip.onDrag = { [weak self] width in self?.onWidthDrag?(width) }
         addSubview(widthDragStrip)
@@ -294,10 +302,14 @@ public final class TreeSurfaceView: NSView {
             transferBand.trailingAnchor.constraint(equalTo: trailingAnchor),
             transferBand.bottomAnchor.constraint(equalTo: bottomAnchor),
             transferBandHeight,
+            rightBorder.topAnchor.constraint(equalTo: topAnchor),
+            rightBorder.bottomAnchor.constraint(equalTo: bottomAnchor),
+            rightBorder.trailingAnchor.constraint(equalTo: trailingAnchor),
+            rightBorder.widthAnchor.constraint(equalToConstant: 1),
             widthDragStrip.topAnchor.constraint(equalTo: topAnchor),
             widthDragStrip.bottomAnchor.constraint(equalTo: bottomAnchor),
             widthDragStrip.trailingAnchor.constraint(equalTo: trailingAnchor),
-            widthDragStrip.widthAnchor.constraint(equalToConstant: 6),
+            widthDragStrip.widthAnchor.constraint(equalToConstant: 8),
         ])
 
         applyAppearance(dark: false)
@@ -323,6 +335,8 @@ public final class TreeSurfaceView: NSView {
     public func applyAppearance(dark: Bool) {
         isDark = dark
         layer?.backgroundColor = ShellPalette.surfaceBackground(dark: dark).cgColor
+        rightBorder.layer?.backgroundColor =
+            ShellPalette.secondaryText(dark: dark).withAlphaComponent(0.35).cgColor
         tableView.backgroundColor = .clear
         headerLabel.textColor = ShellPalette.primaryText(dark: dark)
         transferBand.applyAppearance(dark: dark)

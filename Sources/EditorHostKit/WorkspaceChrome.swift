@@ -105,6 +105,10 @@ public final class WorkspaceChrome {
         // below; an empty directory id means the root (the flat row list
         // has no explicit root row).
         router.configureTreeView = { [weak self] tree in
+            // The appearance observation's initial push predates the
+            // surface's open; a freshly created view must not stay stuck
+            // on its light default in a dark window.
+            tree.applyAppearance(dark: self?.isDark ?? false)
             tree.onDropFiles = { [weak self] urls, directory in
                 guard let self else { return }
                 let dir = directory.isEmpty ? self.projectRoot.path : directory

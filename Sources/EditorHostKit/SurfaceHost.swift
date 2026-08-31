@@ -133,7 +133,11 @@ final class SurfaceHostRouter {
         }
         knownGridID = gridID
 
-        if let frame = overlayFrame?(gridID) {
+        if var frame = overlayFrame?(gridID) {
+            // Cover nvim's window-separator glyph column too: the tree view
+            // draws a continuous native hairline at its trailing edge in
+            // place of the `|` cell column.
+            frame.size.width += cellWidth?() ?? 0
             treeView?.frame = frame
             treeView?.isHidden = false
         } else {
@@ -356,7 +360,9 @@ final class SurfaceHostRouter {
     private func handleWidthDrag(_ pixelWidth: CGFloat) {
         guard let win, let cellWidth = cellWidth?(), cellWidth > 0 else { return }
         let minimumCols = Int(ceil(Self.minimumWidthPoints / cellWidth))
-        let cols = max(minimumCols, Int((pixelWidth / cellWidth).rounded()))
+        // The overlay is one cell wider than the vim window (it covers the
+        // separator column); subtract it before converting to columns.
+        let cols = max(minimumCols, Int(((pixelWidth - cellWidth) / cellWidth).rounded()))
         setWindowWidth?(win, cols)
     }
 
