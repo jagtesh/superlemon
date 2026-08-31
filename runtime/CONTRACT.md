@@ -509,32 +509,6 @@ through Neovim. Named buffers use `vim.cmd.write()`.
 File > Save As opens the same native workflow directly and does not require
 this notification. A user mapping for `<D-s>` replaces the bundled behavior.
 
-### `superlemon.git`
-
-One map, pushed once at setup and with about 150 ms debounce after
-`BufWritePost`, `FocusGained`, `DirChanged`, and `VimResume`:
-
-```lua
-{
-  files = {
-    { path = "Sources/a.swift", status = "M" },
-    { path = "new.txt", status = "?" },
-  },
-}
-```
-
-The provider asynchronously runs, in the current cwd:
-
-```text
-git --no-optional-locks status --porcelain -z
-```
-
-It parses NUL-delimited rename/copy records and chooses the worktree status
-column when set, otherwise the index column. Status is `M`, `A`, `D`, `R`, `C`,
-`U`, or `?`. Generation tokens ensure that only the newest request can notify;
-a directory change invalidates an older in-flight result immediately. Git
-failure/not-a-repository sends an empty list, which clears native badges.
-
 ### `superlemon.ui`
 
 The canonical wire shape is one notification with four arguments, not one
@@ -560,9 +534,11 @@ Implemented methods:
 
 | Component | Method | Args |
 |---|---|---|
-| `sidebar` | `set_badge` | `{path, text, color?}`; path is cwd-relative |
-| `sidebar` | `set_dot` | `{path, color}` |
-| `sidebar` | `clear` | `{}`; clears this namespace only |
+| `surface` | `open` | `{surface_id, win, buf, control, event_cb}` |
+| `surface` | `render` | `{surface_id, seq, header, menu, rows}` |
+| `surface` | `close` | `{surface_id}` |
+| `host` | `trash` | `{path}`; absolute; macOS Trash, local sessions only |
+| `host` | `reveal` | `{path}`; absolute; Reveal in Finder, local only |
 | `palette` | `open` | `{placeholder?, query_cb, select_cb, close_cb?}` |
 | `palette` | `close` | `{}` |
 | `toast` | `show` | `{text, kind}` where kind is `info`, `warn`, or `error` |
@@ -570,10 +546,20 @@ Implemented methods:
 | `statusbar` | `clear` | `{}`; clears this namespace only |
 | `input` | `open` | `{prompt?, default?, submit_cb}` |
 
-Sidebar namespaces compose in sorted-name order, with the later namespace
-winning for the same path. Statusbar namespaces render in sorted-name order.
-A plugin sidebar decoration wins over a built-in git decoration on the same
-row.
+The `surface` component carries the navbar: a real nvim window (scratch
+buffer, `filetype=superlemon-navbar`) whose grid the GUI suppresses and
+overlays with a native tree control. The render payload's `rows` are the
+buffer's lines — `rows[i]` describes buffer line `i`, and a render whose
+rows and lines disagree is rejected whole. Full schema, the event-callback
+payloads (`open`/`toggle`/`menu` detached; `rename`/`create` blocking with
+`{ok}`/`{error}` results), and the root-as-`""` convention live in
+`docs/design/surface-navbar-v1.md` §6.
+
+Sidebar decoration namespaces (`ui.sidebar.namespace`) no longer cross the
+wire on their own: they merge inside the navbar model (sorted-name order,
+later namespace winning per path, plugin decorations over git badges) and
+reach the GUI inside the tree render. Statusbar namespaces render in
+sorted-name order.
 
 Callback IDs refer to Lua functions in a session registry. The GUI invokes one
 with a request:

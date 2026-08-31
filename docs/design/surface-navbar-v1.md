@@ -1,9 +1,10 @@
 # Surface Navbar v1 — contract
 
-Status: v1 implementation contract (2026-08-31). This document is the source
-of truth for the three parallel workstreams; deviations must be brought back
-here first. When implemented and stable, the wire sections graduate into
-`runtime/CONTRACT.md`.
+Status: SHIPPED and default-on (2026-08-31). The legacy sidebar navbar was
+removed the same day — there is no flag and no fallback; §3's opt-in
+mechanics and §10's flip gate are historical. The wire sections graduated
+into `runtime/CONTRACT.md` (`superlemon.ui`, `surface`/`host` components);
+this document remains the detailed schema and design rationale.
 
 ## 1. Goal
 
