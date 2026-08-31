@@ -68,6 +68,6 @@ let package = Package(
         .testTarget(name: "SSHKitTests", dependencies: ["SSHKit"]),
         .testTarget(
             name: "SuperlemonAppTests",
-            dependencies: ["EditorHostKit", "NvimKit", "SurfaceKit"]),
+            dependencies: ["EditorHostKit", "NvimKit", "GridKit", "SurfaceKit", "ShellKit"]),
     ]
 )

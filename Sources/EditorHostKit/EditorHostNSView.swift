@@ -98,6 +98,38 @@ public final class EditorHostNSView: NSView {
 
         controller.chrome = chrome
 
+        if controller.navbarSurfaceEnabled {
+            // Surface-mode navbar (docs/design/surface-navbar-v1.md §3/§7):
+            // the tree is a vim window overlaid inside the editor area, so
+            // the legacy split-view pane stays collapsed for the session.
+            chrome.sidebar.isHidden = true
+            let host = chrome.surfaceHost
+            host.mountOverlay = { [weak inputHost] view in
+                inputHost?.setSurfaceOverlay(view)
+            }
+            host.unmountOverlay = { [weak inputHost] _ in
+                inputHost?.setSurfaceOverlay(nil)
+            }
+            host.overlayFrame = { [weak surface, weak inputHost] gridID in
+                guard let surface, let inputHost,
+                    let rect = surface.rect(ofGrid: gridID)
+                else { return nil }
+                return inputHost.convert(rect, from: surface)
+            }
+            host.setOverlaidWindowHandles = { [weak surface] handles in
+                surface?.setOverlaidWindowHandles(handles)
+            }
+            host.cellWidth = { [weak surface] in
+                surface?.cellSize.width ?? 0
+            }
+            host.setWindowCursor = { [weak controller] win, line0 in
+                controller?.setSurfaceWindowCursor(win: win, line0: line0)
+            }
+            host.setWindowWidth = { [weak controller] win, cols in
+                controller?.setSurfaceWindowWidth(win: win, cols: cols)
+            }
+        }
+
         // Layout: [ sidebar | editor ] over a full-width 24pt status bar.
         splitView.isVertical = true
         splitView.dividerStyle = .thin
@@ -143,6 +175,8 @@ public final class EditorHostNSView: NSView {
             statusBar.isHidden = !nativeStatusbar
             if let self, nativeSidebar != self.lastAppliedNativeSidebar {
                 self.lastAppliedNativeSidebar = nativeSidebar
+                // Surface mode: the vim window is the sidebar; the pane
+                // stays collapsed (setSidebarVisible also gates on this).
                 self.setSidebarVisible(nativeSidebar)
             }
             self?.layoutSubtreeIfNeeded()
@@ -256,9 +290,14 @@ public final class EditorHostNSView: NSView {
         window?.makeFirstResponder(inputHost)
     }
 
-    /// View ▸ Toggle Sidebar.
+    /// View ▸ Toggle Sidebar. Surface mode routes through nvim (the plugin
+    /// owns the window); legacy mode flips the pane directly.
     public func toggleSidebar() {
-        chrome.sidebar.isHidden.toggle()
+        if controller.navbarSurfaceEnabled {
+            controller.toggleNativeChrome("sidebar")
+        } else {
+            chrome.sidebar.isHidden.toggle()
+        }
     }
 
     /// Show or hide the project sidebar. Remote-filesystem sessions
@@ -267,6 +306,9 @@ public final class EditorHostNSView: NSView {
     /// hosts no longer need to hide the sidebar for correctness — this
     /// remains a purely presentational choice.
     public func setSidebarVisible(_ visible: Bool) {
+        // Surface mode: the navbar is a vim window inside the editor area;
+        // the legacy pane never opens.
+        guard !controller.navbarSurfaceEnabled else { return }
         chrome.sidebar.isHidden = !visible
     }
 

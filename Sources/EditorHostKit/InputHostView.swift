@@ -82,14 +82,36 @@ public final class InputHostView: NSView, @preconcurrency NSTextInputClient, NSM
     }
 
     /// Grid pixels remain owned by this first-responder view. Explicit native
-    /// controls in an acknowledged accessory gutter are the sole exception.
-    /// AppKit passes `point` in the superview's coordinate system; this view
-    /// sits at a sidebar-width x offset inside the split view, so converting
-    /// from the correct space is load-bearing.
+    /// controls in an acknowledged accessory gutter — and the surface-navbar
+    /// overlay, which paints over its suppressed vim-window grid — are the
+    /// sole exceptions. AppKit passes `point` in the superview's coordinate
+    /// system; this view sits at a sidebar-width x offset inside the split
+    /// view, so converting from the correct space is load-bearing.
     public override func hitTest(_ point: NSPoint) -> NSView? {
         guard super.hitTest(point) != nil else { return nil }
+        if let overlay = surfaceOverlay, !overlay.isHidden,
+            let hit = overlay.hitTest(convert(point, from: superview))
+        {
+            return hit
+        }
         let pointInSurface = surface.convert(point, from: superview)
         return surface.accessoryInteractionView(at: pointInSurface) ?? self
+    }
+
+    /// The surface-navbar overlay (docs/design/surface-navbar-v1.md §7),
+    /// mounted above the grid surface; SurfaceHostRouter positions it over
+    /// its vim window's grid frame each flush.
+    private(set) var surfaceOverlay: NSView?
+
+    func setSurfaceOverlay(_ view: NSView?) {
+        if let surfaceOverlay, surfaceOverlay !== view {
+            surfaceOverlay.removeFromSuperview()
+        }
+        surfaceOverlay = view
+        if let view, view.superview !== self {
+            view.isHidden = true  // shown once a grid frame positions it
+            addSubview(view, positioned: .above, relativeTo: surface)
+        }
     }
 
     public override func layout() {

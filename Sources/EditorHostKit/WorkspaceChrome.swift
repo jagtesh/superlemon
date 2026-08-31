@@ -117,6 +117,38 @@ public final class WorkspaceChrome {
     private(set) lazy var uiRouter = UIComponentRouter(
         chrome: self, controller: controller, projectRoot: projectRoot)
 
+    /// Surface-mode navbar host (docs/design/surface-navbar-v1.md §7): owns
+    /// the ("surface", …)/("host", …) components of the superlemon.ui plane.
+    /// Its view-hierarchy seams are wired by EditorHostNSView.
+    private(set) lazy var surfaceHost: SurfaceHostRouter = {
+        let router = SurfaceHostRouter(controller: controller)
+        router.showToast = { [weak self] text in
+            self?.toasts.showAdHoc(text: text, kind: .error)
+        }
+        // Drag & drop/transfer seams mirror the legacy sidebar's wiring
+        // below; an empty directory id means the root (the flat row list
+        // has no explicit root row).
+        router.configureTreeView = { [weak self] tree in
+            tree.onDropFiles = { [weak self] urls, directory in
+                guard let self else { return }
+                let dir = directory.isEmpty ? self.projectRoot.path : directory
+                self.fileTransfers.importItems(urls, into: dir)
+            }
+            tree.onMoveItems = { [weak self] paths, directory in
+                guard let self else { return }
+                let dir = directory.isEmpty ? self.projectRoot.path : directory
+                self.fileTransfers.moveItems(paths, into: dir)
+            }
+            tree.onCancelTransfers = { [weak self] in
+                self?.fileTransfers.cancelActiveTransfers()
+            }
+            tree.dragWriterProvider = { [weak self] path, isDirectory in
+                self?.dragWriter(forPath: path, isDirectory: isDirectory)
+            }
+        }
+        return router
+    }()
+
     /// The attached window; UIComponentRouter presents panels/sheets over it.
     var attachedWindow: NSWindow? { window }
 
@@ -263,8 +295,21 @@ public final class WorkspaceChrome {
             }
             sidebar.setGitStatus(statuses)
         case "superlemon.ui":
-            // The component framework (CONTRACT.md, DESIGN §15): one generic
-            // notification routed to the native components.
+            // The component framework (CONTRACT.md, DESIGN §15): surface-mode
+            // components peel off to the surface host; everything else goes
+            // to the component router.
+            var quad = params
+            if quad.count == 1, let inner = quad[0].arrayValue { quad = inner }
+            if quad.count >= 4,
+                let component = quad[0].stringValue,
+                let uiMethod = quad[1].stringValue,
+                let namespace = quad[2].stringValue,
+                surfaceHost.handle(
+                    component: component, method: uiMethod,
+                    namespace: namespace, args: quad[3])
+            {
+                return
+            }
             uiRouter.handle(params)
         case "superlemon.buffers":
             guard let payload = params.first,
@@ -290,6 +335,9 @@ public final class WorkspaceChrome {
         sidebar.applyAppearance(dark: dark)
         quickOpen.applyAppearance(dark: dark)
         tabStrip.applyAppearance(dark: dark)
+        if controller?.navbarSurfaceEnabled == true {
+            surfaceHost.applyAppearance(dark: dark)
+        }
     }
 
     // MARK: - ChromeKit sync
@@ -551,7 +599,11 @@ public final class WorkspaceChrome {
             self?.dragWriter(forPath: path, isDirectory: isDirectory)
         }
         fileTransfers.onProgress = { [weak self] progress in
-            self?.sidebar.renderTransferProgress(progress)
+            guard let self else { return }
+            self.sidebar.renderTransferProgress(progress)
+            if self.controller?.navbarSurfaceEnabled == true {
+                self.surfaceHost.treeView?.renderTransferProgress(progress)
+            }
         }
         fileTransfers.onError = { [weak self] message in
             self?.presentTransferError(message)

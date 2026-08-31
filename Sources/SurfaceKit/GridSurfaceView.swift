@@ -297,6 +297,26 @@ public final class GridSurfaceView: NSView {
         return (grid: 1, row: row, col: col)
     }
 
+    /// Grids whose `windowHandle` is in `handles` contribute no visible
+    /// pixels (docs/design/surface-navbar-v1.md §7 — the surface-mode
+    /// navbar overlays its vim window with a native control and the grid's
+    /// own text must not show through): their `CALayer` is hidden and no
+    /// tile repaint work is spent on them, the cursor layer is hidden while
+    /// the cursor sits on one of them, and they are excluded from editor
+    /// accessories (minimap/scrollers). Layout resolution and viewport
+    /// bookkeeping are untouched — `rect(ofGrid:)` keeps returning their
+    /// frame so the caller can position its overlay. Idempotent; a real
+    /// change re-commits the last flush with a full repaint so a grid that
+    /// stops being overlaid is immediately repainted (skipping its tile work
+    /// while overlaid means its renderer/filmstrip state was never created).
+    public func setOverlaidWindowHandles(_ handles: Set<Int>) {
+        guard handles != overlaidWindowHandles else { return }
+        overlaidWindowHandles = handles
+        if let flush = lastFlush {
+            commit(flush, redrawAll: true)
+        }
+    }
+
     /// A grid's frame in view coordinates (top-left origin; the view is
     /// flipped). Nil for unknown/hidden grids. Used by the app to anchor
     /// chrome (popupmenu) at grid cells.
@@ -423,6 +443,9 @@ public final class GridSurfaceView: NSView {
     private var rasterizer: TextRasterizer
     private var renderers: [Int: GridRenderer] = [:]
     private var gridLayers: [Int: CALayer] = [:]
+    /// Window handles whose grid contributes no visible pixels
+    /// (`setOverlaidWindowHandles`).
+    private var overlaidWindowHandles: Set<Int> = []
     private var smoothViewports: [Int: SmoothViewportState] = [:]
     private lazy var accessoryCoordinator = GridAccessoryCoordinator(hostView: self)
     private let cursorLayer = CursorLayer()
@@ -582,11 +605,13 @@ public final class GridSurfaceView: NSView {
         var updatedContents: Set<Int> = []
         if redrawAll {
             for (id, grid) in flush.grids {
+                guard !isOverlaid(grid) else { continue }
                 renderer(for: id).renderFull(grid: grid, highlights: flush.highlights)
                 updatedContents.insert(id)
             }
         } else {
             for damaged in flush.damagedGrids {
+                guard !isOverlaid(damaged.grid) else { continue }
                 renderer(for: damaged.grid.id).apply(
                     grid: damaged.grid, damage: damaged.damage,
                     highlights: flush.highlights)
@@ -609,6 +634,7 @@ public final class GridSurfaceView: NSView {
             guard let grid = flush.grids[frame.gridID] else { continue }
             visible.insert(frame.gridID)
             let gridLayer = layerFor(frame.gridID, flush: flush, updated: &updatedContents)
+            gridLayer.isHidden = isOverlaid(grid)
             if !redrawAll, !flush.allowsScrollInterpolation,
                 previousFrames[frame.gridID] != frame,
                 let state = smoothViewports[frame.gridID]
@@ -700,10 +726,11 @@ public final class GridSurfaceView: NSView {
         if hidesCursorDuringWheelScroll {
             updateCursorHiddenForWheelScrollIfNeeded(cursorGrid: flush.cursor.grid)
         }
+        let cursorGridOverlaid = flush.grids[flush.cursor.grid].map(isOverlaid) ?? false
         cursorLayer.update(
             flush: flush, cellOrigin: newCursorOrigin,
             fonts: fonts, cache: rasterizer.cache, scale: scale,
-            suppressed: isCursorHiddenForScroll)
+            suppressed: isCursorHiddenForScroll || cursorGridOverlaid)
         let newAuthoritativeY = cursorLayer.frame.minY
         let cursorState = smoothViewports[flush.cursor.grid]
         let coupledY = newAuthoritativeY - (cursorState?.snappedTranslationY ?? 0)
@@ -1125,6 +1152,17 @@ public final class GridSurfaceView: NSView {
         return callbackTimestamp - resumedAt >= nominal * 2
     }
 
+    private func isOverlaid(_ grid: Grid) -> Bool {
+        guard let handle = grid.windowHandle else { return false }
+        return overlaidWindowHandles.contains(handle)
+    }
+
+    /// Test hook: whether a grid's own `CALayer` is currently hidden by
+    /// suppression.
+    package func isGridLayerHidden(gridID: Int) -> Bool? {
+        gridLayers[gridID]?.isHidden
+    }
+
     private func renderer(for id: Int) -> GridRenderer {
         if let existing = renderers[id] { return existing }
         let created = GridRenderer(rasterizer: rasterizer, scale: scale)
@@ -1140,8 +1178,17 @@ public final class GridSurfaceView: NSView {
     private func syncEditorAccessories(
         flush: FlushResult, frames: [ResolvedGridFrame]
     ) {
+        // Overlaid grids (surface-mode navbar) are excluded from minimap and
+        // scrollbar accessories — they contribute no visible pixels, so no
+        // accessory should anchor to them either.
+        let accessoryFrames = overlaidWindowHandles.isEmpty
+            ? frames
+            : frames.filter { frame in
+                guard let grid = flush.grids[frame.gridID] else { return true }
+                return !isOverlaid(grid)
+            }
         accessoryCoordinator.sync(
-            flush: flush, frames: frames, gridLayers: gridLayers,
+            flush: flush, frames: accessoryFrames, gridLayers: gridLayers,
             cellSize: cellSize, scale: scale,
             fontName: CTFontCopyPostScriptName(fonts.regular) as String,
             editorFontSize: fontSpec.size,
@@ -1172,7 +1219,7 @@ public final class GridSurfaceView: NSView {
         created.masksToBounds = true
         gridLayers[id] = created
         layer?.addSublayer(created)
-        if !updated.contains(id), let grid = flush.grids[id] {
+        if !updated.contains(id), let grid = flush.grids[id], !isOverlaid(grid) {
             renderer(for: id).renderFull(grid: grid, highlights: flush.highlights)
             updated.insert(id)
         }

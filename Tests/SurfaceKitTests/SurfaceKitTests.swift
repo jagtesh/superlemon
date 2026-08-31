@@ -3170,3 +3170,114 @@ private func presentOneRowScrollStep(_ view: GridSurfaceView, _ store: GridStore
         #expect(fired == 1, "the hook is one-shot")
     }
 }
+
+// MARK: - Grid overlay suppression (docs/design/surface-navbar-v1.md §7)
+
+@MainActor
+@Suite struct GridOverlaySuppressionTests {
+    @Test func suppressedGridLayerIsHiddenAndUnsuppressingRestoresIt() {
+        let view = GridSurfaceView(
+            frame: NSRect(x: 0, y: 0, width: 400, height: 200), font: menlo)
+        let store = GridStore()
+        view.present(flush(store, [
+            .gridResize(grid: 1, width: 40, height: 12),
+            .gridResize(grid: 2, width: 20, height: 12),
+            .winPos(grid: 2, win: 42, startRow: 0, startCol: 0, width: 20, height: 12),
+            line(0, "hello world hello wor", hl: 0, grid: 2),
+            .gridCursorGoto(grid: 2, row: 0, col: 0),
+        ]))
+        #expect(view.isGridLayerHidden(gridID: 1) == false)
+        #expect(view.isGridLayerHidden(gridID: 2) == false)
+
+        view.setOverlaidWindowHandles([42])
+        #expect(view.isGridLayerHidden(gridID: 2) == true)
+        #expect(view.isGridLayerHidden(gridID: 1) == false, "only the overlaid window's grid hides")
+
+        // Idempotent: repeating the same set is a no-op, not a crash or a
+        // toggle.
+        view.setOverlaidWindowHandles([42])
+        #expect(view.isGridLayerHidden(gridID: 2) == true)
+
+        view.setOverlaidWindowHandles([])
+        #expect(view.isGridLayerHidden(gridID: 2) == false)
+    }
+
+    @Test func neverTracksTileMotionForAGridSuppressedBeforeItFirstAppears() {
+        let view = GridSurfaceView(
+            frame: NSRect(x: 0, y: 0, width: 400, height: 200), font: menlo)
+        view.setOverlaidWindowHandles([42])
+        let store = GridStore()
+        view.present(flush(store, [
+            .gridResize(grid: 1, width: 40, height: 12),
+            .gridResize(grid: 2, width: 20, height: 12),
+            .winPos(grid: 2, win: 42, startRow: 0, startCol: 0, width: 20, height: 12),
+            line(0, "hello", hl: 0, grid: 2),
+            .gridCursorGoto(grid: 2, row: 0, col: 0),
+        ]))
+        #expect(view.isGridLayerHidden(gridID: 2) == true)
+        #expect(
+            view.scrollPosition(gridID: 2) == nil,
+            "no tile/filmstrip state should exist for a grid never painted")
+
+        // Un-suppressing repaints it from scratch (the re-commit is a full
+        // redraw), so it is no longer blank.
+        view.setOverlaidWindowHandles([])
+        #expect(view.isGridLayerHidden(gridID: 2) == false)
+    }
+
+    @Test func hidesCursorLayerWhileTheCursorGridIsOverlaid() {
+        let view = GridSurfaceView(
+            frame: NSRect(x: 0, y: 0, width: 400, height: 200), font: menlo)
+        let store = GridStore()
+        view.present(flush(store, [
+            .gridResize(grid: 1, width: 40, height: 12),
+            .gridResize(grid: 2, width: 20, height: 12),
+            .winPos(grid: 2, win: 42, startRow: 0, startCol: 0, width: 20, height: 12),
+            line(0, "hello", hl: 0, grid: 2),
+            .gridCursorGoto(grid: 2, row: 0, col: 0),
+            .winViewport(
+                grid: 2, win: 42, topline: 0, botline: 12, curline: 0, curcol: 0,
+                lineCount: 12, scrollDelta: 0),
+        ]))
+        guard let cursor = view.layer?.sublayers?.first(where: { $0.zPosition == 10_000 }) else {
+            Issue.record("cursor layer missing")
+            return
+        }
+        #expect(cursor.isHidden == false)
+
+        view.setOverlaidWindowHandles([42])
+        #expect(cursor.isHidden == true)
+
+        view.setOverlaidWindowHandles([])
+        #expect(cursor.isHidden == false)
+    }
+
+    @Test func excludesOverlaidGridFromEditorAccessories() {
+        let view = GridSurfaceView(frame: .zero, font: menlo)
+        let outerCols = 100
+        let outerRows = 20
+        view.frame = CGRect(
+            x: 0, y: 0,
+            width: CGFloat(outerCols) * view.cellSize.width,
+            height: CGFloat(outerRows) * view.cellSize.height)
+        let store = GridStore()
+        view.present(flush(store, [
+            .gridResize(grid: 1, width: outerCols, height: outerRows),
+            .gridResize(grid: 2, width: outerCols, height: outerRows),
+            .winPos(
+                grid: 2, win: 42, startRow: 0, startCol: 0,
+                width: outerCols, height: outerRows),
+            .gridCursorGoto(grid: 2, row: 4, col: 2),
+            .winViewport(
+                grid: 2, win: 42, topline: 100, botline: 120, curline: 104,
+                curcol: 2, lineCount: 2_000, scrollDelta: 0),
+        ]))
+        #expect(view.editorAccessoryDebugSnapshot(gridID: 2) != nil)
+
+        view.setOverlaidWindowHandles([42])
+        #expect(view.editorAccessoryDebugSnapshot(gridID: 2) == nil)
+
+        view.setOverlaidWindowHandles([])
+        #expect(view.editorAccessoryDebugSnapshot(gridID: 2) != nil)
+    }
+}

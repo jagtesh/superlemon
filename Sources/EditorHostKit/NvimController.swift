@@ -158,6 +158,10 @@ public final class NvimController {
     /// the local filesystem, and the session's own cwd — not the host's —
     /// becomes the project root once startup completes.
     public let hasRemoteFilesystem: Bool
+    /// Surface-mode navbar (docs/design/surface-navbar-v1.md): the file
+    /// tree is a real nvim window rendered by a native overlay. Opt-in via
+    /// SUPERLEMON_NAVBAR=surface until the v1 parity gate passes.
+    public let navbarSurfaceEnabled: Bool
     /// Whether a host-supplied transport session adopts Superlemon's managed
     /// configuration at bridge setup. The far side's nvim never ran a local
     /// launch plan, so without adoption none of the managed baseline
@@ -375,6 +379,11 @@ public final class NvimController {
         self.configSelectionProvider = configSelectionProvider
         self.customLaunchConfiguration = customLaunchConfiguration
         self.hasRemoteFilesystem = remoteFilesystem
+        // Surface-mode navbar (docs/design/surface-navbar-v1.md §3): the
+        // file tree lives in a real nvim window rendered natively. Opt-in
+        // while v1 works toward the parity gate.
+        self.navbarSurfaceEnabled =
+            ProcessInfo.processInfo.environment["SUPERLEMON_NAVBAR"] == "surface"
         self.customConfigMode = customConfigMode
         self.customSafeStartConfiguration = customSafeStartConfiguration
         // App-level appearance follows the system even while the window's
@@ -692,15 +701,17 @@ public final class NvimController {
             "nvim_exec_lua",
             [
                 .string(
-                    "local chan, mode, compact, remote = ...\n"
+                    "local chan, mode, compact, remote, navbar = ...\n"
                         + "vim.g.superlemon_config_mode = vim.g.superlemon_config_mode or mode\n"
                         + "return require('superlemon').setup("
-                        + "chan, { compact = compact, remote = remote })"),
+                        + "chan, { compact = compact, remote = remote, "
+                        + "navbar_surface = navbar })"),
                 .array([
                     .int(Int64(channelID)),
                     .string(safeStartRequested ? "safe" : activeConfigMode.rawValue),
                     .bool(startupLayoutIsCompact?() ?? false),
                     .bool(customLaunchConfiguration != nil && adoptsManagedConfiguration),
+                    .bool(navbarSurfaceEnabled),
                 ]),
             ],
             timeout: .seconds(5))
@@ -1033,6 +1044,9 @@ public final class NvimController {
 
     private func handleFlush(_ flush: FlushResult) {
         surface?.present(flush)
+        if navbarSurfaceEnabled {
+            chrome?.surfaceHost.sync(flush: flush)
+        }
         inputHost?.updateAccessibility(with: flush)
 
         if flush.title != lastTitle {
@@ -1836,6 +1850,27 @@ public final class NvimController {
         performSessionOperation(failureTitle: "Couldn’t switch buffers") { session in
             _ = try await session.request(
                 "nvim_set_current_buf", [.int(Int64(bufnr))],
+                timeout: .seconds(5))
+        }
+    }
+
+    /// Surface navbar: sync a surface window's cursor to a clicked row
+    /// (0-based buffer line) without changing the current window.
+    func setSurfaceWindowCursor(win: Int, line0: Int) {
+        performSessionOperation(failureTitle: "Couldn’t move tree selection") { session in
+            _ = try await session.request(
+                "nvim_win_set_cursor",
+                [.int(Int64(win)), .array([.int(Int64(line0 + 1)), .int(0)])],
+                timeout: .seconds(5))
+        }
+    }
+
+    /// Surface navbar: native divider drag resizes the vim window.
+    func setSurfaceWindowWidth(win: Int, cols: Int) {
+        performSessionOperation(failureTitle: "Couldn’t resize the tree") { session in
+            _ = try await session.request(
+                "nvim_win_set_width",
+                [.int(Int64(win)), .int(Int64(cols))],
                 timeout: .seconds(5))
         }
     }
