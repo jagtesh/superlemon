@@ -1,4 +1,5 @@
--- git_spec.lua — the slim git-status provider (CONTRACT.md superlemon.git).
+-- git_spec.lua — the slim git-status provider (subscriber plane; the
+-- navbar merges the badges).
 local H = dofile(vim.fs.dirname(arg[0]) .. "/helpers.lua")
 H.setup_rtp()
 
@@ -7,7 +8,15 @@ if vim.fn.executable("git") == 0 then
   os.exit(0, true)
 end
 
-local calls = H.stub_gui()
+H.stub_gui()
+
+local git = require("superlemon.git")
+-- Observe through the subscriber plane, registered before setup() so the
+-- initial refresh is captured too.
+local updates = {}
+git.on_update(function(files)
+  updates[#updates + 1] = files
+end)
 
 -- A directory change must invalidate an old cwd's in-flight result
 -- immediately, before the 150 ms debounce starts the replacement command.
@@ -19,16 +28,8 @@ vim.system = function(_, _, callback)
 end
 require("superlemon").setup(1)
 
-local git = require("superlemon.git")
-
 local function git_push_count()
-  local count = 0
-  for _, call in ipairs(calls.notify) do
-    if call.method == "superlemon.git" then
-      count = count + 1
-    end
-  end
-  return count
+  return #updates
 end
 
 local pushes_before_dir_change = git_push_count()
@@ -74,15 +75,13 @@ sh("git add tracked.txt && git commit -qm init")
 vim.fn.writefile({ "one", "two" }, dir .. "/tracked.txt") -- modify
 vim.fn.writefile({ "x" }, dir .. "/untracked.txt")
 
--- Wait for the push that reflects THIS repo (stale-generation pushes from
--- earlier cwds are suppressed by git.lua's double generation guard).
+-- Wait for the update that reflects THIS repo (stale-generation pushes
+-- from earlier cwds are suppressed by git.lua's double generation guard).
 local function repo_push()
-  for _, c in ipairs(calls.notify) do
-    if c.method == "superlemon.git" then
-      for _, f in ipairs(c.args[1].files) do
-        if f.path == "tracked.txt" then
-          return c.args[1].files
-        end
+  for _, files in ipairs(updates) do
+    for _, f in ipairs(files) do
+      if f.path == "tracked.txt" then
+        return files
       end
     end
   end
@@ -95,7 +94,7 @@ vim.wait(3000, function()
 end)
 
 local files = repo_push()
-H.ok(files ~= nil, "async refresh pushed this repo's superlemon.git")
+H.ok(files ~= nil, "async refresh published this repo's status")
 local got = {}
 for _, f in ipairs(files or {}) do
   got[f.path] = f.status

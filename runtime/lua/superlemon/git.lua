@@ -1,6 +1,7 @@
--- git.lua — slim git-status DATA PROVIDER (no UI; CONTRACT.md
--- `superlemon.git`). The native sidebar renders the badges; this module
--- only gathers. Async via vim.system so a slow repo never blocks nvim.
+-- git.lua — slim git-status DATA PROVIDER (no UI). Subscribers — the
+-- navbar's badge merge (navbar.lua), and any future consumer — register
+-- via M.on_update; this module only gathers. Async via vim.system so a
+-- slow repo never blocks nvim.
 
 local M = {}
 
@@ -10,10 +11,9 @@ local generation = 0
 local subscribers = {}
 
 --- Register a subscriber called with the parsed `files` list on every
---- refresh (success or failure/not-a-repo, which reports `{}`), in addition
---- to the existing unconditional `superlemon.git` notification. Used by
---- navbar.lua (surface mode) to merge git badges onto the tree; never
---- unregistered — setup() is called at most once per session.
+--- refresh (success or failure/not-a-repo, which reports `{}`). Used by
+--- navbar.lua to merge git badges onto the tree; never unregistered —
+--- setup() is called at most once per session.
 ---@param fn fun(files: table[])
 function M.on_update(fn)
   subscribers[#subscribers + 1] = fn
@@ -26,7 +26,6 @@ local function publish(files)
       vim.notify("superlemon.git subscriber error: " .. tostring(err), vim.log.levels.ERROR)
     end
   end
-  vim.rpcnotify(vim.g.superlemon_channel, "superlemon.git", { files = files })
 end
 
 --- Parse `git status --porcelain -z` output into { {path, status}, ... }.
