@@ -1090,6 +1090,31 @@ private func center(of cell: (row: Int, col: Int), _ fonts: FontSet) -> (x: Int,
         #expect(state.position == 0)
     }
 
+    @Test(arguments: [1, -1])
+    func settledWrappedGestureRetainsVisibleRowsAndRestartsOnRelease(direction: Int) {
+        let host = CALayer()
+        let state = idleState(gridID: 99, host: host)
+        state.noteScrollInput(inputRows: Double(direction) * 0.3,
+            requestedRows: direction, gestureOpen: true)
+        _ = state.present(
+            image: solidImage(width: 80, height: 96), rows: 6, cols: 10,
+            margins: nil,
+            scrolls: [ScrollDelta(top: 0, bottom: 6, left: 0, right: 10, rows: direction * 6, cols: 0)],
+            semanticDelta: direction * 6, cellSize: cellSize, scale: 1,
+            host: host, animate: true)
+        for _ in 0..<600 where state.isActive { _ = state.advance(by: 1.0 / 120.0) }
+        #expect(!state.isActive)
+        #expect(abs(state.position) > 5)
+        let first = Int(floor(state.position))
+        for row in first..<(first + 6) {
+            #expect(state.history[row] != nil, "settling must retain every displayed history row")
+        }
+        state.noteScrollInput(inputRows: Double(direction), requestedRows: direction, gestureOpen: false)
+        #expect(state.isActive, "release without a new Neovim frame must restart the camera")
+        for _ in 0..<600 where state.isActive { _ = state.advance(by: 1.0 / 120.0) }
+        #expect(state.position == 0)
+    }
+
     @Test func trueFarCutResetsTheGestureCounters() {
         let host = CALayer()
         let state = idleState(gridID: 27, host: host)

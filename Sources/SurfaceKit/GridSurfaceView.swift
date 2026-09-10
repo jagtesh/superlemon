@@ -551,8 +551,12 @@ public final class GridSurfaceView: NSView {
     public func noteScrollInput(gridID: Int, inputRows: Double, requestedRows: Int, gestureOpen: Bool) {
         noteScrollInputPending(gridID: gridID)
         guard scrollMotionStyle == .tightNative, !reducedMotion else { return }
-        smoothViewports[gridID]?.noteScrollInput(
+        guard let state = smoothViewports[gridID] else { return }
+        state.noteScrollInput(
             inputRows: inputRows, requestedRows: requestedRows, gestureOpen: gestureOpen)
+        // A zero-delta gesture end may be the only event after the camera
+        // settled off-origin: no Neovim redraw will wake the display link.
+        if state.isActive { resumeDisplayLink() }
     }
 
     /// Bounded, allocation-stable diagnostic history. Unlike the former

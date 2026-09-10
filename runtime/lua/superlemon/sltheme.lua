@@ -17,17 +17,17 @@
 local M = {}
 
 local POWERLINE_GROUPS = {
-  -- Mode badge colors.
-  SLModeNormal = { fg = "#FFFFFF", bg = "#004DC8", bold = true },
-  SLModeInsert = { fg = "#1B2023", bg = "#ADC694", bold = true },
-  SLModeVisual = { fg = "#FFFFFF", bg = "#8E24AA", bold = true },
+  -- Airline dark palette: neon yellow-green normal/position caps.
+  SLModeNormal = { fg = "#00005F", bg = "#DFFF00", bold = true },
+  SLModeInsert = { fg = "#00005F", bg = "#00DFFF", bold = true },
+  SLModeVisual = { fg = "#000000", bg = "#FFAF00", bold = true },
   SLModeReplace = { fg = "#FFFFFF", bg = "#C42B1C", bold = true },
   SLModeCommand = { fg = "#1B2023", bg = "#E0B268", bold = true },
   -- Remaining statusline segment colors.
   SLGit = { fg = "#CDD2D7", bg = "#4A4A49" },
   SLFile = { fg = "#CDD2D7", bg = "#373736" },
   SLInfo = { fg = "#A6ABB0", bg = "#2B2B2A" },
-  SLPos = { fg = "#FFFFFF", bg = "#005A37", bold = true },
+  SLPos = { fg = "#00005F", bg = "#DFFF00", bold = true },
 }
 
 -- Human-readable labels and highlight groups for every editor mode.

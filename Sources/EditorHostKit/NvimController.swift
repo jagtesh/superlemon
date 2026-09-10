@@ -100,7 +100,10 @@ public final class NvimController {
         }
     }
 
-    let store = GridStore()
+    private(set) var store = GridStore()
+    private(set) var recovery = SessionRecovery()
+    private var recoveryCheckpoint: Value?
+    private var lastAutomaticRecovery: Date?
 
     private(set) var session: NvimSession?
     weak var window: NSWindow?
@@ -466,6 +469,9 @@ public final class NvimController {
     func launchSession(safeStart: Bool = false) async {
         guard session == nil, !stopRequested else { return }
         phase = .starting
+        store = GridStore()
+        chrome?.chromeState.resetForSessionChange()
+        minimapBridge.reset()
         safeStartRequested = safeStart
         let generation = lifecycle.beginGeneration()
         var launchedSession: NvimSession?
@@ -573,13 +579,27 @@ public final class NvimController {
                 ])
             guard isCurrent(context), phase == .starting else { return }
             attached = true
-            inputReady = true
-            scheduleInputDrainIfNeeded()
+            // Input waits for restoration, so edits cannot race buffer recovery.
             // The view may have been laid out while attaching.
             sendResizeIfNeeded()
             try await validateCustomConfiguration(session)
             guard isCurrent(context), phase == .starting else { return }
             try await bootstrapRuntimePlugin(session)
+            guard isCurrent(context), phase == .starting else { return }
+            if let checkpoint = recoveryCheckpoint {
+                _ = try await session.request("nvim_exec_lua", [
+                    .string("return require('superlemon.recovery').restore(...)"),
+                    .array([checkpoint]),
+                ], timeout: .seconds(30))
+                guard isCurrent(context), phase == .starting else { return }
+            }
+            recovery = SessionRecovery()
+            if !hasRemoteFilesystem {
+                _ = try await session.request("nvim_exec_lua", [
+                    .string("require('superlemon.recovery').start(...)"),
+                    .array([.int(Int64(info.channelID))]),
+                ], timeout: .seconds(30))
+            }
             guard isCurrent(context), phase == .starting else { return }
             // Report the resolved appearance before the authoritative
             // redraw so the first presented frame already carries the
@@ -596,6 +616,9 @@ public final class NvimController {
             guard isCurrent(context), phase == .starting else { return }
             runtimeReady = true
             phase = .running
+            recoveryCheckpoint = nil
+            inputReady = true
+            scheduleInputDrainIfNeeded()
             deliverFirstFlushIfReady()
             beginQueuedStartupQuitIfNeeded(context)
         } catch {
@@ -620,7 +643,7 @@ public final class NvimController {
                 if let launchedSession {
                     let outcome = await launchedSession.shutdown()
                     if session === launchedSession, !sessionExited {
-                        handleSessionTermination(launchedSession, outcome: outcome)
+                        await handleSessionTermination(launchedSession, outcome: outcome)
                     }
                 }
                 return
@@ -987,6 +1010,10 @@ public final class NvimController {
                 guard let self, self.session === session,
                     self.sessionGeneration == generation
                 else { return }
+                if notification.method == "superlemon.recovery" {
+                    self.recovery.consume(notification.params)
+                    continue
+                }
                 if self.minimapBridge.handleNotification(
                     notification.method, params: notification.params)
                 {
@@ -1140,15 +1167,15 @@ public final class NvimController {
                 guard let self, self.session === session,
                     self.sessionGeneration == generation
                 else { return }
-                self.handleSessionTermination(session, outcome: outcome)
+                await self.handleSessionTermination(session, outcome: outcome)
             }
         }
     }
 
     private func handleSessionTermination(
         _ exitedSession: NvimSession, outcome: NvimTermination
-    ) {
-        guard session === exitedSession else { return }
+    ) async {
+        guard session === exitedSession, !sessionExited else { return }
         // Startup owns failures until the launch sequence reaches `.running`.
         // Its awaited request will fail from the same terminal outcome and
         // present one startup-recovery sheet; consuming the lifecycle event
@@ -1164,6 +1191,11 @@ public final class NvimController {
             exitHandler(outcome.exitCode ?? 1, outcome.stderrTail)
             return
         }
+        // The terminal event follows stream closure. Drain already-received
+        // buffer deltas before taking a recovery checkpoint or cancelling it.
+        await notificationTask?.value
+        guard session === exitedSession else { return }
+        recoveryCheckpoint = hasRemoteFilesystem ? nil : recovery.snapshot
         dismissActiveQuitAlert()
         clearSessionState()
         if let intent = terminationIntent.take() {
@@ -1191,7 +1223,18 @@ public final class NvimController {
             requestApplicationTermination()
         } else {
             phase = .recovering
-            presentRecoveryAlert(outcome)
+            // One automatic restart per minute; repeated crashes use the
+            // existing Restart / Safe Start / Quit sheet instead of looping.
+            if !hasRemoteFilesystem,
+                lastAutomaticRecovery.map({ Date().timeIntervalSince($0) >= 60 }) ?? true
+            {
+                lastAutomaticRecovery = Date()
+                // clearSessionState cancels the old lifecycle consumer. Start
+                // a fresh task so its cancellation cannot abort the new child.
+                Task { await self.launchSession(safeStart: self.safeStartRequested) }
+            } else {
+                presentRecoveryAlert(outcome)
+            }
         }
     }
 
@@ -1510,7 +1553,7 @@ public final class NvimController {
         // outcome while shutdown was suspended. Only synthesize delivery for
         // an idle/already-terminated session that remains current.
         guard isCurrent(context) else { return }
-        handleSessionTermination(context.session, outcome: outcome)
+        await handleSessionTermination(context.session, outcome: outcome)
     }
 
     /// Native Save All / Discard All / Cancel — replaces nvim's in-grid

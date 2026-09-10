@@ -39,10 +39,10 @@ local function apply_editor_defaults()
   vim.cmd("filetype plugin indent on")
   vim.cmd("syntax enable")
 
-  -- Ships with nvim, and — unlike bundled schemes such as habamax that pin
-  -- 'background' to one value — adapts to it, so the Appearance setting
-  -- (Auto/Light/Dark, CONTRACT.md "Appearance") can follow the system.
-  vim.cmd.colorscheme("default")
+  -- Bundle the same Molokai palette as the local Neovim configuration.
+  vim.opt.background = "dark"
+  vim.g.rehash256 = 1
+  vim.cmd.colorscheme("molokai")
 end
 
 --- Apply the complete managed configuration: editor defaults, the annotated
@@ -89,6 +89,22 @@ function M.apply(opts)
         }
       end
     end
+  end
+  -- Load only in managed mode, after personal mappings/options. Vendoring
+  -- keeps startup offline and also supports bridge-time remote adoption.
+  local surround = vim.fs.joinpath(vim.fs.dirname(config_dir()), "vendor", "vim-surround")
+  vim.opt.runtimepath:append(surround)
+  local personal_maps = {}
+  for _, mode in ipairs({ "n", "x", "i" }) do
+    for _, mapping in ipairs(vim.api.nvim_get_keymap(mode)) do
+      table.insert(personal_maps, { mode = mode, mapping = mapping })
+    end
+  end
+  vim.cmd("source " .. vim.fn.fnameescape(vim.fs.joinpath(surround, "plugin", "surround.vim")))
+  -- Upstream installs unconditional default mappings. Personal mappings
+  -- still take precedence, just as they do for our macOS shortcuts.
+  for _, entry in ipairs(personal_maps) do
+    vim.fn.mapset(entry.mode, false, entry.mapping)
   end
 end
 

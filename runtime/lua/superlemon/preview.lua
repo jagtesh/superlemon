@@ -83,6 +83,19 @@ end
 --- Sidebar single-click entry point.
 ---@param path string absolute path
 function M.open(path)
+  -- Native tab/sidebar callbacks can arrive while a fixed plugin window is
+  -- current. Open into an editor window; never unpin the plugin's buffer.
+  if vim.wo.winfixbuf or vim.bo.buftype ~= "" then
+    local target
+    for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+      if not vim.wo[win].winfixbuf and vim.bo[vim.api.nvim_win_get_buf(win)].buftype == ""
+        and vim.api.nvim_win_get_config(win).relative == "" then
+        target = win
+        break
+      end
+    end
+    if target then vim.api.nvim_set_current_win(target) else vim.cmd("botright new") end
+  end
   local existing = buffer_for(path)
 
   -- Already open as a permanent buffer (or as the current preview):

@@ -47,6 +47,22 @@ public final class ChromeState {
 
     public init() {}
 
+    /// Drop UI state owned by a previous Neovim process.
+    public func resetForSessionChange() {
+        cmdline = nil
+        popupmenu = nil
+        messages = []
+        pendingConfirm = nil
+        showmode = []
+        showcmd = []
+        ruler = []
+        history = []
+        tabline = TablineModel()
+        cmdlineLevels = [:]
+        blockLines = []
+        onChange?()
+    }
+
     public func clearPendingConfirm() {
         pendingConfirm = nil
     }

@@ -114,10 +114,26 @@ private final class WidthDragStripView: NSView {
         addCursorRect(bounds, cursor: .resizeLeftRight)
     }
 
-    override func mouseDragged(with event: NSEvent) {
+    private var dragOrigin: (windowX: CGFloat, width: CGFloat)?
+
+    override func mouseDown(with event: NSEvent) {
         guard let superview else { return }
-        let point = superview.convert(event.locationInWindow, from: nil)
-        onDrag?(max(0, point.x))
+        // Consume the press: NSView's default forwards it up the responder
+        // chain to the editor, starting a second mouse gesture underneath us.
+        dragOrigin = (event.locationInWindow.x, superview.bounds.width)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let dragOrigin else { return }
+        // Keep the original grab offset as Neovim asynchronously resizes the
+        // overlay. AppKit continues delivering this gesture to this view even
+        // when the pointer leaves the moving strip.
+        onDrag?(max(0, dragOrigin.width + event.locationInWindow.x - dragOrigin.windowX))
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        // Consume release as well; there was no corresponding editor press.
+        dragOrigin = nil
     }
 }
 

@@ -127,7 +127,13 @@ struct ScrollFollower: Equatable {
     /// nvim's confirmation, `SmoothViewportState` retargets this to the
     /// clamped predicted offset so the glide continues toward the finger
     /// instead of the origin; see `SmoothViewportState.clampedTarget()`.
-    var target: CGFloat = 0
+    var target: CGFloat = 0 {
+        didSet {
+            // A gesture can end after settling at a nonzero predicted offset.
+            // Changing its target must resume integration from that position.
+            if target != oldValue { isActive = true }
+        }
+    }
     private(set) var stiffness: Double = ScrollFollower.softStartStiffness
     /// Peak-hold-with-decay estimate of the gap between scroll-frame
     /// arrivals, fed by the host's cadence tracking. Used only to cap `ω` so
@@ -618,8 +624,7 @@ final class SmoothViewportState {
             self.cellSize = cellSize
             self.scale = nextScale
             rebuildLayers()
-            follower.settle()
-            isActive = false
+            settle()
             authoritativeRows = nextRows
             bindAuthoritativeRows()
             seedCurrentRows()
@@ -726,7 +731,9 @@ final class SmoothViewportState {
         if !follower.isActive {
             isActive = false
             lastSemanticDelta = 0
-            discardNonCurrentHistory()
+            // Resting at a predicted offset still displays retained rows.
+            // Only the authoritative origin makes that history disposable.
+            if follower.position == 0 { discardNonCurrentHistory() }
         }
         render(forceBindings: false)
 
@@ -831,6 +838,7 @@ final class SmoothViewportState {
         gestureInputRows = inputRows
         gestureRequestedRows = requestedRows
         follower.target = gestureOpen ? clampedTarget() : 0
+        isActive = follower.isActive
     }
 
     /// The predicted camera offset while a wheel gesture is open, clamped so

@@ -36,6 +36,17 @@ Running the bare executable during development may use
 `SUPERLEMON_NVIM` to select an explicit Neovim 0.12+ executable. Packaged
 releases use their checksum-verified bundled copy.
 
+## Crash recovery
+
+If a local Neovim child crashes, Superlemon restarts it automatically and restores
+normal text buffers (including unsaved scratch buffers), tabs, splits and cursor
+positions from an incremental mirror held by the GUI. Restoration does not write
+your files. A second crash within a minute offers manual restart or Safe Start.
+The mirror covers notifications received before the crash, survives only while
+Superlemon remains running, and does not restore undo history, terminal jobs or
+arbitrary plugin state. SSH sessions retain manual reconnect handling; a lost
+connection may leave the remote Neovim alive.
+
 ## Run
 
 Install the latest release with Homebrew:
@@ -94,6 +105,13 @@ can define ordinary options, mappings, autocmds, and plugin configuration. It is
 sourced exactly once after the bundled baseline. You can instead choose your
 normal Neovim init or one exact custom init from **Superlemon → Settings…**;
 those modes do not receive the managed configuration afterward.
+
+The managed defaults include Molokai syntax colors, Airline-style neon green
+status-bar accents, and bundled vim-surround (`cs"'`, `ds"`, `ysiw)` and visual
+`S`). Personal overrides can select another `colorscheme` or disable surround
+with `let g:loaded_surround = 1` before it loads.
+Molokai is a dark palette; choose an adaptive colorscheme such as `default`
+in your override if you want editor colors to follow Light/Dark appearance.
 
 Common development overrides are:
 

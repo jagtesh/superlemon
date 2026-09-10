@@ -46,7 +46,7 @@ local segments = require("superlemon.statusline").eval()
 H.ok(segments ~= nil and #segments >= 4, "statusline evaluates into segments")
 
 H.ok(segments[1].text:find("NORMAL", 1, true) ~= nil, "mode badge segment first")
-H.eq(segments[1].bg, 0x004DC8, "NORMAL badge uses the NORTHSTAR blue")
+H.eq(segments[1].bg, 0xDFFF00, "NORMAL badge uses the Airline neon green")
 H.eq(segments[1].bold, true, "mode badge is bold")
 
 local joined = ""
@@ -63,7 +63,7 @@ H.ok(_G.superlemon_sl_mode("i"):find("SLModeInsert# INSERT ", 1, true) ~= nil,
 H.ok(_G.superlemon_sl_mode("v"):find("SLModeVisual# VISUAL ", 1, true) ~= nil,
   "visual mode maps to the visual badge")
 local insert_hl = vim.api.nvim_get_hl(0, { name = "SLModeInsert", link = false })
-H.eq(insert_hl.bg, 0xADC694, "INSERT badge uses the sage green")
+H.eq(insert_hl.bg, 0x00DFFF, "INSERT badge uses the Airline cyan")
 
 -- Outside a repository the git segment is silently absent (no error).
 H.ok(joined:find("⎇") == nil or true, "git segment tolerated") -- eval didn't error

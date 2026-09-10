@@ -78,4 +78,21 @@ H.eq(preview.bufnr(), one2, "one.txt re-opened as preview first")
 preview.open_permanent(path("one.txt"))
 H.eq(preview.bufnr(), nil, "open_permanent pins the previewed file")
 
+-- A native click can arrive with a fixed sidebar window current.
+local editor = vim.api.nvim_get_current_win()
+vim.cmd("topleft vnew")
+local sidebar = vim.api.nvim_get_current_win()
+local sidebar_buf = vim.api.nvim_get_current_buf()
+vim.bo.buftype = "nofile"
+vim.wo.winfixbuf = true
+preview.open(path("two.txt"))
+H.eq(vim.api.nvim_get_current_win(), editor, "preview routes to editor from fixed sidebar")
+H.eq(vim.api.nvim_get_current_buf(), two, "already-open buffer switches successfully")
+H.eq(vim.api.nvim_win_get_buf(sidebar), sidebar_buf, "sidebar buffer preserved")
+H.eq(vim.wo[sidebar].winfixbuf, true, "sidebar stays fixed")
+vim.api.nvim_set_current_win(sidebar)
+vim.cmd("only!")
+preview.open(path("one.txt"))
+H.ok(vim.api.nvim_get_current_win() ~= sidebar, "creates editor when only sidebar remains")
+H.eq(vim.api.nvim_win_get_buf(sidebar), sidebar_buf, "sole sidebar is preserved")
 H.finish()

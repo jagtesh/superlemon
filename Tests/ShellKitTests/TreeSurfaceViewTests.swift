@@ -446,3 +446,55 @@ struct TreeSurfaceViewClickTests {
         #expect(opened.count == 1 && opened[0] == ("/root/broken", false))
     }
 }
+
+@MainActor
+private final class DividerEventSink: NSResponder {
+    var presses = 0
+    var releases = 0
+    override func mouseDown(with event: NSEvent) { presses += 1 }
+    override func mouseUp(with event: NSEvent) { releases += 1 }
+}
+
+@Suite("Tree divider gesture", .serialized)
+@MainActor
+struct TreeDividerGestureTests {
+    @Test func dividerOwnsPressDragAndReleaseAcrossLayoutChanges() throws {
+        let tree = TreeSurfaceView(frame: NSRect(x: 0, y: 0, width: 260, height: 400))
+        let window = hostInRealWindow(tree)
+        window.isReleasedWhenClosed = false
+        defer { window.close() }
+        tree.render(makeModel(rows: [makeRow("/file", "file")]))
+        tree.layoutSubtreeIfNeeded()
+        // Pick the real hit-test target on the divider at the first file row.
+        let rowPoint = tree.tableView.convert(NSPoint(x: 10, y: 10), to: tree)
+        let point = NSPoint(x: tree.bounds.maxX - 4, y: rowPoint.y)
+        let strip = try #require(tree.hitTest(point))
+        #expect(strip !== tree.tableView)
+        #expect(!strip.isDescendant(of: tree.tableView))
+        let sink = DividerEventSink()
+        strip.nextResponder = sink
+        var widths: [CGFloat] = []
+        tree.onWidthDrag = { widths.append($0) }
+        let origin = tree.convert(point, to: nil)
+        func event(_ type: NSEvent.EventType, dx: CGFloat = 0) -> NSEvent {
+            NSEvent.mouseEvent(with: type,
+                location: NSPoint(x: origin.x + dx, y: origin.y),
+                modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber,
+                context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+        }
+        strip.mouseDown(with: event(.leftMouseDown))
+        strip.mouseDragged(with: event(.leftMouseDragged, dx: 40))
+        #expect(widths == [300])
+        // A delayed/quantized Neovim resize must not change our drag origin.
+        tree.setFrameSize(NSSize(width: 290, height: 400))
+        tree.layoutSubtreeIfNeeded()
+        strip.mouseDragged(with: event(.leftMouseDragged, dx: 100))
+        strip.mouseDragged(with: event(.leftMouseDragged, dx: -30))
+        #expect(widths == [300, 360, 230])
+        strip.mouseUp(with: event(.leftMouseUp, dx: -30))
+        strip.mouseDragged(with: event(.leftMouseDragged, dx: 50))
+        #expect(widths == [300, 360, 230])
+        #expect(sink.presses == 0)
+        #expect(sink.releases == 0)
+    }
+}
