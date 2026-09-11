@@ -229,7 +229,7 @@ After the process starts, Superlemon:
 
 1. prepends the bundled runtime through a pre-init `--cmd`;
 2. calls `nvim_get_api_info`, records channel/API/version metadata, and rejects
-   Neovim older than 0.12;
+   Neovim older than 0.11;
 3. identifies itself with `nvim_set_client_info`;
 4. attaches the UI with `ext_linegrid`, `ext_multigrid`, `ext_cmdline`,
    `ext_popupmenu`, `ext_messages`, and RGB color enabled;
@@ -244,7 +244,7 @@ baseline loads, but executable personal configuration is skipped.
 `ext_tabline` is decoded by NvimKit but is not enabled by the application. The
 visible native strip is a runtime-driven buffer list, not Neovim tabpages.
 
-The application enforces Neovim 0.12 or newer before UI attachment. Packaged
+The application enforces Neovim 0.11 or newer before UI attachment. Packaged
 artifacts additionally verify the exact manifest-pinned bundled version.
 
 ### RPC implementation
@@ -996,7 +996,7 @@ budgets, sign-off, tag, commit, artifact filename, and SHA-256 before release.
 | Externalized messages | Plugins may depend on TUI-specific hit-enter/message behavior | Typed model, native history, atomic editor grid; no claim of complete TUI-message emulation |
 | Sidebar mutations | Rename/trash may leave an already-open Neovim buffer referring to the old path | File open/preview goes through Neovim; buffer-aware mutation integration remains open |
 | Config combinations | Managed, normal-user, and custom init paths can expose different plugin/chrome behavior | Explicit Settings choice, one documented personal override, idempotent runtime setup, Lua config tests |
-| Version compatibility | Future Neovim protocol changes may add unknown events | Enforce Neovim 0.12+, pin and verify the packaged version, skip well-formed unknown events, and test the supported decoder vocabulary |
+| Version compatibility | Future Neovim protocol changes may add unknown events | Enforce Neovim 0.11+, pin and verify the packaged version, skip well-formed unknown events, and test the supported decoder vocabulary |
 
 ---
 

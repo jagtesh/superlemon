@@ -35,7 +35,7 @@ Smooth scrolling is opt-in through **View → Smooth Scrolling** and defaults to
 
 Packaged builds include Neovim, so users do not need to install it separately.
 Running the bare executable during development may use
-`SUPERLEMON_NVIM` to select an explicit Neovim 0.12+ executable. Packaged
+`SUPERLEMON_NVIM` to select an explicit Neovim 0.11+ executable. Packaged
 releases use their checksum-verified bundled copy.
 
 ## Crash recovery
