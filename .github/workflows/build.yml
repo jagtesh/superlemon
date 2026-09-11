@@ -22,6 +22,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+          fetch-depth: 0 # version.sh needs tags and full history for bundle versions
 
       - name: Verify runner and dependency manifest
         run: |

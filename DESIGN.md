@@ -899,7 +899,7 @@ and a `superlemon` CLI helper are open work.
 
 ## 11. Testing and verification
 
-The repository uses Swift Testing across all six library targets plus a Lua
+The repository uses Swift Testing across the editor, shell, transport, and app modules plus a Lua
 runtime suite.
 
 Current Swift coverage includes:
@@ -1007,17 +1007,19 @@ authoritative for what the current implementation actually does.
 
 ### 14.1 Sidebar and file operations
 
-`FileTreeSidebarView` is a native outline-style view rooted at the current
-project directory. Directories load lazily, sort before files, and expose native
-context-menu actions for New File, New Folder, Rename, Delete/Trash, and Reveal
-in Finder. File-type dots, Git badges, and namespaced `superlemon.ui`
-decorations compose in the row.
+The workspace navbar is a real Neovim window with a scratch buffer whose grid
+is overlaid by native `TreeSurfaceView`. `superlemon.navbar` owns lazy directory
+listing, expansion state, filesystem watchers, Git badges and plugin decorations.
+The Lua model sends rows through `superlemon.ui` surface render notifications.
+`FileTreeSidebarView` remains the remote file panel's tree; it is no longer the
+workspace navbar.
 
-Single-click opens a Neovim preview buffer; double-click opens permanently.
-Creating, renaming, and trashing currently use Swift `FileManager`, followed by
-sidebar/index refresh. These mutations do not yet rename or delete an already
-open Neovim buffer, which is a documented limitation rather than hidden
-behavior.
+Single-click previews a file; double-click opens it permanently. For local
+sessions, creation and rename use `vim.uv`, while Trash and Reveal in Finder
+use GUI host services. Remote navbar menus currently offer directory changes.
+File mutations do not yet rename or delete an already-open Neovim buffer.
+See [the surface navbar design](docs/design/surface-navbar-v1.md) and
+[runtime contract](runtime/CONTRACT.md) for the wire protocol.
 
 ### 14.2 Preview buffers
 
@@ -1147,7 +1149,8 @@ discarded by generation tokens.
 
 | Component | Current methods |
 |---|---|
-| sidebar | `set_badge`, `set_dot`, `clear` |
+| surface | `open`, `render`, `close` for the native navbar |
+| host | `trash`, `reveal` for local macOS file operations |
 | palette | `open`, `close` with query/select/close callbacks |
 | toast | `show` with info/warn/error kind |
 | statusbar | `set_segment`, `clear` |
@@ -1158,8 +1161,9 @@ enabled. If the user's config already installed its own implementation, that
 implementation wins. The current `vim.ui.select` adapter uses a simple
 case-insensitive substring filter over formatted items.
 
-Built-in Git badges and Command-P Quick Open do not yet dogfood the generic API:
-Git still uses `superlemon.git`, and the built-in picker uses Swift FileIndex.
+Built-in Git badges and plugin sidebar decorations merge in the Lua navbar
+model and travel through `superlemon.ui` surface renders; there is no separate
+`superlemon.git` wire notification. The built-in picker uses Swift FileIndex.
 `vim.notify` is not overridden. Quickfix, location lists, LSP progress, picker
 adapters, and native hover dressing remain open integration points.
 

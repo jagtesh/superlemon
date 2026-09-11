@@ -3,7 +3,9 @@
 // (sidebar, status bar, quick-open), and the superlemon.* RPC notifications.
 // See Sources/ChromeKit/WIRING.md and Sources/ShellKit/WIRING.md.
 
-import AppKit
+// Older SDKs omit Sendable on NSFilePromiseProvider's completion handler.
+// Keep the newer SDK's concurrency contract while supporting Xcode 16.
+@preconcurrency import AppKit
 import ChromeKit
 import GridKit
 import NvimKit

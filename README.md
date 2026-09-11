@@ -13,7 +13,7 @@ frame.
 Superlemon is the native macOS application built around that engine. It turns
 Neovim state into AppKit windows, pixels, motion, menus, panels, and gestures—
 about as far as a native Mac integration can go without forking Neovim itself.
-The result includes smooth display-linked scrolling, a native file browser,
+The result includes optional display-linked smooth scrolling, a native file browser,
 Quick Open, a minimap, a buffer tab bar, and a command/status bar integrated
 into the main window, plus native key handling and marked-text IME composition.
 Active composition retains attributed clauses and local replacement ranges;
@@ -23,7 +23,9 @@ This is still Neovim, not merely an editor with a Vim mode. Your mappings and
 Neovim plugins continue to work through your configuration, while Superlemon
 adds native Mac surfaces where they improve the experience.
 
-![Superlemon in action](media/superlemon-demo.gif)
+![Superlemon editing Swift with Molokai colors, native file navigation, and a minimap](media/superlemon-editor.png)
+
+Smooth scrolling is opt-in through **View → Smooth Scrolling** and defaults to off.
 
 ## Requirements
 
@@ -49,7 +51,14 @@ connection may leave the remote Neovim alive.
 
 ## Run
 
-Install the latest release with Homebrew:
+Download the Apple Silicon binary from [GitHub Releases](https://github.com/jagtesh/superlemon/releases/latest),
+extract the ZIP, and move `Superlemon.app` into `/Applications`. Release 0.1.5
+is ad-hoc signed, **not Developer ID signed or notarized**. macOS may block its
+first launch; review the release and use **System Settings → Privacy & Security →
+Open Anyway** if you trust the download. A SHA-256 file accompanies the archive.
+Intel Macs can build from source; the downloadable binary is arm64 only.
+
+Alternatively, install with Homebrew:
 
 ```sh
 brew tap jagtesh/tap
@@ -128,10 +137,11 @@ swift test
 bash runtime/tests/run.sh
 ```
 
-Every push and pull request tests and produces an arm64, ad-hoc-signed validation
-artifact in GitHub Actions. Tagged releases additionally require the protected
-Developer ID/notarization environment before publishing a distributable app.
-Before approving a tagged build, follow the
+The GitHub Actions build job runs tests and packages an arm64, ad-hoc-signed
+validation artifact. The automated notarized release route additionally requires
+the protected Developer ID/notarization environment. It is separate from the
+manually published ad-hoc release described above.
+Before approving the notarized release route, follow the
 [release acceptance runbook](packaging/RELEASE_ACCEPTANCE.md), copy its
 [machine-readable record](packaging/RELEASE_ACCEPTANCE.json), run the manual
 IME, VoiceOver, memory, filesystem-stress, and sidebar-layout matrix against the
@@ -153,7 +163,7 @@ no Developer ID or notarization credentials. Keep every Apple credential as an
 environment secret scoped only to `release`; do not configure those values as
 repository-level, `gui-acceptance`, or `release-acceptance` secrets.
 
-To create a versioned GitHub Release from a clean, up-to-date `main` branch:
+To create and push a versioned tag from a clean, up-to-date `main` branch:
 
 ```sh
 scripts/release.sh
@@ -163,13 +173,15 @@ With no argument this bumps the patch version automatically (see
 [Versioning](#versioning) above); pass `minor`, `major`, or an explicit
 `X.Y.Z` to choose a different version. The command records the version,
 creates the release commit and tag, and pushes them atomically. GitHub
-Actions tests the tagged source, signs the exact tested app with Developer
-ID, notarizes and staples it, and attaches the arm64 archive plus SHA-256 to
-the corresponding GitHub Release. Once the release workflow completes,
+Actions attempts the protected pipeline described above; a pushed tag alone
+is not a published release. When its acceptance and signing prerequisites are
+met, it signs the tested app with Developer ID, notarizes and staples it, and
+attaches the archive and SHA-256. For the manual ad-hoc packaging procedure, see
+[the release guide](packaging/RELEASING.md). Once the release is published,
 publish its checksum-pinned source formula:
 
 ```sh
-scripts/publish-homebrew-formula.sh 0.2.0
+scripts/publish-homebrew-formula.sh 0.1.5
 ```
 
 See [DESIGN.md](DESIGN.md) for the implemented architecture,
