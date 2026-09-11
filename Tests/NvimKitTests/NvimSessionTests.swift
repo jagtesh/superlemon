@@ -19,6 +19,30 @@ private func waitUntil(
     throw TimeoutError()
 }
 
+// A child-published marker proves shell setup has completed before a test
+// sends signals or writes stdin. Process.run() only proves launch, and a fixed
+// sleep races child scheduling on loaded CI hosts. Pass the path as $1 rather
+// than interpolating it into shell code.
+private struct ChildReadyMarker {
+    let url = FileManager.default.temporaryDirectory
+        .appendingPathComponent("superlemon-child-ready-\(UUID().uuidString)")
+
+    func configuration(after setup: String) -> NvimLaunchConfiguration {
+        NvimLaunchConfiguration(
+            binaryURL: URL(fileURLWithPath: "/bin/sh"),
+            // Deliberately exceed the old 50 ms assumption so every run
+            // exercises delayed child initialization, even on a fast Mac.
+            arguments: ["-c", "sleep 0.2; " + setup + "; : > \"$1\"; exec /bin/sleep 30",
+                        "superlemon-test-child", url.path])
+    }
+
+    func wait() async throws {
+        try await waitUntil { FileManager.default.fileExists(atPath: url.path) }
+    }
+
+    func remove() { try? FileManager.default.removeItem(at: url) }
+}
+
 private actor EventSink {
     private(set) var events: [UIEvent] = []
     func add(_ batch: RedrawBatch) { events.append(contentsOf: batch.events) }
@@ -196,10 +220,9 @@ private func lineText(_ event: UIEvent) -> String? {
     }
 
     @Test func shutdownEscalatesIgnoredSIGTERMAndEmitsExactlyOnce() async throws {
-        let session = NvimSession(
-            configuration: NvimLaunchConfiguration(
-                binaryURL: URL(fileURLWithPath: "/bin/sh"),
-                arguments: ["-c", "trap '' TERM; exec /bin/sleep 30"]))
+        let ready = ChildReadyMarker()
+        defer { ready.remove() }
+        let session = NvimSession(configuration: ready.configuration(after: "trap '' TERM"))
         let lifecycleCount = Task {
             var count = 0
             for await _ in session.lifecycleEvents { count += 1 }
@@ -211,8 +234,7 @@ private func lineText(_ event: UIEvent) -> String? {
             return outcomes
         }
         try await session.start()
-        // Give /bin/sh time to install SIG_IGN and exec sleep.
-        try await Task.sleep(for: .milliseconds(50))
+        try await ready.wait()
 
         async let first = session.shutdown(
             termGrace: .milliseconds(50), killGrace: .seconds(1))
@@ -424,10 +446,9 @@ private func lineText(_ event: UIEvent) -> String? {
     }
 
     @Test func missingProcessExitCallbackCannotStrandShutdownWaiters() async throws {
-        let session = NvimSession(
-            configuration: NvimLaunchConfiguration(
-                binaryURL: URL(fileURLWithPath: "/bin/sh"),
-                arguments: ["-c", "trap '' TERM; exec /bin/sleep 30"]))
+        let ready = ChildReadyMarker()
+        defer { ready.remove() }
+        let session = NvimSession(configuration: ready.configuration(after: "trap '' TERM"))
         await session.suppressProcessExitHandling()
         let terminationOutcomes = Task {
             var outcomes: [NvimTermination] = []
@@ -435,7 +456,7 @@ private func lineText(_ event: UIEvent) -> String? {
             return outcomes
         }
         try await session.start()
-        try await Task.sleep(for: .milliseconds(50))
+        try await ready.wait()
 
         let clock = ContinuousClock()
         let start = clock.now
@@ -485,10 +506,9 @@ private func lineText(_ event: UIEvent) -> String? {
         // Keep the child alive briefly after closing stdin. This makes the
         // session write while its pipe has no reader: write(2) must return
         // EPIPE rather than terminating the whole test process with SIGPIPE.
-        let session = NvimSession(
-            configuration: NvimLaunchConfiguration(
-                binaryURL: URL(fileURLWithPath: "/bin/sh"),
-                arguments: ["-c", "exec 0<&-; exec /bin/sleep 5"]))
+        let ready = ChildReadyMarker()
+        defer { ready.remove() }
+        let session = NvimSession(configuration: ready.configuration(after: "exec 0<&-"))
         let exitBox = ExitBox()
         let terminationBox = TerminationBox()
         let watcher = Task {
@@ -509,7 +529,7 @@ private func lineText(_ event: UIEvent) -> String? {
         }
 
         try await session.start()
-        try await Task.sleep(for: .milliseconds(50))
+        try await ready.wait()
         await session.notify("write_to_closed_pipe", [])
         try await waitUntil { await exitBox.event != nil }
 
