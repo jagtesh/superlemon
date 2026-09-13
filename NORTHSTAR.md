@@ -12,6 +12,14 @@ not a claim about the current build and it is not a milestone plan. Read
 [`DESIGN.md`](DESIGN.md) for the implemented architecture, boundaries, and open
 work.
 
+> [!NOTE]
+> Although the document says NORTHSTAR - this is more aptly the v1 vision
+> document. Since writing this, I've used Superlemon extensively and my vision
+> has evolved but I have not updated this document.
+>
+> In many ways, I like the current feature set and experience, and would rather
+> spend my effort in further refinement than adding more features.
+
 ---
 
 ## 1. The experience we are building
