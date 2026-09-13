@@ -31,8 +31,9 @@ it was actually performed.
 
 ## Protected notarized pipeline
 
-The tag workflow in `.github/workflows/build.yml` requires an interactive
-`superlemon-gui` runner, the candidate-specific completed acceptance record,
-and Developer ID/notarization credentials in its protected environments.
+The tag workflow in `.github/workflows/build.yml` requires successful hosted
+headless checks and Developer ID/notarization credentials in the protected
+`release` environment. GUI acceptance is reviewed manually before approval;
+CI does not require an interactive runner or enforce the acceptance record.
 Follow [RELEASE_ACCEPTANCE.md](RELEASE_ACCEPTANCE.md). Do not mark unperformed
 checks PASS or describe a manual ad-hoc archive as having passed this gate.

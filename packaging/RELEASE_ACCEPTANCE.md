@@ -24,16 +24,12 @@ decision must be `PASS`, every check must name evidence, performance minimums
 and predeclared budgets must be satisfied, timestamps must include a timezone,
 and `blocking_issues` must be empty.
 
-On the dedicated GUI runner, configure the protected `release-acceptance`
-environment variable `SUPERLEMON_ACCEPTANCE_RECORD_PATH` to the absolute path
-of that completed JSON file. Write the completed record only after testing the
-artifact produced for the tag, then approve the protected job. The job copies
-the record before validating it, binds that copy to the downloaded artifact,
-and uploads the validated copy with the automated evidence. Missing, stale,
-unfinished, blocked, or failing records make the job fail and prevent the
-release job from starting.
+GUI acceptance is performed manually outside CI. Retain the completed record
+and evidence for the exact tag artifact and review them before approving the
+protected `release` environment. CI runs headless checks and does not collect
+or enforce this record automatically.
 
-The validator can also be run before approval:
+Run the validator locally before approval:
 
 ```sh
 python3 scripts/validate-release-acceptance.py \

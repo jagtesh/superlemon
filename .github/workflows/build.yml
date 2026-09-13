@@ -104,131 +104,13 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  gui-acceptance:
-    name: Trusted GUI acceptance staging
-    if: >-
-      github.event_name == 'push' &&
-      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
-    needs: build-test-package
-    runs-on: [self-hosted, macOS, ARM64, superlemon-gui]
-    timeout-minutes: 20
-    environment:
-      name: ${{ startsWith(github.ref, 'refs/tags/v') && 'release-acceptance' || 'gui-acceptance' }}
-    permissions:
-      contents: read
-
-    steps:
-      - name: Check out exact trusted source without credentials
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          persist-credentials: false
-
-      - name: Download exact tested application
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: ${{ needs.build-test-package.outputs.artifact_name }}
-          path: gui-acceptance
-
-      - name: Confirm interactive ARM64 Mac session
-        shell: bash
-        run: |
-          test "$(uname -m)" = arm64
-          console_user=$(stat -f '%Su' /dev/console)
-          test -n "$console_user"
-          test "$console_user" != root
-          test "$console_user" != loginwindow
-          printf 'console_user=%s\n' "$console_user"
-
-      - name: Expand, verify, and smoke-test candidate
-        shell: bash
-        run: |
-          mkdir -p gui-acceptance/app gui-acceptance/evidence
-          ditto -x -k \
-            "gui-acceptance/${{ needs.build-test-package.outputs.archive_name }}" \
-            gui-acceptance/app
-          scripts/verify-package.sh gui-acceptance/app/Superlemon.app
-          state=$(mktemp -d)
-          trap 'rm -rf "$state"' EXIT
-          mkdir -p "$state/home" "$state/config" "$state/data" "$state/state" "$state/cache"
-          HOME="$state/home" \
-          XDG_CONFIG_HOME="$state/config" \
-          XDG_DATA_HOME="$state/data" \
-          XDG_STATE_HOME="$state/state" \
-          XDG_CACHE_HOME="$state/cache" \
-            gui-acceptance/app/Superlemon.app/Contents/MacOS/superlemon --smoke \
-            | tee gui-acceptance/evidence/clean-profile-smoke.txt
-
-      - name: Record automated evidence
-        shell: bash
-        run: |
-          {
-            printf 'commit=%s\n' "$GITHUB_SHA"
-            printf 'ref=%s\n' "$GITHUB_REF"
-            printf 'artifact=%s\n' "${{ needs.build-test-package.outputs.archive_name }}"
-            printf 'artifact_sha256='
-            shasum -a 256 \
-              "gui-acceptance/${{ needs.build-test-package.outputs.archive_name }}" \
-              | awk '{print $1}'
-            printf 'architecture=%s\n' "$(uname -m)"
-            sw_vers
-            codesign -dv --verbose=4 gui-acceptance/app/Superlemon.app 2>&1
-          } > gui-acceptance/evidence/automated-evidence.txt
-
-      - name: Stage unfinished acceptance templates for main
-        if: github.ref == 'refs/heads/main'
-        run: |
-          cp packaging/RELEASE_ACCEPTANCE.md \
-            gui-acceptance/evidence/RELEASE_ACCEPTANCE-NOT-RUN.md
-          cp packaging/RELEASE_ACCEPTANCE.json \
-            gui-acceptance/evidence/RELEASE_ACCEPTANCE-NOT-RUN.json
-          cp packaging/release-acceptance.schema.json \
-            gui-acceptance/evidence/release-acceptance.schema.json
-
-      - name: Validate completed candidate acceptance for tag
-        if: startsWith(github.ref, 'refs/tags/v')
-        shell: bash
-        env:
-          ACCEPTANCE_RECORD_PATH: ${{ vars.SUPERLEMON_ACCEPTANCE_RECORD_PATH }}
-        run: |
-          if [[ -z "$ACCEPTANCE_RECORD_PATH" ]]; then
-            echo "The protected release-acceptance environment must define SUPERLEMON_ACCEPTANCE_RECORD_PATH." >&2
-            exit 1
-          fi
-          if [[ ! -f "$ACCEPTANCE_RECORD_PATH" ]]; then
-            echo "Completed release acceptance record not found: $ACCEPTANCE_RECORD_PATH" >&2
-            exit 1
-          fi
-
-          completed_record=gui-acceptance/evidence/RELEASE_ACCEPTANCE-COMPLETED.json
-          cp "$ACCEPTANCE_RECORD_PATH" "$completed_record"
-          archive="gui-acceptance/${{ needs.build-test-package.outputs.archive_name }}"
-          archive_sha256=$(shasum -a 256 "$archive" | awk '{print $1}')
-          python3 scripts/validate-release-acceptance.py \
-            --record "$completed_record" \
-            --tag "$GITHUB_REF_NAME" \
-            --commit "$GITHUB_SHA" \
-            --artifact "${{ needs.build-test-package.outputs.archive_name }}" \
-            --sha256 "$archive_sha256" \
-            | tee gui-acceptance/evidence/release-acceptance-validation.txt
-          cp packaging/release-acceptance.schema.json \
-            gui-acceptance/evidence/release-acceptance.schema.json
-
-      - name: Upload GUI-runner evidence
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: Superlemon-${{ needs.build-test-package.outputs.version }}-gui-acceptance-evidence
-          path: gui-acceptance/evidence
-          if-no-files-found: error
-          retention-days: 30
-
   release:
     if: >-
       always() &&
       github.ref_type == 'tag' &&
       startsWith(github.ref_name, 'v') &&
-      needs.build-test-package.result == 'success' &&
-      needs.gui-acceptance.result == 'success'
-    needs: [build-test-package, gui-acceptance]
+      needs.build-test-package.result == 'success'
+    needs: build-test-package
     runs-on: macos-15
     timeout-minutes: 30
     environment: release

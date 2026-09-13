@@ -149,19 +149,13 @@ exact validation archive, and retain the completed results and referenced
 evidence. The template deliberately starts at `NOT RUN`; a green build or GUI
 smoke is not a substitute for those results.
 
-Trusted main/tag builds require an interactive ARM64 self-hosted Mac labeled
-`superlemon-gui`. Main uses the `gui-acceptance` environment; tags use the
-separate, protected `release-acceptance` environment. A tag cannot
-advance to the release job unless that runner gate validates a completed record
-against the exact tag, commit, archive filename, and SHA-256, with every required
-check and overall decision at `PASS`. Configure the environment variable
-`SUPERLEMON_ACCEPTANCE_RECORD_PATH` as the absolute runner-local path to that
-record in `release-acceptance` and protect tag deployments with required review.
-Main builds only stage
-unfinished templates. The GUI job has read-only repository access and receives
-no Developer ID or notarization credentials. Keep every Apple credential as an
-environment secret scoped only to `release`; do not configure those values as
-repository-level, `gui-acceptance`, or `release-acceptance` secrets.
+CI uses GitHub-hosted macOS runners for Swift tests, headless Neovim runtime
+specs, package verification, and the clean-profile `--smoke` check. No interactive
+self-hosted GUI runner is required. GUI acceptance remains a manual check using
+the runbook and validator above; CI does not collect or enforce its record.
+Before approving a notarized release, review that evidence in the protected
+`release` environment. Keep every Apple credential as an environment secret
+scoped only to `release`, not as a repository-level secret.
 
 To create and push a versioned tag from a clean, up-to-date `main` branch:
 
